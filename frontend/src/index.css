@@ -1,0 +1,46 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Design tokens -- light mode (default) */
+:root {
+  --surface-page: #f9f9f7;
+  --surface-card: #fcfcfb;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --border-hairline: rgba(11, 11, 11, 0.1);
+  --grid-line: #e1e0d9;
+  --baseline: #c3c2b7;
+  --series-1: #2a78d6; /* blue   -- prompt / GTT / primary */
+  --series-2: #eb6834; /* orange -- decode / RAM */
+  --series-3: #1baf7a; /* aqua   -- tertiary */
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-critical: #d03b3b;
+}
+
+/* Dark mode -- selected steps for the dark surface, not an auto-flip */
+html.dark {
+  --surface-page: #0d0d0d;
+  --surface-card: #1a1a19;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --border-hairline: rgba(255, 255, 255, 0.1);
+  --grid-line: #2c2c2a;
+  --baseline: #383835;
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-critical: #d03b3b;
+}
+
+body {
+  background-color: var(--surface-page);
+  color: var(--text-primary);
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
