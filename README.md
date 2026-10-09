@@ -1,5 +1,5 @@
 # Halogen Strix Halo Operations Dashboard
-
+![AMD Strix Halo Logo](AMD_Strix_Halo_logo.png)
 A real-time web dashboard for monitoring a running **Halogen LLM Server** alongside
 host and hardware telemetry on an **AMD Strix Halo** (Ryzen AI Max+ 395 / Radeon
 8060S) machine, with an on-demand fine-tuning compliance audit and a built-in

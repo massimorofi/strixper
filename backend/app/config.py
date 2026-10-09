@@ -30,6 +30,12 @@ class Settings:
         self.poll_interval_seconds: float = _get_float("POLL_INTERVAL_SECONDS", DEFAULT_POLL_INTERVAL)
         self.bind_host: str = os.getenv("BIND_HOST", "0.0.0.0")
         self.bind_port: int = int(os.getenv("BIND_PORT", "8000"))
+        # Model id assumed before any engine has told us what it serves.
+        # A run configuration's `served_model_name` and the engine's own
+        # /health both override it.
+        self.default_model: str = os.getenv(
+            "DEFAULT_MODEL", "halogen-qwen3.8-flash-next"
+        ).strip()
 
 
 settings = Settings()

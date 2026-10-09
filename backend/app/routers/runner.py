@@ -18,36 +18,46 @@ time the backend renders the template against the parameter values and
 launches the resulting command; a run may also override individual values
 without saving them first.
 
-Starting a run launches the rendered docker command as a subprocess and
-streams its merged stdout/stderr back to the browser as Server-Sent Events:
+Starting and watching are **separate calls**, because a run is a
+server-side resource rather than a property of one browser tab:
 
-    event: stdout  data: {"text": "..."}    output chunk
-    event: exit    data: {"exit_code": 0}   process terminated
-    event: error   data: {"message": "..."} failed to start / run
+    POST /runner/configs/{id}/run        start it, returns JSON
+    GET  /runner/active                what is running right now
+    GET  /runner/runs/{id}/stream      watch it (SSE)
+    POST /runner/runs/{id}/stop        stop it
 
-A run can be stopped explicitly via POST /runner/runs/{run_id}/stop, and is
-also terminated automatically when the client disconnects.
+The stream delivers a ``backlog`` event with everything already produced,
+then live chunks::
+
+    event: backlog  data: {"text": "...", "last_seq": 12, ...}  history
+    event: stdout   data: {"text": "..."}                       new output
+    event: exit     data: {"exit_code": 0}                      process gone
+
+Closing a stream detaches that viewer and nothing else -- the engine keeps
+running until something stops it on purpose.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
-import os
-import pty
-import uuid
-from typing import Any, AsyncIterator, Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
+from ..services.engine_target import (
+    EngineTargetError,
+    engine_url,
+    port_from_params,
+)
+from ..services.live_service import set_engine_target
 from ..services.params import (
     MAX_PARAMS,
     ParamError,
     merge_values,
     render_command,
 )
+from ..services.run_registry import registry, stream_console
 from ..services.runner_store import (
     MAX_COMMAND_CHARS,
     MAX_DESCRIPTION_CHARS,
@@ -61,15 +71,22 @@ router = APIRouter(tags=["runner"])
 # One store instance per process, created lazily on first use.
 _store: Optional[RunnerStore] = None
 
-# Active runs: run_id -> asyncio subprocess handle.
-_active_runs: dict[str, asyncio.subprocess.Process] = {}
-
 
 def get_store() -> RunnerStore:
     global _store
     if _store is None:
         _store = RunnerStore()
     return _store
+
+
+def _param_value(params: Optional[list[dict[str, Any]]], name: str) -> Optional[str]:
+    """Value of one rendered parameter, or None when absent or blank."""
+    for param in params or []:
+        if param.get("name") != name:
+            continue
+        value = (param.get("value") or "").strip()
+        return value or None
+    return None
 
 
 class RunnerParameter(BaseModel):
@@ -125,6 +142,45 @@ async def _terminate(proc: asyncio.subprocess.Process) -> None:
         pass
 
 
+async def halt_run(run: ActiveRun) -> str:
+    """Stop a run, taking the container down with it.
+
+    Killing the `docker run` client is not enough -- with `-it` attached to
+    a PTY the container outlives its client -- so the container is stopped
+    through docker first, then the client process is reaped.
+
+    Idempotent: whichever path reaches it first (an explicit stop request,
+    or the stream tearing down after a client disconnect) does the work,
+    and later calls return the same result. Returns the method that did it.
+    """
+    async with run.stop_lock:
+        if run.halted:
+            return run.halt_method
+
+        method = "already_exited"
+        if run.proc.returncode is None:
+            if run.container_name:
+                if await stop_container(
+                    run.container_name, timeout=DEFAULT_STOP_TIMEOUT
+                ):
+                    method = "docker_stop"
+                elif await kill_container(run.container_name):
+                    method = "docker_kill"
+                else:
+                    method = "process"
+            else:
+                method = "process"
+
+            # Whether or not docker cooperated, make sure the local client
+            # is gone too -- a lingering `docker run` would keep the PTY
+            # and its slot in the table alive.
+            await _terminate(run.proc)
+
+        run.halted = True
+        run.halt_method = method
+        return method
+
+
 # -- Configuration CRUD --------------------------------------------------------
 
 
@@ -174,6 +230,18 @@ async def update_config(config_id: str, body: RunnerConfigUpdate) -> dict[str, A
 
 @router.delete("/runner/configs/{config_id}")
 async def delete_config(config_id: str) -> dict[str, Any]:
+    # A running engine was launched from this configuration and is still
+    # holding its port and GPU. Deleting the config would leave a live
+    # container with nothing describing it -- stop the run first.
+    active = registry.get_active()
+    if active is not None and active.status == "running" and active.config_id == config_id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{active.config_name or 'this configuration'} is currently running. "
+                "Stop it before deleting."
+            ),
+        )
     try:
         await get_store().delete(config_id)
     except RunnerStoreError as exc:
@@ -218,13 +286,21 @@ async def preview_command(body: PreviewRequest) -> dict[str, Any]:
 
 @router.post("/runner/configs/{config_id}/run")
 async def run_config(
-    config_id: str, body: Optional[RunRequest] = None
-) -> StreamingResponse:
+    config_id: str,
+    request: Request,
+    body: Optional[RunRequest] = None,
+) -> dict[str, Any]:
+    """Start a configuration's engine and return immediately.
+
+    Starting and watching are separate calls: this launches the run, and
+    ``GET /runner/runs/{run_id}/stream`` delivers its console. Separating
+    them is what lets a browser that arrives later attach to a run it did
+    not start -- the run belongs to the backend, not to the request that
+    launched it.
+    """
     cfg = get_store().get(config_id)
     if cfg is None:
         raise HTTPException(status_code=404, detail="configuration not found")
-
-    run_id = uuid.uuid4().hex[:12]
 
     # Reconstruct the concrete command from the stored template and the
     # parameter values (request overrides take precedence over stored).
@@ -234,76 +310,69 @@ async def run_config(
     except ParamError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Allocate a pseudo-terminal so the command sees a real TTY. This lets
-    # `docker run -it ...` (TTY-allocating flags) work from the dashboard;
-    # without it Docker aborts with "stdin is not a terminal".
     try:
-        master_fd, slave_fd = pty.openpty()
-    except OSError as exc:
-        raise HTTPException(
-            status_code=500, detail=f"failed to allocate pty: {exc}"
-        ) from exc
-
-    try:
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdin=slave_fd,
-            stdout=slave_fd,
-            stderr=slave_fd,
+        run = await registry.start(
+            command=command,
+            config_id=config_id,
+            config_name=cfg.get("name", ""),
         )
-    except Exception as exc:  # noqa: BLE001 -- surface as a stream error
-        os.close(master_fd)
-        os.close(slave_fd)
+    except Exception as exc:  # noqa: BLE001 -- surface a clean start failure
         raise HTTPException(
             status_code=502, detail=f"failed to start command: {exc}"
         ) from exc
-    # The child holds the slave side; the parent only reads/writes the master.
-    os.close(slave_fd)
 
-    _active_runs[run_id] = proc
-
-    # Bridge the PTY master onto an asyncio StreamReader.
-    reader = asyncio.StreamReader()
-    read_protocol = asyncio.StreamReaderProtocol(reader)
-    loop = asyncio.get_running_loop()
-    master_file = os.fdopen(master_fd, "rb", buffering=0)
-    try:
-        await loop.connect_read_pipe(lambda: read_protocol, master_file)
-    except Exception as exc:  # noqa: BLE001
-        _active_runs.pop(run_id, None)
-        await _terminate(proc)
-        master_file.close()
-        raise HTTPException(
-            status_code=502, detail=f"failed to attach pty: {exc}"
-        ) from exc
-
-    async def stream() -> AsyncIterator[str]:
+    # A configuration that declares a `port` is a network server, so the
+    # dashboard follows it: repoint the live-status client at the engine we
+    # just launched. Done *after* the start succeeds, so a run that failed
+    # to launch cannot leave the dashboard pointed at nothing.
+    state = request.app.state.rt
+    engine_port = port_from_params(params)
+    if engine_port is not None:
         try:
-            yield _sse("started", {"run_id": run_id, "command": command})
-            while True:
-                try:
-                    chunk = await reader.read(65536)
-                except (OSError, ConnectionResetError):
-                    # PTY master raises EIO once the child's terminal closes.
-                    break
-                if not chunk:
-                    break
-                text = chunk.decode(errors="replace")
-                # A PTY emits CRLF; normalise so the console renders cleanly.
-                text = text.replace("\r\n", "\n").replace("\r", "\n")
-                yield _sse("stdout", {"text": text})
-            exit_code = await proc.wait()
-            yield _sse("exit", {"exit_code": exit_code})
-        finally:
-            _active_runs.pop(run_id, None)
-            await _terminate(proc)
-            try:
-                master_file.close()
-            except OSError:
-                pass
+            snapshot = await set_engine_target(
+                state,
+                engine_url(engine_port),
+                config_id,
+                cfg.get("name"),
+                # The chat needs the model id the engine actually serves.
+                # Take it from the config; /health overrides it when the
+                # engine reports one.
+                model_name=_param_value(params, "served_model_name"),
+            )
+            run.engine_url = snapshot["base_url"]
+        except EngineTargetError as exc:
+            # The run itself is fine; only the switch failed. Say so rather
+            # than leaving the user guessing why the live view is stale.
+            run.engine_switch_error = str(exc)
+
+    return run.summary()
+
+
+@router.get("/runner/active")
+async def get_active_run() -> dict[str, Any]:
+    """The currently running engine, if any.
+
+    Cheap enough for the UI to poll so a run that exits on its own -- a
+    crash, an OOM -- is reflected in the buttons even with no console
+    stream open.
+    """
+    run = registry.get_active()
+    return {"active": run.summary() if run else None}
+
+
+@router.get("/runner/runs/{run_id}/stream")
+async def watch_run(run_id: str) -> StreamingResponse:
+    """Attach a viewer to a live run: backlog first, then the live tail.
+
+    Disconnecting detaches the viewer and nothing else. The run keeps
+    going -- stopping it is the Stop button's job, not the connection's.
+    """
+    run = registry.get_active()
+    if run is None or run.run_id != run_id:
+        raise HTTPException(status_code=404, detail="run is not active")
 
     return StreamingResponse(
-        stream(),
+        stream_console(run),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -315,8 +384,8 @@ async def run_config(
 
 @router.post("/runner/runs/{run_id}/stop")
 async def stop_run(run_id: str) -> dict[str, Any]:
-    proc = _active_runs.get(run_id)
-    if proc is None:
+    run = registry.get_active()
+    if run is None or run.run_id != run_id:
         raise HTTPException(status_code=404, detail="run is not active")
-    await _terminate(proc)
-    return {"stopped": run_id}
+    method = await registry.stop_active()
+    return {"stopped": run_id, "method": method}

@@ -8,6 +8,11 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from ..config import settings
+from .engine_target import (
+    normalise_base_url,
+    save_target_async,
+    load_target,
+)
 from .halogen_client import HalogenClient
 from .rocm_monitor import RocmMonitor
 from .system_monitor import SystemMonitor
@@ -113,16 +118,79 @@ class RuntimeState:
     """Mutable runtime state shared between the poller and the API routers."""
 
     def __init__(self) -> None:
+        # The engine address is whatever was last selected (persisted), not
+        # necessarily the startup default: the user may have switched to a
+        # different engine before this process started.
+        saved = load_target()
+        initial_url = (saved or {}).get("base_url") or settings.halogen_host
+
         self.poll_interval: float = settings.poll_interval_seconds
         self.latest: Optional[dict[str, Any]] = None
         self.wake: asyncio.Event = asyncio.Event()
-        self.halogen: HalogenClient = HalogenClient(settings.halogen_host)
+        self.halogen: HalogenClient = HalogenClient(initial_url)
         self.monitor: SystemMonitor = SystemMonitor()
         self.rocm: RocmMonitor = RocmMonitor()
         self.stats: StatsTracker = StatsTracker()
+        # Which LLM-Runner configuration the current engine came from, for
+        # display. None when the target is the startup default.
+        self.engine_config_id: Optional[str] = (saved or {}).get("config_id")
+        self.engine_config_name: Optional[str] = (saved or {}).get("config_name")
         # Served model id, refreshed from /health on every poll. Used by
         # /api/v1/count-tokens (the model field is required by Halogen).
-        self.model_name: str = "halogen-qwen3.8-flash-next"
+        # Seeded from the persisted target so a restart keeps the model of
+        # the engine we are pointed at, not the startup default.
+        saved_model = (saved or {}).get("model_name")
+        self.model_name: str = (
+            saved_model.strip() if isinstance(saved_model, str) and saved_model.strip()
+            else settings.default_model
+        )
+
+
+async def set_engine_target(
+    state: RuntimeState,
+    base_url: str,
+    config_id: Optional[str] = None,
+    config_name: Optional[str] = None,
+    model_name: Optional[str] = None,
+) -> dict[str, Any]:
+    """Point the dashboard at a different engine, and remember it.
+
+    ``HalogenClient`` builds each request URL from ``base_url`` at call
+    time rather than at construction, so reassigning it here takes effect
+    on the very next request -- nothing needs to be rebuilt. The write is
+    persisted so a backend restart comes back on the same engine, and the
+    poll loop is woken so the new state shows up immediately instead of
+    after a full interval.
+
+    ``model_name`` is the id the engine serves, taken from the run
+    configuration. It seeds ``state.model_name`` right away so the chat
+    asks for the right model even before the first successful ``/health``
+    -- an engine that does not report its model in ``/health`` would
+    otherwise leave the chat on whatever the previous engine used.
+    """
+    url = normalise_base_url(base_url)
+    model = (model_name or "").strip()
+    state.halogen.base_url = url
+    state.engine_config_id = config_id
+    state.engine_config_name = config_name
+    if model:
+        state.model_name = model
+    # Persist whatever the model now actually is. A switch that supplies
+    # no model -- a hand-typed address in the engine chip, say -- keeps the
+    # current one rather than silently blanking it on disk while the
+    # running process still holds it.
+    await save_target_async(url, config_id, config_name, state.model_name)
+    state.wake.set()
+    return engine_target_snapshot(state)
+
+
+def engine_target_snapshot(state: RuntimeState) -> dict[str, Any]:
+    return {
+        "base_url": state.halogen.base_url,
+        "config_id": state.engine_config_id,
+        "config_name": state.engine_config_name,
+        "model_name": state.model_name,
+    }
 
 
 def utc_now_iso() -> str:

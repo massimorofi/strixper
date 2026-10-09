@@ -110,10 +110,27 @@ Read from environment variables / a `.env` file (`backend/app/config.py`):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `HALOGEN_HOST` | `http://127.0.0.1:8731` | Halogen server base address |
+| `HALOGEN_HOST` | `http://127.0.0.1:8731` | **Initial** engine address only — superseded at runtime by the engine target (see §4.9) |
 | `POLL_INTERVAL_SECONDS` | `5` | Background poll cadence (seconds) |
 | `BIND_HOST` | `0.0.0.0` | Backend bind host |
 | `BIND_PORT` | `8000` | Backend bind port |
+| `RUNNER_STORE_PATH` | `backend/data/llm_runner_configs.json` | LLM-Runner config store (see §4.6) |
+| `RUNNER_STOP_TIMEOUT` | `5` | Seconds `docker stop` waits before force-killing (see §4.8) |
+| `RUNNER_CONSOLE_BYTES` | `2097152` | Console history kept for late-joining viewers (see §4.10) |
+| `RUNNER_SUBSCRIBER_QUEUE` | `2000` | Per-viewer output queue depth (see §4.10) |
+| `RUNNER_ADOPT_TAIL` | `2000` | Lines of `docker logs` pulled when adopting a container |
+| `RUNNER_RELEASE_WAIT` | `20` | Seconds to wait for a stopped container's port/GPU to free |
+| `RUNNER_STOP_SETTLE` | `15` | Seconds a stop waits for the output pump to record the exit |
+| `RUNNER_SSE_HEARTBEAT` | `15` | Seconds of silence before a console stream sends `ping` |
+| `RUNNER_RECONCILE` | `20` | Seconds between scans for an untracked engine container |
+| `ENGINE_TARGET_PATH` | `backend/data/engine_target.json` | Remembered engine target (see §4.9) |
+| `DEFAULT_MODEL` | `halogen-qwen3.8-flash-next` | Model id assumed before any engine reports one |
+
+`HALOGEN_HOST` is easy to over-read: it is where the dashboard starts
+looking, not where it keeps looking. As soon as an engine is started through
+the LLM-Runner (or the target is set by hand), that becomes the address of
+record and it is remembered across restarts. The `.env` value is reached
+only on a fresh install with no saved target.
 
 Numeric values are validated: a non-positive or unparsable `POLL_INTERVAL_SECONDS`
 falls back to `5`.
@@ -137,8 +154,10 @@ All endpoints are mounted under the `/api/v1` prefix.
 | `/api/v1/runner/configs` | `POST` | On-demand (LLM-Runner tab) | Create a new run configuration |
 | `/api/v1/runner/configs/{id}` | `PUT` | On-demand (LLM-Runner tab) | Edit an existing configuration |
 | `/api/v1/runner/configs/{id}` | `DELETE` | On-demand (LLM-Runner tab) | Delete a configuration |
-| `/api/v1/runner/configs/{id}/run` | `POST` | On-demand (LLM-Runner tab) | Start the rendered docker command (SSE stream) |
+| `/api/v1/runner/configs/{id}/run` | `POST` | On-demand (LLM-Runner tab) | Start the rendered docker command (returns JSON) |
+| `/api/v1/runner/active` | `GET` | Polled ~3 s (LLM-Runner tab) | The run currently live, or `null` |
 | `/api/v1/runner/preview` | `POST` | On-demand (LLM-Runner tab) | Render a command template against its parameters, without running |
+| `/api/v1/runner/runs/{run_id}/stream` | `GET` | Per viewer (LLM-Runner tab) | Attach to the live console (SSE) |
 | `/api/v1/runner/runs/{run_id}/stop` | `POST` | On-demand (LLM-Runner tab) | Stop a running docker command |
 | `/api/v1/healthz` | `GET` | On-demand | Backend's own liveness (independent of Halogen) |
 
@@ -296,17 +315,25 @@ CPU model and thread count are read from `/proc/cpuinfo`; GPU name from
 
 #### `GET /api/v1/config` / `POST /api/v1/config`
 
-`GET` returns `{ "poll_interval_seconds": <float>, "halogen_host": "<url>" }`.
+`GET` returns
+`{ "poll_interval_seconds": <float>, "halogen_host": "<url>", "engine_config_id": <string|null>, "engine_config_name": <string|null> }`.
 
-`POST` accepts a JSON body:
+`POST` accepts a JSON body in which either or both fields may appear:
 
 ```json
-{ "poll_interval_seconds": 10 }
+{ "poll_interval_seconds": 10, "halogen_host": "http://127.0.0.1:18080" }
 ```
 
 `poll_interval_seconds` is validated to `0.5 … 300`. On a successful update the
 poller is woken immediately (`state.wake.set()`) so the new cadence takes effect
 without waiting out the old interval.
+
+`halogen_host` repoints the dashboard at a different engine — see §4.9 for the
+mechanism and its persistence. It is validated (http/https scheme and a real
+host required) and a rejected address is a `400` carrying the reason, not a
+silent no-op. Setting it by hand clears `engine_config_id` /
+`engine_config_name`, since a hand-picked address has no originating
+configuration.
 
 #### `POST /api/v1/stats/reset`
 
@@ -511,42 +538,100 @@ saving or running anything, so the UI can show exactly what a run would
 launch through the same code path the run itself uses. `400` if a referenced
 parameter is missing or blank.
 
+**A run is a server-side resource, not a browser connection.** Starting and
+watching are separate calls, so any number of browsers can follow the same
+engine, and closing one never affects the run. See §4.10 for the service
+that owns this.
+
 **`POST /api/v1/runner/configs/{id}/run`** — renders the stored
-`docker_command` against the configuration's parameter values, launches the
-resulting command as a shell subprocess, and streams its merged
-stdout/stderr back as `text/event-stream` (same SSE framing as
-`/api/v1/chat`):
+`docker_command` against the configuration's parameter values, launches it,
+and returns the run summary as JSON immediately. It does **not** stream;
+the console comes from `GET …/stream`.
 
-| Event | Data | Meaning |
-| --- | --- | --- |
-| `started` | `{"run_id": "…", "command": "…"}` | Process launched |
-| `stdout` | `{"text": "…"}` | An output chunk (stdout + stderr merged) |
-| `exit` | `{"exit_code": 0}` | Process terminated |
-| `error` | `{"message": "…"}` | Failed to start / stream failure |
+If another engine is already running it is stopped first, and the stop is
+**awaited** — the new container usually wants the same GPU and often the
+same published port, and launching into a still-held port is exactly the
+failure that reads as a mysterious crash-on-start. The new configuration is
+validated (rendered, container name extracted) *before* anything running is
+touched, so a typo in the new config cannot take down a working engine.
 
-The `command` in the `started` event is the **rendered** command — the
-template with every `{placeholder}` already replaced — so what actually ran
-is always visible in the stream.
-
-An optional body `{ "values": { "port": "9000", … } }` overrides individual
+Body: optional `{ "values": { "port": "9000", … } }` overrides individual
 parameter values for this run only; nothing is written back to the store.
 Override keys must be parameters the configuration already declares — an
 unknown key is a `400` rather than a silent no-op, so a typo cannot quietly
 leave the stored value in place. `400` is also returned if a parameter the
-template needs ends up blank.
+template needs ends up blank. `404` if the config is unknown; `502` if the
+command cannot be launched.
 
-The subprocess is launched attached to a **pseudo-terminal (PTY)** so the
-command sees a real TTY. This is required for TTY-allocating docker flags
-(`-t` / `-it`); without a PTY Docker aborts with *"cannot attach stdin to a
-TTY-enabled container because stdin is not a terminal"*. The PTY emits CRLF,
-which the backend normalises to LF before streaming. The run is assigned a
-`run_id` (sent in the `started` event). The process is terminated
-automatically when the client disconnects. `404` if the config is unknown;
-`502` if the command cannot be launched.
+Response — the run summary:
 
-**`POST /api/v1/runner/runs/{run_id}/stop`** — sends `SIGTERM` to the running
-process (escalating to `SIGKILL` after a 5 s grace period). Returns
-`{ "stopped": "<run_id>" }`, or `404` if the run is not active.
+```json
+{
+  "run_id": "cc7c704e4814",
+  "config_id": "10082f82ee6a",
+  "config_name": "Halogen-Qwen3.8-flash-next",
+  "container_name": "ai-toolbox-cockpit-halogen-server-334446c6",
+  "engine_url": "http://127.0.0.1:8731",
+  "started_at": "2026-10-09T21:57:14Z",
+  "status": "running",
+  "exit_code": null,
+  "adopted": false,
+  "engine_switch_error": null
+}
+```
+
+`container_name` is the value of the command's `--name` flag, or `null`
+when the command has none. `engine_url` is the address the dashboard has
+just been repointed at, or `null` when the configuration declares no
+`port` parameter and so left the target alone (see §4.9).
+`engine_switch_error` carries the reason the repoint failed, when it did —
+the run itself is fine in that case, so it is reported rather than left for
+the user to infer from a stale live view.
+
+**`GET /api/v1/runner/active`** — `{ "active": <run summary> }`, or
+`{ "active": null }` when nothing is running. Cheap enough to poll, which
+is how the UI keeps its Run/Stop buttons honest when a run exits on its own.
+
+**`GET /api/v1/runner/runs/{run_id}/stream`** — attaches a viewer to the
+live run as `text/event-stream` (same SSE framing as `/api/v1/chat`):
+
+| Event | Data | Meaning |
+| --- | --- | --- |
+| `state` | `{"run_id": "…", "status": "…", "exit_code": null, "backlog": "…"}` | Current state plus everything already produced |
+| `stdout` | `{"text": "…"}` | A new output chunk (stdout + stderr merged) |
+| `ping` | `{}` | Keepalive during a quiet stretch |
+| `exit` | `{"exit_code": 0}` | Process terminated |
+| `error` | `{"message": "…"}` | Stream failure |
+
+The viewer subscribes **before** the backlog is read, with no `await`
+between, so nothing produced in that gap is lost or repeated. A late joiner
+gets the whole buffered console in the `backlog` field rather than an empty
+window — which is the whole point of a run that outlives the browser that
+started it.
+
+Disconnecting detaches that one viewer and nothing else. **The run keeps
+going.** Stopping it is the Stop button's job, not the connection's.
+`404` if the run is not the active one.
+
+**`POST /api/v1/runner/runs/{run_id}/stop`** — stops the run by stopping
+its **container** through docker (`docker stop --time N`), then reaps the
+local `docker run` client process. Returns
+`{ "stopped": "<run_id>", "method": "docker_stop" }`, or `404` if the run
+is not active.
+
+`method` reports what actually did it: `docker_stop` (graceful stop
+succeeded), `docker_kill` (the container ignored the graceful stop and was
+force-killed), `process` (no container handle, so only the client was
+killed), or `already_exited`.
+
+Stopping goes through docker rather than signalling the client because
+`docker run -it` attaches the CLI to a pseudo-terminal: killing that client
+does **not** stop the container, which keeps running with nothing attached,
+holding the GPU and the published port. `docker stop` sends SIGTERM to the
+container's PID 1 and escalates to SIGKILL after `N` seconds
+(`RUNNER_STOP_TIMEOUT`, default 5). A command with no `--name` gives no
+handle to stop by, so it falls back to killing the client only — include
+`--name` for a reliable stop.
 
 #### `GET /api/v1/healthz`
 
@@ -683,8 +768,16 @@ reporting yet", not a real zero.
 
 **`RuntimeState`** — `poll_interval`, `latest`, `wake` (asyncio.Event),
 `halogen` (HalogenClient), `monitor` (SystemMonitor), `rocm` (RocmMonitor),
-`stats` (StatsTracker), `model_name` (served model id, refreshed from `/health`
-on every poll and used by `/api/v1/count-tokens`).
+`stats` (StatsTracker), `model_name` (served model id, used by
+`/api/v1/count-tokens` and by the chat's `model` field).
+
+`model_name` is seeded from the persisted engine target at startup, falling
+back to `DEFAULT_MODEL`, and refreshed from `/health` on every poll that
+reports a `model`. The `/health` value wins when present — the engine is
+authoritative — but a run configuration's `served_model_name` is applied
+immediately on switch, so an engine that does not report its model in
+`/health` still gets the right id from the first request rather than
+inheriting whatever the previous engine used.
 
 **`build_live_snapshot(state)`** — polls Halogen and rocm **concurrently**
 (`asyncio.gather(..., return_exceptions=True)`), reads local hardware, attaches
@@ -755,6 +848,220 @@ The substitution layer shared by the store (validation) and the run path
 for per-row form feedback, so the form can give live warnings. The backend stays
 the authority: it re-validates on save and at run time.
 
+### 4.8 `docker_control` (`services/docker_control.py`)
+
+Stopping a run means stopping the **container**, not the process that launched
+it. With `docker run -it` the CLI is attached to a pseudo-terminal, and a
+signal to that client tears down its own stream handling without reliably
+reaching the container — the container survives, still holding the GPU and the
+published port, with nothing attached to it. Every stop path therefore goes
+through the docker CLI.
+
+* **`extract_container_name(command)`** reads the `--name` value out of the
+  *rendered* command (`--name foo` and `--name=foo` both match), so parameter
+  substitution has already happened. An unrendered `{placeholder}` is skipped:
+  it would name a container that cannot exist. `None` when the command has no
+  `--name`, which leaves no handle to stop by.
+* **`stop_container(name, timeout)`** — `docker stop --time N`, graceful
+  SIGTERM to the container's PID 1 with docker escalating to SIGKILL after
+  `N` seconds. **`kill_container(name)`** — `docker kill`, immediate.
+  **`container_is_running(name)`** — `docker inspect -f {{.State.Running}}`.
+  Each returns a boolean rather than raising, so the caller can treat a failed
+  docker call as "try the next strategy".
+* **Timeouts.** `RUNNER_STOP_TIMEOUT` (default 5 s) is how long docker waits
+  for the container before force-killing it; keep it short so the Stop button
+  stays responsive against a server that ignores SIGTERM. Every docker CLI call
+  additionally carries `DOCKER_CLI_GUARD` (25 s) of headroom on our own wait,
+  so a wedged docker daemon surfaces as a failed stop rather than a hung
+  request.
+* **Teardown is idempotent.** `ActiveRun.stop()` in the run registry guards
+  each run with its own `asyncio.Lock` and records `_halted`/`_halt_method`,
+  so repeated stops are safe and the second caller gets the first caller's
+  `halt_method` back. Nothing stops a run on browser disconnect any more —
+  see §4.10.
+* **Fallback chain.** `docker stop` → `docker kill` → kill the client process.
+  A run whose command has no `--name` reports `method: "process"` and can
+  still orphan its container; configurations should always pass `--name`.
+* **`list_running_names()`** — `docker ps --format {{.Names}}`, `[]` on any
+  failure. One call rather than one `inspect` per configuration, because
+  discovery runs on a timer.
+* **`inspect_started_at(name)`** — `docker inspect -f {{.State.StartedAt}}`.
+  Used for adopted runs: the container was already up, so docker's own clock
+  is the honest start time rather than the moment we noticed it.
+
+### 4.9 `engine_target` (`services/engine_target.py`)
+
+Which engine the dashboard reads its live metrics from.
+
+**Why this exists.** `HALOGEN_HOST` is read once at process launch, so a
+dashboard configured for one engine can never see another. Running a second
+engine — a different model, a different server, a different port — left the
+live view polling a dead address. The target is now a piece of runtime state
+rather than a startup constant.
+
+* **Two different addresses, deliberately not conflated.**
+  - `bind` (a *configuration parameter*, rendered into `-p {bind}:{port}`)
+    decides who may reach the container from outside: `127.0.0.1` for
+    local-only, `0.0.0.0` for the LAN.
+  - the **engine target** decides where *this backend* connects to reach the
+    engine. It is always loopback — the backend supervises containers on its
+    own host, and routing to a local service via an outward-facing address
+    just adds a failure mode.
+
+  Note that a docker command may contain two bind-ish things. GUFO's
+  `--host 0.0.0.0` is the server binding *inside* the container and must
+  stay `0.0.0.0` for the published port to work at all; only the `-p`
+  host-published address is parameterised.
+
+* **Auto-switch on run start.** A configuration that declares a `port`
+  parameter is treated as a network server, so launching one repoints the
+  dashboard at `http://127.0.0.1:{port}` and records the originating
+  `config_id` / `config_name`. A configuration with no `port` leaves the
+  target alone. The switch happens in the request handler, immediately
+  after the run launches successfully — a run that failed to start cannot
+  leave the dashboard pointed at nothing.
+
+* **The served model travels with the target.** The target also stores
+  `model_name`, taken from the configuration's `served_model_name`
+  parameter. This is not decoration: the chat sends a `model` field on
+  every request, and an engine that does not report its model in `/health`
+  would otherwise leave the chat asking for whatever the *previous* engine
+  served. `/health` still overrides it when the engine reports one — the
+  engine is authoritative, the config value is the floor. A manual
+  `POST /config {"halogen_host": …}` with no model supplied keeps the
+  current one rather than blanking the persisted value.
+
+* **Stop does not revert.** Per the chosen semantics, stopping a run leaves
+  the target where it is. If that engine is gone the live view honestly
+  shows "Connection Lost"; starting another configuration switches again.
+  `POST /config {"halogen_host": …}` is the manual escape hatch.
+
+* **Persistence is best-effort.** The switch has already taken effect in
+  memory before anything is written, so an unwritable
+  `engine_target.json` logs a warning and the run proceeds. On startup a
+  missing, unreadable, or corrupt target file falls back to `HALOGEN_HOST`
+  — the same philosophy as the config store: a bad file must never wedge
+  the app.
+
+* **`normalise_base_url`** requires an http/https scheme and a non-empty
+  host, and strips the trailing slash so callers can safely append
+  `/health`. It raises `EngineTargetError` rather than guessing, so a typo
+  surfaces as a `400` instead of a silently unreachable client.
+
+* **Why mutating `base_url` is safe.** `HalogenClient` builds every
+  request URL from `self.base_url` at call time
+  (`f"{self.base_url}/health"`), not at construction, so reassignment
+  takes effect on the next request with nothing to rebuild. httpx pools
+  connections by origin and caches no responses, so old pooled
+  connections to the previous engine simply idle out. All the in-memory
+  mutations in `set_engine_target` happen with no `await` between them, so
+  no other coroutine can observe a half-updated target.
+
+**Consequence worth knowing:** `chat.py` and `tokens.py` read the same
+`state.halogen` client. Repointing the target redirects the chat proxy and
+the token counter too — which is the intended behaviour, but it means the
+target engine must actually speak the API those tabs use.
+
+### 4.10 `run_registry` (`services/run_registry.py`)
+
+Owns the one live engine run as a server-side resource.
+
+**Why this exists.** A run used to be a property of one HTTP stream: its
+reader lived inside the SSE generator, and the generator's `finally`
+stopped the container. That made two ordinary things impossible. A second
+browser could not see a run another browser had started — its Stop button
+was missing and its console was empty. And closing a browser killed an
+engine the user still wanted up, because "nobody is watching" was being read
+as "nobody wants this running".
+
+So the run lives here instead, owned by the backend. A background pump reads
+the container's output from the moment the run starts, keeps a rolling
+backlog, and fans it out to any number of viewers. Viewers come and go; the
+run does not care. It is stopped only by an explicit stop.
+
+* **Two ways a run begins.**
+  - **Started** — we launch `docker run` ourselves under a PTY and read the
+    PTY master. Preferred, because two things reach the client's stderr and
+    *never* appear in `docker logs`: image-pull progress, and daemon-side
+    flag errors (`manifest for xyz not found`, a bad device path). That is
+    precisely the output an operator needs when a start goes wrong.
+  - **Adopted** — a container is already running, started before this
+    backend process existed or by another tool. There is no terminal on it,
+    so the console comes from `docker logs -f --tail N`. Same interface to
+    the caller, same stop path, `adopted: true` in the summary.
+
+* **The pump is the sole writer of terminal state.** Everything that ends a
+  run — a crash, an exit, a stop, the container dying on its own — arrives
+  as EOF on the read side, so exactly one place decides a run is over and
+  records `status: "exited"` with its `exit_code`. `stop()` asks docker to
+  stop the container and then *awaits* the pump under `asyncio.shield`, so
+  a cancelled HTTP request cannot kill the pump and leave the run stuck
+  reporting "running". If the pump is wedged past `RUNNER_STOP_SETTLE`,
+  the stop settles the state itself.
+
+* **Detached (`-d`) configurations.** EOF on our own PTY does not
+  necessarily mean the run ended — a detached run's client exits straight
+  away while the container keeps serving. On EOF the registry checks whether
+  the container is still up and, if so, swaps the console source to
+  `docker logs -f` rather than declaring the run dead.
+
+* **Fan-out and backpressure.** Each viewer gets a bounded
+  `asyncio.Queue(RUNNER_SUBSCRIBER_QUEUE)`. When a viewer's queue is full
+  the buffer **drops that queue's oldest chunk** and counts it
+  (`dropped_chunks` / `dropped_bytes`), rather than evicting the viewer.
+  The distinction matters: Chrome throttles a backgrounded tab to roughly
+  one timer tick a second, and a viewer dropped on the first lag would
+  never see the rest of the run. Shedding old lines costs a little history;
+  eviction loses the console entirely.
+
+* **The console buffer is capped by bytes, not lines**
+  (`RUNNER_CONSOLE_BYTES`, default 2 MiB ≈ eight hours of a busy engine's
+  access logging). A line-count cap is not a bound at all — chunk sizes
+  vary, and one large read could carry the whole budget.
+
+* **The backlog/subscribe race is closed by ordering.** The viewer
+  subscribes *before* the backlog snapshot is taken, with no `await`
+  between, so anything produced in between lands in the live stream with a
+  sequence number above the backlog's. Nothing is lost, nothing is
+  duplicated.
+
+* **No locks around the buffer or the subscriber set, deliberately.** Every
+  mutating method there is fully synchronous with no `await` inside it, so
+  each is atomic with respect to other tasks on the event loop. Locks appear
+  only around work that genuinely spans an await: stopping, and switching
+  from one run to the next (`_switch_lock`).
+
+* **Switching runs awaits the old stop.** Two stored configurations that
+  publish the same host port cannot coexist. Starting a run stops the
+  current one and then `_wait_until_gone()` polls until docker reports the
+  old container actually gone (up to `RUNNER_RELEASE_WAIT`) before
+  launching, because firing the new start against a still-held port is the
+  failure that reads as a mysterious crash-on-start. The *new*
+  configuration is validated — rendered, container name extracted — before
+  anything running is touched, so a typo in the new config cannot take down
+  a working engine.
+
+* **Reconcile, not a one-shot scan.** Adoption runs at startup *and* on a
+  timer (`RUNNER_RECONCILE`, default 20 s) whenever nothing is active. A
+  startup-only scan has a hole in it: if the backend restarts while
+  `docker run` is still pulling an image, the container does not exist
+  yet, nothing adopts it, and the dashboard stays blind to it forever. The
+  loop turns adoption from a snapshot into a property the system keeps.
+
+* **Discovery matches on the rendered container name.** Each configuration's
+  command is rendered exactly as a real start would render it, the
+  `--name` is read out of that result, and docker is asked whether that
+  container is up (`docker ps`). Matching against what would actually run,
+  rather than a stored string that may have drifted, is the point.
+
+* **Backend shutdown leaves containers running.** Deliberate, and
+  consistent with "on open, detect which engine is running": a restart of
+  the dashboard should not silently take down an engine that is serving.
+  The next startup adopts it again.
+
+* **Deleting a running configuration is refused** with `409`. It would
+  leave a live container with nothing describing it. Stop the run first.
+
 ---
 
 ## 5. Frontend Dashboard Specification
@@ -764,6 +1071,14 @@ the authority: it re-validates on save and at run time.
 * App name: **Halogen Strix Halo Operations Dashboard**.
 * Connection status indicator (green = connected, red = lost), driven by
   `data.connected`.
+* **Engine target chip** — shows the address the dashboard is currently
+  reading from, plus the name of the LLM-Runner configuration it came from
+  (e.g. `⬢ http://127.0.0.1:18080 · GUFO`). Clicking it opens an inline
+  editor (input + save/cancel, Enter saves, Escape closes) that POSTs
+  `halogen_host` to `/api/v1/config`; a rejected address is shown inline
+  rather than silently ignored. The chip is the manual override for engines
+  started outside the LLM-Runner — the normal path is the automatic switch
+  on run start (see §4.9).
 * Auto-refresh selector: `1s`, `5s` (default), `10s`, `30s`, `Off`. Changing it
   updates the local `refetchInterval` **and** POSTs the new
   `poll_interval_seconds` to `/api/v1/config`.
@@ -901,11 +1216,17 @@ a single column:
   description (if any), the docker command template (truncated, full template in
   the `title` tooltip) and — when the config has them — a wrapped row of
   `name=value` chips, one per parameter, each carrying the parameter's label in
-  its `title`. Per-config actions: **Run** (▶, primary), **Edit** (pencil) and
-  **Delete** (trash, right-aligned). While a config is running it shows a
-  pulsing `RUNNING` badge and its **Run** and **Delete** buttons are disabled
-  (Edit stays available). The empty state shows a terminal icon with a short
-  prompt to create a configuration.
+  its `title`. Per-config actions: **Run** (▶, primary), **Stop** (■),
+  **Edit** (pencil) and **Delete** (trash). While a config is running it shows
+  a pulsing `RUNNING` badge, its **Run** and **Delete** buttons are disabled,
+  and its **Stop** is enabled; on every other card **Stop** is disabled and
+  **Run** is enabled. Edit is always available.
+
+  **Stop lives on the card, not only in the console, and is disabled rather
+  than hidden when idle.** A browser that merely *opens* the page — having
+  started nothing — must still be able to see which engine is live and stop
+  it. Disabled rather than hidden keeps the button positions identical across
+  every card so the layout never jumps.
 * **Right — Form + Run console.**
   * **Form** (`ConfigForm`): `Name` (≤ 120), `Docker command` (monospace
     textarea, `spellCheck={false}`), the **Run parameters** editor, and optional
@@ -932,25 +1253,46 @@ a single column:
     expands to show the concrete command the current template + parameter values
     produce, so the exact command line can be checked before running. Hidden when
     the template can't be rendered (blank values).
-  * **Run console:** a fixed-height (~420 px) scrolling monospace pane. Pressing
-    **Run** starts the configured command and streams its live output in,
-    appending chunks as they arrive with a blinking caret at the end while
-    running. The header shows the run status (`Idle` / `Running` (spinner) /
-    `Exited (code)` — green on 0, red otherwise) and a **Stop** button while
-    running. The footer shows the finish time and exit code after completion.
-    Runtime/stream errors render as an inline red banner inside the console.
+  * **Run console:** a fixed-height (~420 px) scrolling monospace pane with a
+    blinking caret at the end while running. The header shows the run status
+    (`Idle` / `Running` (spinner) / `Exited (code)` — green on 0, red
+    otherwise), the running config name, its container name, the engine URL the
+    dashboard is reading from, and an `adopted` marker when the engine was
+    already running rather than launched here. Runtime/stream errors render as
+    an inline red banner inside the console.
+
+    **The console attaches on mount**, keyed on the active run id, so a
+    browser that opens onto an already-running engine fills in from that
+    run's backlog instead of showing an empty pane. It does not wait for a
+    Run click in that browser.
+
+    Output chunks are buffered in a ref and flushed on a fixed ~100 ms beat
+    rather than per chunk, and the rendered string is capped at ~500 KB.
+    Appending to a React state string on every chunk is O(length) each time
+    and re-renders the whole `<pre>`; at an engine's full logging rate with
+    a multi-megabyte backlog that janks visibly. The cap keeps both memory
+    and re-render cost flat regardless of how long the run goes.
 
 Like the chat tab, the runner is **kept mounted** (hidden with a CSS `hidden`
 class) when another tab is selected, so switching tabs never interrupts a
 running container's output stream. The console auto-scrolls to the bottom on new
 output and when the tab is re-shown.
 
-**Client-side streaming.** `streamRunnerRun()` in `api.js` uses `fetch` with a
-`ReadableStream` reader (an `EventSource` cannot POST) and parses the SSE frames,
-dispatching `onStarted` / `onStdout` / `onExit` / `onError` callbacks. **Stop**
-aborts the in-flight `AbortController` *and* calls
-`POST /api/v1/runner/runs/{run_id}/stop`; the `run_id` is captured from the
-`started` event.
+**Run state is read, not held.** The tab polls
+`GET /api/v1/runner/active` every ~3 s and derives the Run/Stop button
+state from it, rather than tracking "did I press Run" in local state. That
+is what makes the buttons correct in a browser that did not start the run,
+and what makes a run that exits on its own — a crash, an OOM — update the
+UI with no stream open.
+
+**Client-side streaming.** A shared `readSSE(res, onEvent)` helper in
+`api.js` splits the byte stream on blank-line frame boundaries and
+dispatches each complete frame; both the runner console and the chat proxy
+use it. Around it: `startRunnerRun(configId, values)` (POST, returns the
+run summary), `fetchRunnerActive()` (GET, the live run or `null`),
+`openRunnerStream(runId, handlers)` (GET SSE, dispatching `onState` /
+`onStdout` / `onExit` / `onError`), and `stopRunnerRun(runId)`.
+`EventSource` is not used anywhere because it cannot POST.
 
 ### 5.6 Theme & Color
 
@@ -988,21 +1330,25 @@ backend/
       stats_routes.py       POST /stats/reset
       tokens.py             POST /count-tokens (Halogen count_tokens proxy)
       chat.py               POST /chat (streaming chat proxy, 4 API styles)
-      runner.py             LLM-Runner: config CRUD + run (SSE) + stop + preview
+      runner.py             LLM-Runner: config CRUD + start/watch/stop + preview
     services/
+      docker_control.py     stop/kill/inspect the container a run owns
+      engine_target.py      which engine the dashboard reads; resolve + persist
       halogen_client.py     async Halogen HTTP client + Prometheus parser
       system_monitor.py     sysfs/procfs telemetry (GTT/VRAM/RAM/CPU)
       rocm_monitor.py       GPU util + VRAM via `rocm-smi`
       tuning_checker.py     8-check compliance audit + system info
       live_service.py       MetricStats / StatsTracker / RuntimeState / poll loop
+      run_registry.py       the live run: pump, fan-out, adoption, reconcile
       runner_store.py       JSON-persisted store for LLM-Runner docker configs
       params.py             {name} template validation + command rendering
     data/
       llm_runner_configs.json   runtime store (gitignored)
+      engine_target.json        remembered engine target (gitignored)
 frontend/
   src/
     App.jsx                 tabs, theme, polling, 120-sample history buffer
-    api.js                  fetch helpers (fetchLiveStatus, postConfig, resetStats, countTokens, streamChat, createThinkSplitter, and the runner client: fetchRunnerConfigs, createRunnerConfig, updateRunnerConfig, deleteRunnerConfig, previewRunnerCommand, streamRunnerRun, stopRunnerRun, sendJSON)
+    api.js                  fetch helpers (fetchLiveStatus, fetchConfig, postConfig, resetStats, countTokens, streamChat, createThinkSplitter, and the runner client: fetchRunnerConfigs, createRunnerConfig, updateRunnerConfig, deleteRunnerConfig, previewRunnerCommand, startRunnerRun, fetchRunnerActive, openRunnerStream, stopRunnerRun) + the shared readSSE frame parser and sendJSON
     theme.js                chart + status color tokens (light/dark)
     format.js               number/percent/time formatters
     params.js               client-side {name} template helpers (placeholders, missing/unused, render, row validation)

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ChevronDown,
@@ -15,12 +15,13 @@ import {
 import {
   createRunnerConfig,
   deleteRunnerConfig,
+  fetchRunnerActive,
   fetchRunnerConfigs,
+  openRunnerStream,
+  startRunnerRun,
   stopRunnerRun,
-  streamRunnerRun,
   updateRunnerConfig,
 } from '../api.js'
-import { fmtTime } from '../format.js'
 import {
   MAX_PARAMS,
   missingParameters,
@@ -29,6 +30,13 @@ import {
   unusedParameters,
   validateRows,
 } from '../params.js'
+
+// The console is a live firehose; re-rendering a React string on every
+// chunk is O(length) each time and visibly janks a long run. Chunks are
+// collected in a ref and flushed on a fixed beat instead, and the rendered
+// string is capped so memory and re-render cost stay flat.
+const CONSOLE_FLUSH_MS = 100
+const CONSOLE_MAX_CHARS = 500_000
 
 const EMPTY_FORM = {
   name: '',
@@ -323,7 +331,15 @@ function ConfigForm({ initial, saving, error, onSubmit, onCancel }) {
   )
 }
 
-function ConfigList({ configs, runningId, onSelectRun, onEdit, onDelete }) {
+function ConfigList({
+  configs,
+  activeConfigId,
+  stopping,
+  onSelectRun,
+  onStop,
+  onEdit,
+  onDelete,
+}) {
   if (!configs.length) {
     return (
       <div className="flex h-full min-h-[120px] flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-[var(--border-hairline)] p-6 text-center">
@@ -341,7 +357,7 @@ function ConfigList({ configs, runningId, onSelectRun, onEdit, onDelete }) {
   return (
     <ul className="space-y-2">
       {configs.map((c) => {
-        const isRunning = runningId === c.id
+        const isRunning = activeConfigId === c.id
         const params = c.parameters || []
         return (
           <li
@@ -397,10 +413,28 @@ function ConfigList({ configs, runningId, onSelectRun, onEdit, onDelete }) {
                 <Play size={12} />
                 Run
               </button>
+              {/* Stop lives on every card rather than only the console, so a
+                  browser that merely opened the page can still see and
+                  control the running engine. Disabled rather than hidden
+                  when idle, so the layout never jumps. */}
+              <button
+                type="button"
+                disabled={!isRunning || stopping}
+                onClick={() => onStop(c)}
+                title={
+                  isRunning
+                    ? 'Stop this engine'
+                    : 'Nothing is running from this configuration'
+                }
+                className="inline-flex items-center gap-1.5 rounded-md border border-[var(--status-critical)] px-3 py-1.5 text-xs font-medium text-[var(--status-critical)] transition-colors hover:bg-[var(--surface-page)] disabled:cursor-not-allowed disabled:border-[var(--border-hairline)] disabled:text-[var(--text-muted)] disabled:opacity-60"
+              >
+                <Square size={12} />
+                {stopping && isRunning ? 'Stopping…' : 'Stop'}
+              </button>
               <button
                 type="button"
                 onClick={() => onEdit(c)}
-                className="inline-flex items-center gap-1.5 rounded-md border border-[var(--border-hairline)] px-3 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--surface-page)] hover:text-[var(--text-primary)]"
+                className="ml-auto inline-flex items-center gap-1.5 rounded-md border border-[var(--border-hairline)] px-3 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--surface-page)] hover:text-[var(--text-primary)]"
               >
                 <Pencil size={12} />
                 Edit
@@ -409,7 +443,7 @@ function ConfigList({ configs, runningId, onSelectRun, onEdit, onDelete }) {
                 type="button"
                 disabled={isRunning}
                 onClick={() => onDelete(c)}
-                className="ml-auto inline-flex items-center gap-1.5 rounded-md border border-[var(--border-hairline)] px-3 py-1.5 text-xs text-[var(--status-critical)] transition-colors hover:bg-[var(--surface-page)] disabled:cursor-not-allowed disabled:opacity-40"
+                className="inline-flex items-center gap-1.5 rounded-md border border-[var(--border-hairline)] px-3 py-1.5 text-xs text-[var(--status-critical)] transition-colors hover:bg-[var(--surface-page)] disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <Trash2 size={12} />
                 Delete
@@ -422,29 +456,47 @@ function ConfigList({ configs, runningId, onSelectRun, onEdit, onDelete }) {
   )
 }
 
-export default function RunnerTab({ active = true }) {
+export default function RunnerTab({ active = true, onEngineChange }) {
   const queryClient = useQueryClient()
   const { data, isLoading } = useQuery({
     queryKey: ['runner-configs'],
     queryFn: fetchRunnerConfigs,
   })
 
+  // The run is a server-side resource, so its state is read from the
+  // backend rather than kept in this component. Polling means a run that
+  // exits on its own -- a crash, an OOM -- is reflected in the buttons
+  // even with no console stream open, and a run started in another browser
+  // shows up here too.
+  const { data: activeRun } = useQuery({
+    queryKey: ['runner-active'],
+    queryFn: fetchRunnerActive,
+    refetchInterval: 3000,
+  })
+
   const [formInitial, setFormInitial] = useState(null)
   const [saving, setSaving] = useState(false)
   const [formError, setFormError] = useState(null)
 
-  const [runningId, setRunningId] = useState(null)
-  const [runningName, setRunningName] = useState('')
+  const [stopping, setStopping] = useState(false)
   const [output, setOutput] = useState('')
-  const [exitCode, setExitCode] = useState(null)
   const [runError, setRunError] = useState(null)
-  const abortRef = useRef(null)
+
+  const pendingRef = useRef('')
   const consoleRef = useRef(null)
 
   const configs = data?.configs || []
+  const isRunning = activeRun?.status === 'running'
+  const activeConfigId = isRunning ? activeRun?.config_id : null
 
   const refresh = () =>
     queryClient.invalidateQueries({ queryKey: ['runner-configs'] })
+
+  const refreshRunState = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: ['runner-active'] })
+    queryClient.invalidateQueries({ queryKey: ['engine-target'] })
+    queryClient.invalidateQueries({ queryKey: ['live-status'] })
+  }, [queryClient])
 
   const handleSubmit = async (form) => {
     setSaving(true)
@@ -474,48 +526,34 @@ export default function RunnerTab({ active = true }) {
     }
   }
 
-  const stopRun = async () => {
-    const runId = abortRef.current?.runId
-    abortRef.current?.controller?.abort()
-    abortRef.current = null
-    if (runId) {
-      try {
-        await stopRunnerRun(runId)
-      } catch {
-        /* run may have already exited */
-      }
+  const handleRun = async (cfg) => {
+    if (isRunning) return
+    setRunError(null)
+    try {
+      await startRunnerRun(cfg.id)
+      refreshRunState()
+      onEngineChange?.()
+    } catch (err) {
+      setRunError(err?.message || 'Failed to start')
     }
-    setRunningId(null)
   }
 
-  const handleRun = async (cfg) => {
-    if (runningId) return
-    setRunningId(cfg.id)
-    setRunningName(cfg.name)
-    setOutput('')
-    setExitCode(null)
-    setRunError(null)
-
-    const controller = new AbortController()
-    abortRef.current = { controller, runId: null }
-
-    await streamRunnerRun(cfg.id, {
-      signal: controller.signal,
-      onStarted: (info) => {
-        if (abortRef.current) abortRef.current.runId = info?.run_id
-      },
-      onStdout: (text) => setOutput((prev) => prev + text),
-      onExit: (info) => {
-        setExitCode(info?.exit_code ?? null)
-        setRunningId(null)
-        abortRef.current = null
-      },
-      onError: (message) => {
-        setRunError(message)
-        setRunningId(null)
-        abortRef.current = null
-      },
-    })
+  // Stop goes through the backend, which stops the *container* via docker
+  // rather than just killing the client -- killing the `docker run` client
+  // leaves the container up. `docker stop` can take a few seconds, so the
+  // button shows progress rather than appearing to hang.
+  const handleStop = async () => {
+    const runId = activeRun?.run_id
+    if (!runId) return
+    setStopping(true)
+    try {
+      await stopRunnerRun(runId)
+    } catch {
+      /* best effort -- the state poll below reports what actually happened */
+    } finally {
+      setStopping(false)
+      refreshRunState()
+    }
   }
 
   const handleDelete = async (cfg) => {
@@ -527,6 +565,45 @@ export default function RunnerTab({ active = true }) {
       setFormError(err?.message || 'Delete failed')
     }
   }
+
+  // Attach the console to whatever run is live. Keyed on run_id, so a new
+  // run resets the console and a page that simply opens onto an existing
+  // run fills in from that run's backlog instead of showing nothing.
+  useEffect(() => {
+    const runId = activeRun?.run_id
+    if (!runId) return undefined
+
+    const controller = new AbortController()
+    openRunnerStream(runId, {
+      signal: controller.signal,
+      onState: (info) => {
+        pendingRef.current = ''
+        setOutput(info?.backlog || '')
+      },
+      onStdout: (text) => {
+        pendingRef.current += text
+      },
+      onExit: () => refreshRunState(),
+      onError: (message) => setRunError(message),
+    })
+    return () => controller.abort()
+  }, [activeRun?.run_id, refreshRunState])
+
+  // Flush buffered console output on a fixed beat rather than per chunk.
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (!pendingRef.current) return
+      const chunk = pendingRef.current
+      pendingRef.current = ''
+      setOutput((prev) => {
+        const next = prev + chunk
+        return next.length > CONSOLE_MAX_CHARS
+          ? next.slice(next.length - CONSOLE_MAX_CHARS)
+          : next
+      })
+    }, CONSOLE_FLUSH_MS)
+    return () => clearInterval(id)
+  }, [])
 
   // Auto-scroll the console as new output arrives (also when the tab is
   // re-shown, since a hidden element has no layout).
@@ -559,8 +636,10 @@ export default function RunnerTab({ active = true }) {
         ) : (
           <ConfigList
             configs={configs}
-            runningId={runningId}
+            activeConfigId={activeConfigId}
+            stopping={stopping}
             onSelectRun={handleRun}
+            onStop={handleStop}
             onEdit={(c) => setFormInitial({ ...c })}
             onDelete={handleDelete}
           />
@@ -578,44 +657,65 @@ export default function RunnerTab({ active = true }) {
 
         <div className="rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)]">
           <div className="flex items-center justify-between border-b border-[var(--border-hairline)] px-4 py-2.5">
-            <div className="flex items-center gap-2">
-              <Terminal size={15} className="text-[var(--series-1)]" />
-              <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+            <div className="flex min-w-0 items-center gap-2">
+              <Terminal size={15} className="shrink-0 text-[var(--series-1)]" />
+              <h3 className="shrink-0 text-sm font-semibold text-[var(--text-primary)]">
                 Run console
               </h3>
-              {runningName && (
-                <span className="text-xs text-[var(--text-muted)]">
-                  · {runningName}
+              {activeRun?.config_name && (
+                <span className="truncate text-xs text-[var(--text-muted)]">
+                  · {activeRun.config_name}
+                </span>
+              )}
+              {isRunning && activeRun?.container_name && (
+                <span
+                  className="hidden font-mono text-[11px] text-[var(--text-muted)] md:inline"
+                  title="Container stopped by docker when you press Stop"
+                >
+                  · {activeRun.container_name}
+                </span>
+              )}
+              {isRunning && activeRun?.engine_url && (
+                <span
+                  className="hidden font-mono text-[11px] text-[var(--series-1)] lg:inline"
+                  title="The dashboard now reads its live metrics from this engine"
+                >
+                  · dashboard → {activeRun.engine_url}
+                </span>
+              )}
+              {activeRun?.adopted && (
+                <span
+                  className="hidden text-[11px] text-[var(--text-muted)] xl:inline"
+                  title="This engine was already running when the dashboard opened; it was picked up rather than launched here."
+                >
+                  · adopted
                 </span>
               )}
             </div>
-            <div className="flex items-center gap-3">
-              {runningId ? (
-                <span className="inline-flex items-center gap-1.5 text-xs font-medium text-[var(--status-good)]">
-                  <Loader2 size={12} className="animate-spin" /> Running
+            <div className="flex shrink-0 items-center gap-3">
+              {isRunning ? (
+                <span
+                  className={`inline-flex items-center gap-1.5 text-xs font-medium ${
+                    stopping
+                      ? 'text-[var(--status-warning)]'
+                      : 'text-[var(--status-good)]'
+                  }`}
+                >
+                  <Loader2 size={12} className="animate-spin" />
+                  {stopping ? 'Stopping container…' : 'Running'}
                 </span>
-              ) : exitCode !== null ? (
+              ) : activeRun?.status === 'exited' ? (
                 <span
                   className={`text-xs font-medium ${
-                    exitCode === 0
+                    activeRun.exit_code === 0
                       ? 'text-[var(--status-good)]'
                       : 'text-[var(--status-critical)]'
                   }`}
                 >
-                  Exited ({exitCode})
+                  Exited ({activeRun.exit_code})
                 </span>
               ) : (
                 <span className="text-xs text-[var(--text-muted)]">Idle</span>
-              )}
-              {runningId && (
-                <button
-                  type="button"
-                  onClick={stopRun}
-                  className="inline-flex items-center gap-1.5 rounded-md border border-[var(--status-critical)] px-3 py-1.5 text-xs font-medium text-[var(--status-critical)] transition-colors hover:bg-[var(--surface-page)]"
-                >
-                  <Square size={12} />
-                  Stop
-                </button>
               )}
             </div>
           </div>
@@ -631,21 +731,16 @@ export default function RunnerTab({ active = true }) {
             {output ? (
               <pre className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-[var(--text-secondary)]">
                 {output}
-                {runningId && <span className="animate-pulse">▍</span>}
+                {isRunning && <span className="animate-pulse">▍</span>}
               </pre>
             ) : (
               <p className="text-xs text-[var(--text-muted)]">
-                Select a configuration and press Run to start the container.
-                Output streams here live.
+                {isRunning
+                  ? 'Waiting for output…'
+                  : 'Select a configuration and press Run to start the container. Output streams here live.'}
               </p>
             )}
           </div>
-          {exitCode !== null && !runningId && (
-            <div className="border-t border-[var(--border-hairline)] px-4 py-2 text-[11px] text-[var(--text-muted)]">
-              Last run finished at {fmtTime(new Date().toISOString())} · exit code{' '}
-              {exitCode}
-            </div>
-          )}
         </div>
       </div>
     </div>

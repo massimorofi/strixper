@@ -33,6 +33,24 @@ function usesInlineThink(api) {
   return api === 'completions'
 }
 
+// Build the history we send upstream. The backend rejects any message whose
+// content is blank (min_length=1), and an assistant turn can legitimately
+// end up empty -- reasoning only, or an error before any text arrived.
+// Sending that back would fail validation and break the whole conversation,
+// so empty turns are dropped here rather than at the far end.
+const ROLES = ['user', 'assistant', 'system']
+
+function toOutbound(messages) {
+  return messages
+    .filter(
+      (m) =>
+        ROLES.includes(m?.role) &&
+        typeof m?.content === 'string' &&
+        m.content.trim().length > 0,
+    )
+    .map(({ role, content }) => ({ role, content }))
+}
+
 function loadStoredMessages() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
@@ -259,10 +277,7 @@ export default function AIChatTab({ active = true }) {
     try {
       await streamChat(
         {
-          messages: [...messages, userMsg].map(({ role, content }) => ({
-            role,
-            content,
-          })),
+          messages: toOutbound([...messages, userMsg]),
           api,
           thinking,
           maxTokens: maxTokens ? Number(maxTokens) : undefined,

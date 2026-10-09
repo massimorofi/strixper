@@ -1,14 +1,58 @@
 const BASE = '/api/v1'
 
+// Turn a FastAPI error body into a string that is safe to render.
+//
+// `detail` is a plain string when it comes from HTTPException, but a list of
+// structured objects ({type, loc, msg, input, ctx}) when FastAPI rejects the
+// request body itself. Handing that list to React as a child crashes the render
+// with "Objects are not valid as a React child", which blanks the whole page --
+// so it is flattened here, once, at the boundary.
+function formatIssue(issue) {
+  if (typeof issue === 'string') return issue
+  if (!issue || typeof issue !== 'object') return String(issue)
+  const msg = typeof issue.msg === 'string' ? issue.msg : 'invalid value'
+  const path = Array.isArray(issue.loc)
+    ? issue.loc.filter((p) => p !== 'body').join('.')
+    : ''
+  return path ? `${path}: ${msg}` : msg
+}
+
+function textOr(fallback, value) {
+  if (typeof value === 'string' && value.trim()) return value
+  if (Array.isArray(value) && value.length > 0) {
+    const joined = value.map(formatIssue).filter(Boolean).join('; ')
+    if (joined) return joined
+  }
+  return fallback
+}
+
+function errorText(fallback, body) {
+  return textOr(fallback, body?.detail)
+}
+
+// Read the body of a failed response, always yielding a human-readable string.
+async function readError(res, fallback) {
+  let body = null
+  try {
+    body = await res.json()
+  } catch {
+    /* non-JSON error body */
+  }
+  return errorText(fallback, body)
+}
+
 async function getJSON(path) {
   const res = await fetch(`${BASE}${path}`, { headers: { Accept: 'application/json' } })
-  if (!res.ok) throw new Error(`HTTP ${res.status} on ${path}`)
+  if (!res.ok) {
+    throw new Error(await readError(res, `HTTP ${res.status} on ${path}`))
+  }
   return res.json()
 }
 
 export const fetchLiveStatus = () => getJSON('/live-status')
 export const fetchTuningCheck = () => getJSON('/tuning-check')
 export const fetchSystemInfo = () => getJSON('/system-info')
+export const fetchConfig = () => getJSON('/config')
 
 export async function countTokens(text, system) {
   const res = await fetch(`${BASE}/count-tokens`, {
@@ -17,14 +61,7 @@ export async function countTokens(text, system) {
     body: JSON.stringify(system ? { text, system } : { text }),
   })
   if (!res.ok) {
-    let detail = `HTTP ${res.status} on POST /count-tokens`
-    try {
-      const body = await res.json()
-      if (body?.detail) detail = body.detail
-    } catch {
-      /* non-JSON error body */
-    }
-    throw new Error(detail)
+    throw new Error(await readError(res, `HTTP ${res.status} on POST /count-tokens`))
   }
   return res.json()
 }
@@ -35,7 +72,11 @@ export async function postConfig(body) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   })
-  if (!res.ok) throw new Error(`HTTP ${res.status} on POST /config`)
+  if (!res.ok) {
+    // Surface the backend's own explanation (e.g. a malformed engine
+    // address) rather than a bare status code.
+    throw new Error(await readError(res, `HTTP ${res.status} on POST /config`))
+  }
   return res.json()
 }
 
@@ -60,14 +101,7 @@ async function sendJSON(method, path, body) {
     body: JSON.stringify(body),
   })
   if (!res.ok) {
-    let detail = `HTTP ${res.status} on ${method} ${path}`
-    try {
-      const j = await res.json()
-      if (j?.detail) detail = j.detail
-    } catch {
-      /* non-JSON error body */
-    }
-    throw new Error(detail)
+    throw new Error(await readError(res, `HTTP ${res.status} on ${method} ${path}`))
   }
   return res.json()
 }
@@ -78,14 +112,9 @@ export const updateRunnerConfig = (id, cfg) =>
 export const deleteRunnerConfig = (id) =>
   fetch(`${BASE}/runner/configs/${id}`, { method: 'DELETE' }).then(async (res) => {
     if (!res.ok) {
-      let detail = `HTTP ${res.status} on DELETE /runner/configs/${id}`
-      try {
-        const j = await res.json()
-        if (j?.detail) detail = j.detail
-      } catch {
-        /* non-JSON error body */
-      }
-      throw new Error(detail)
+      throw new Error(
+        await readError(res, `HTTP ${res.status} on DELETE /runner/configs/${id}`),
+      )
     }
     return res.json()
   })
@@ -97,41 +126,11 @@ export const stopRunnerRun = (runId) =>
 export const previewRunnerCommand = (docker_command, parameters = []) =>
   sendJSON('POST', '/runner/preview', { docker_command, parameters })
 
-// Stream a docker run from the backend. `values` optionally overrides
-// parameter values for this run only (not persisted).
-// onStdout(textChunk), onStarted(info), onExit({exit_code}), onError(message).
-export async function streamRunnerRun(
-  configId,
-  { values, onStdout, onStarted, onExit, onError, signal } = {},
-) {
-  let res
-  try {
-    res = await fetch(`${BASE}/runner/configs/${configId}/run`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'text/event-stream',
-      },
-      body: JSON.stringify(values ? { values } : {}),
-      signal,
-    })
-  } catch (err) {
-    onError?.(err?.message || 'Request failed')
-    return
-  }
-
-  if (!res.ok || !res.body) {
-    let detail = `HTTP ${res.status} on POST /runner/configs/${configId}/run`
-    try {
-      const j = await res.json()
-      if (j?.detail) detail = j.detail
-    } catch {
-      /* non-JSON error body */
-    }
-    onError?.(detail)
-    return
-  }
-
+// Shared Server-Sent Events reader. Splits the byte stream on blank-line
+// frame boundaries and hands each complete frame to `onEvent(event, data)`.
+// Unknown event names are passed through; a frame whose data is not JSON is
+// skipped rather than treated as a failure.
+async function readSSE(res, onEvent) {
   const reader = res.body.getReader()
   const decoder = new TextDecoder()
   let pending = ''
@@ -151,27 +150,73 @@ export async function streamRunnerRun(
     } catch {
       return
     }
-    if (event === 'started') onStarted?.(data)
-    else if (event === 'stdout') onStdout?.(data.text || '')
-    else if (event === 'exit') onExit?.(data)
-    else if (event === 'error') onError?.(data.message || 'Stream error')
+    onEvent(event, data)
+  }
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    pending += decoder.decode(value, { stream: true })
+    let idx
+    while ((idx = pending.indexOf('\n\n')) !== -1) {
+      const frame = pending.slice(0, idx)
+      pending = pending.slice(idx + 2)
+      if (frame.trim()) handleFrame(frame)
+    }
+  }
+  if (pending.trim()) handleFrame(pending)
+}
+
+// Start a configuration's engine. Returns the run summary; the console is
+// a separate call (openRunnerStream), so starting never depends on holding
+// a connection open.
+export const startRunnerRun = (configId, values) =>
+  sendJSON('POST', `/runner/configs/${configId}/run`, values ? { values } : {})
+
+// The run currently live, or null. Polled so a run that exits on its own
+// shows up in the UI without a stream being open.
+export const fetchRunnerActive = async () => {
+  const j = await getJSON('/runner/active')
+  return j?.active || null
+}
+
+// Watch a live run: `state` (with backlog) first, then `stdout` chunks,
+// then `exit`. Any number of browsers may attach to the same run.
+export async function openRunnerStream(
+  runId,
+  { onState, onStdout, onExit, onError, signal } = {},
+) {
+  let res
+  try {
+    res = await fetch(`${BASE}/runner/runs/${runId}/stream`, {
+      headers: { Accept: 'text/event-stream' },
+      signal,
+    })
+  } catch (err) {
+    if (err?.name !== 'AbortError') onError?.(err?.message || 'Request failed')
+    return
+  }
+
+  if (!res.ok || !res.body) {
+    onError?.(
+      await readError(
+        res,
+        `HTTP ${res.status} on GET /runner/runs/${runId}/stream`,
+      ),
+    )
+    return
   }
 
   try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      pending += decoder.decode(value, { stream: true })
-      let idx
-      while ((idx = pending.indexOf('\n\n')) !== -1) {
-        const frame = pending.slice(0, idx)
-        pending = pending.slice(idx + 2)
-        if (frame.trim()) handleFrame(frame)
-      }
-    }
-    if (pending.trim()) handleFrame(pending)
+    await readSSE(res, (event, data) => {
+      if (event === 'state') onState?.(data)
+      else if (event === 'stdout') onStdout?.(data.text || '')
+      else if (event === 'exit') onExit?.(data)
+      else if (event === 'error')
+        onError?.(textOr('Stream error', data?.message))
+    })
   } catch (err) {
-    onError?.(err?.message || 'Stream interrupted')
+    if (err?.name !== 'AbortError') onError?.(err?.message || 'Stream interrupted')
   }
 }
 
@@ -239,56 +284,19 @@ export async function streamChat(
   }
 
   if (!res.ok || !res.body) {
-    let detail = `HTTP ${res.status} on POST /chat`
-    try {
-      const j = await res.json()
-      if (j?.detail) detail = j.detail
-    } catch {
-      /* non-JSON error body */
-    }
-    onError?.(detail)
+    onError?.(await readError(res, `HTTP ${res.status} on POST /chat`))
     return
   }
 
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let pending = ''
-
-  const handleFrame = (frame) => {
-    let event = 'message'
-    const dataLines = []
-    for (const raw of frame.split('\n')) {
-      const line = raw.replace(/\r$/, '')
-      if (line.startsWith('event:')) event = line.slice(6).trim()
-      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim())
-    }
-    if (dataLines.length === 0) return
-    let data
-    try {
-      data = JSON.parse(dataLines.join('\n'))
-    } catch {
-      return
-    }
-    if (event === 'reasoning') onReasoning?.(data.text || '')
-    else if (event === 'delta') onDelta?.(data.text || '')
-    else if (event === 'done') onDone?.(data)
-    else if (event === 'error') onError?.(data.message || 'Stream error')
-  }
-
   try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      pending += decoder.decode(value, { stream: true })
-      let idx
-      while ((idx = pending.indexOf('\n\n')) !== -1) {
-        const frame = pending.slice(0, idx)
-        pending = pending.slice(idx + 2)
-        if (frame.trim()) handleFrame(frame)
-      }
-    }
-    if (pending.trim()) handleFrame(pending)
+    await readSSE(res, (event, data) => {
+      if (event === 'reasoning') onReasoning?.(data.text || '')
+      else if (event === 'delta') onDelta?.(data.text || '')
+      else if (event === 'done') onDone?.(data)
+      else if (event === 'error')
+        onError?.(textOr('Stream error', data?.message))
+    })
   } catch (err) {
-    onError?.(err?.message || 'Stream interrupted')
+    if (err?.name !== 'AbortError') onError?.(err?.message || 'Stream interrupted')
   }
 }

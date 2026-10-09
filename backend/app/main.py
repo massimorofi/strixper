@@ -6,8 +6,11 @@ built frontend (when frontend/dist exists).
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,15 +18,72 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import settings
 from .routers import chat, config_routes, live, runner, stats_routes, tokens, tuning
-from .services.live_service import RuntimeState, managed_poller
+from .services.live_service import RuntimeState, managed_poller, set_engine_target
+from .services.run_registry import registry, reconcile_loop
+
+logger = logging.getLogger(__name__)
+
+
+def _model_for_config(config_id: str) -> Optional[str]:
+    """The ``served_model_name`` a stored configuration declares, if any."""
+    cfg = runner.get_store().get(config_id) or {}
+    for param in cfg.get("parameters") or []:
+        if param.get("name") == "served_model_name":
+            value = (param.get("value") or "").strip()
+            return value or None
+    return None
+
+
+def _make_adopted_hook(state: RuntimeState):
+    """Build the callback that points the dashboard at a newly adopted engine.
+
+    Adoption is not a one-shot: an engine can appear long after startup (it
+    was still pulling its image when this backend came up, say), so the
+    same "we now have a run, follow it" step has to run from the reconcile
+    loop as well as from the initial scan.
+    """
+
+    async def on_adopted(run) -> None:
+        if not run.engine_url:
+            return
+        await set_engine_target(
+            state,
+            run.engine_url,
+            run.config_id,
+            run.config_name,
+            model_name=_model_for_config(run.config_id),
+        )
+
+    return on_adopted
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     state = RuntimeState()
     app.state.rt = state
+    on_adopted = _make_adopted_hook(state)
+
+    # A docker container outlives the process that started it, so an engine
+    # can be up before this backend is. Adopt it rather than showing an
+    # empty console: the run becomes visible, watchable and stoppable, and
+    # the dashboard and chat are pointed at it.
+    try:
+        await registry.discover(runner.get_store().list(), on_adopted=on_adopted)
+    except Exception as exc:  # noqa: BLE001 -- never block startup on this
+        logger.warning("engine adoption failed: %s", exc)
+
     async with managed_poller(state):
-        yield
+        reconcile = asyncio.create_task(
+            reconcile_loop(registry, lambda: runner.get_store().list(), on_adopted)
+        )
+        try:
+            yield
+        finally:
+            reconcile.cancel()
+            try:
+                await reconcile
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(

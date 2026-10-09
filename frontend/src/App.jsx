@@ -1,11 +1,12 @@
 import { useEffect, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import TopBar from './components/TopBar.jsx'
 import LiveTab from './components/LiveTab.jsx'
 import TuningTab from './components/TuningTab.jsx'
 import AIChatTab from './components/AIChatTab.jsx'
 import RunnerTab from './components/RunnerTab.jsx'
-import { fetchLiveStatus, postConfig } from './api.js'
+import ErrorBoundary from './components/ErrorBoundary.jsx'
+import { fetchConfig, fetchLiveStatus, postConfig } from './api.js'
 
 const MAX_SAMPLES = 120
 
@@ -68,6 +69,22 @@ export default function App() {
     postConfig({ poll_interval_seconds: Math.max(ms / 1000, 0.5) }).catch(() => {})
   }
 
+  // The engine address is owned by the backend (it follows whatever the
+  // LLM-Runner last started), so it is read rather than held here.
+  const queryClient = useQueryClient()
+  const engineQuery = useQuery({
+    queryKey: ['engine-target'],
+    queryFn: fetchConfig,
+  })
+  const engineHost = engineQuery.data?.halogen_host ?? ''
+
+  const handleEngineChange = async (url) => {
+    // Throws on a rejected address; the caller shows the message.
+    await postConfig({ halogen_host: url })
+    queryClient.invalidateQueries({ queryKey: ['engine-target'] })
+    queryClient.invalidateQueries({ queryKey: ['live-status'] })
+  }
+
   const connected = data?.connected ?? false
 
   return (
@@ -81,6 +98,9 @@ export default function App() {
         onToggleTheme={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
         tab={tab}
         onTabChange={setTab}
+        engineHost={engineHost}
+        engineConfigName={engineQuery.data?.engine_config_name}
+        onEngineChange={handleEngineChange}
       />
       <main className="mx-auto max-w-7xl px-4 py-6">
         {isError && (
@@ -89,23 +109,41 @@ export default function App() {
           </div>
         )}
         {tab === 'live' && (
-          <LiveTab
-            data={data}
-            history={history}
-            theme={theme}
-            onResetStats={() => refetch()}
-          />
+          <ErrorBoundary>
+            <LiveTab
+              data={data}
+              history={history}
+              theme={theme}
+              onResetStats={() => refetch()}
+            />
+          </ErrorBoundary>
         )}
-        {tab === 'tuning' && <TuningTab />}
+        {tab === 'tuning' && (
+          <ErrorBoundary>
+            <TuningTab />
+          </ErrorBoundary>
+        )}
         {/* The chat stays mounted (hidden via CSS) so switching tabs never
-            discards the conversation, the draft, or an in-flight stream. */}
+            discards the conversation, the draft, or an in-flight stream.
+            Its own boundary keeps a failure here from taking the other tabs
+            down with it. */}
         <div className={tab === 'chat' ? '' : 'hidden'}>
-          <AIChatTab active={tab === 'chat'} />
+          <ErrorBoundary>
+            <AIChatTab active={tab === 'chat'} />
+          </ErrorBoundary>
         </div>
         {/* The runner also stays mounted so a running container's stream is
             not interrupted by switching tabs. */}
         <div className={tab === 'runner' ? '' : 'hidden'}>
-          <RunnerTab active={tab === 'runner'} />
+          <ErrorBoundary>
+            <RunnerTab
+              active={tab === 'runner'}
+              onEngineChange={() => {
+                queryClient.invalidateQueries({ queryKey: ['engine-target'] })
+                queryClient.invalidateQueries({ queryKey: ['live-status'] })
+              }}
+            />
+          </ErrorBoundary>
         </div>
       </main>
     </div>
