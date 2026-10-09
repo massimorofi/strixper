@@ -1,18 +1,24 @@
 """Async client for the Halogen LLM server.
 
-Talks to four endpoints:
+Talks to five endpoints:
   GET  /health                   -- liveness, model, slots, queue, capabilities
   GET  /metrics                  -- Prometheus-style counters and gauges
   GET  /cache                    -- prompt-cache counters (Halogen-specific)
   POST /v1/messages/count_tokens -- input token counting (Anthropic-compatible)
+  POST /v1/chat/completions      -- chat inference (sync + SSE streaming)
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any, Optional
 
 import httpx
+
+# Long-form timeout for chat generation; the default 5 s client timeout is for
+# the small telemetry endpoints only.
+CHAT_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 
 
 def parse_prometheus(text: str) -> dict[str, float]:
@@ -105,6 +111,50 @@ class HalogenClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def post_json(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        headers: Optional[dict[str, str]] = None,
+    ) -> dict[str, Any]:
+        """Generic blocking JSON POST with the long chat timeout."""
+        resp = await self._client.post(
+            f"{self.base_url}{path}", json=payload, headers=headers, timeout=CHAT_TIMEOUT
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def stream_sse(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        headers: Optional[dict[str, str]] = None,
+    ):
+        """Generic SSE POST: yield each parsed ``data: {...}`` JSON object.
+
+        Blank lines, non-``data:`` lines and the terminal ``[DONE]`` sentinel
+        are skipped. Used by every streaming inference style.
+        """
+        async with self._client.stream(
+            "POST",
+            f"{self.base_url}{path}",
+            json=payload,
+            headers=headers,
+            timeout=CHAT_TIMEOUT,
+        ) as resp:
+            resp.raise_for_status()
+            async for raw in resp.aiter_lines():
+                line = raw.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:") :].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    yield json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
     async def count_tokens(
         self,
         messages: list[dict[str, Any]],
@@ -127,6 +177,68 @@ class HalogenClient:
         )
         resp.raise_for_status()
         return resp.json()
+
+    async def chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        """Blocking (non-streaming) chat completion via OpenAI-compatible API."""
+        payload: dict[str, Any] = {"model": model, "messages": messages, **extra}
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
+        resp = await self._client.post(
+            f"{self.base_url}/v1/chat/completions",
+            json=payload,
+            timeout=CHAT_TIMEOUT,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def chat_completion_stream(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        **extra: Any,
+    ):
+        """Stream a chat completion, yielding parsed SSE event dicts.
+
+        Yields the JSON object from each ``data: {...}`` chunk. The terminal
+        ``data: [DONE]`` sentinel is not yielded. Content deltas arrive in
+        ``choices[0].delta.content``; reasoning deltas in
+        ``choices[0].delta.reasoning_content``.
+        """
+        payload: dict[str, Any] = {"model": model, "messages": messages, **extra}
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        if temperature is not None:
+            payload["temperature"] = temperature
+
+        async with self._client.stream(
+            "POST",
+            f"{self.base_url}/v1/chat/completions",
+            json=payload,
+            timeout=CHAT_TIMEOUT,
+        ) as resp:
+            resp.raise_for_status()
+            async for raw in resp.aiter_lines():
+                line = raw.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[len("data:") :].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    yield json.loads(data)
+                except json.JSONDecodeError:
+                    continue
 
     async def snapshot(self) -> dict[str, Any]:
         """Fetch all endpoints concurrently and merge them.

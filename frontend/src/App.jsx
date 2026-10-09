@@ -3,14 +3,18 @@ import { useQuery } from '@tanstack/react-query'
 import TopBar from './components/TopBar.jsx'
 import LiveTab from './components/LiveTab.jsx'
 import TuningTab from './components/TuningTab.jsx'
+import AIChatTab from './components/AIChatTab.jsx'
 import { fetchLiveStatus, postConfig } from './api.js'
 
 const MAX_SAMPLES = 120
 
+const VALID_TABS = ['live', 'tuning', 'chat']
+
 export default function App() {
-  const [tab, setTab] = useState(() =>
-    window.location.hash === '#tuning' ? 'tuning' : 'live',
-  )
+  const [tab, setTab] = useState(() => {
+    const h = window.location.hash.replace('#', '')
+    return VALID_TABS.includes(h) ? h : 'live'
+  })
   const [intervalMs, setIntervalMs] = useState(5000)
   const [theme, setTheme] = useState(() => {
     try {
@@ -83,16 +87,20 @@ export default function App() {
             Backend unreachable. Is the dashboard API running on port 8000?
           </div>
         )}
-        {tab === 'live' ? (
+        {tab === 'live' && (
           <LiveTab
             data={data}
             history={history}
             theme={theme}
             onResetStats={() => refetch()}
           />
-        ) : (
-          <TuningTab />
         )}
+        {tab === 'tuning' && <TuningTab />}
+        {/* The chat stays mounted (hidden via CSS) so switching tabs never
+            discards the conversation, the draft, or an in-flight stream. */}
+        <div className={tab === 'chat' ? '' : 'hidden'}>
+          <AIChatTab active={tab === 'chat'} />
+        </div>
       </main>
     </div>
   )

@@ -2,7 +2,8 @@
 
 A real-time web dashboard for monitoring a running **Halogen LLM Server** alongside
 host and hardware telemetry on an **AMD Strix Halo** (Ryzen AI Max+ 395 / Radeon
-8060S) machine, with an on-demand fine-tuning compliance audit.
+8060S) machine, with an on-demand fine-tuning compliance audit and a built-in
+streaming **AI chat**.
 
 Built from `strixper_specs.md`, using `halogen_api.md` for the Halogen endpoint
 contracts and `strix_halo_finetuning.md` for the tuning recommendations.
@@ -26,6 +27,14 @@ contracts and `strix_halo_finetuning.md` for the tuning recommendations.
   acceptance series (prompt/decode t/s, GPU utilization, CPU utilization, draft
   acceptance) **zero readings are excluded** from both the average and the
   minimum — a 0 means "idle / not reporting yet", not a real measurement of zero.
+- **Prompt Cache & Token Counter** — a card with Halogen's prompt-cache telemetry
+  (hit rate, tokens saved, stores/evictions, pool usage) and a widget that counts
+  the exact token cost of any prompt before you send it.
+- **AI Chat** — a classic streaming chat tab. Type a request, watch the answer
+  stream in token-by-token, and expand the model's chain-of-thought under each
+  reply. Switch between Halogen's four inference API styles (**Chat
+  Completions**, **Anthropic Messages**, **Responses**, **Text Completions**) to
+  compare them, toggle the model's thinking on/off, and cap the response length.
 - **In-context Help** — every chart and every top KPI card has an **info button**
   (ⓘ, top-right corner) that opens a detailed explanation of the measures shown
   there.
@@ -38,9 +47,10 @@ contracts and `strix_halo_finetuning.md` for the tuning recommendations.
 
 ```
 Browser (React + Vite + Tailwind + TanStack Query + Recharts)
-        |  REST (JSON over HTTP)
+        |  REST (JSON over HTTP) + SSE (streaming chat)
 FastAPI backend (asyncio)
-  - HalogenClient   -> httpx -> Halogen /health /metrics /v1/models
+  - HalogenClient   -> httpx -> Halogen /health /metrics /v1/models /cache
+                    -> POST /v1/chat/completions /v1/messages /v1/responses /v1/completions
   - SystemMonitor   -> sysfs / procfs (GTT, RAM, CPU)
   - TuningChecker   -> shell commands (uname, tuned-adm, ls, ...)
         |
@@ -215,9 +225,38 @@ ss -tlnp | grep LISTEN          # see what's already taken
 | `/api/v1/system-info` | GET | Hardware baseline for the summary banner |
 | `/api/v1/config` | GET / POST | Read / update runtime settings |
 | `/api/v1/stats/reset` | POST | Reset session statistics to zero |
+| `/api/v1/count-tokens` | POST | Count the input tokens of a prompt (proxies Halogen) |
+| `/api/v1/chat` | POST | Streaming chat completion (4 API styles, SSE) |
 | `/api/v1/healthz` | GET | Backend liveness |
 
 Interactive API docs: `http://localhost:8000/docs`.
+
+### AI Chat (`POST /api/v1/chat`)
+
+The chat tab sends the conversation to Halogen and streams the reply back as
+Server-Sent Events. One request body works across all four upstream API styles:
+
+```json
+{
+  "messages": [{ "role": "user", "content": "Hello!" }],
+  "api": "chat",
+  "stream": true,
+  "thinking": true,
+  "max_tokens": 1024
+}
+```
+
+`api` selects the Halogen endpoint: `chat` (`/v1/chat/completions`), `messages`
+(`/v1/messages`), `responses` (`/v1/responses`), or `completions`
+(`/v1/completions`). `thinking: false` suppresses the model's chain-of-thought.
+The stream is normalized to `reasoning`, `delta`, `done` and `error` events so
+the UI is identical regardless of the chosen style. Set `stream: false` for a
+single JSON response instead.
+
+Your conversation is **not** cleared when you switch tabs — the chat stays
+mounted in the background, so you can check the metrics mid-chat and come back
+to it. It is also saved locally, so it survives a page reload. Use **Clear
+conversation** (eraser icon) to start over.
 
 ## Docker
 
@@ -294,7 +333,7 @@ backend/
   app/
     main.py                 FastAPI app + lifespan + static serving
     config.py               env settings
-    routers/                live, tuning, config endpoints
+    routers/                live, tuning, config, tokens, chat endpoints
     services/
       halogen_client.py     async Halogen HTTP client + Prometheus parser
       system_monitor.py     sysfs/procfs telemetry
@@ -303,7 +342,9 @@ backend/
 frontend/
   src/
     App.jsx                 tabs, theme, polling, history buffer
-    components/             TopBar, StatTile, Meter, StatusBadge, LiveTab, TuningTab
+    api.js                  fetch helpers + streamChat SSE client
+    components/             TopBar, StatTile, Meter, StatusBadge, LiveTab,
+                            TuningTab, AIChatTab
     charts/                 Throughput, KV pool, Queue, Memory charts
 Dockerfile
 run.sh

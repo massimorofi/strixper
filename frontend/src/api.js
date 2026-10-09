@@ -47,3 +47,121 @@ export async function resetStats() {
   if (!res.ok) throw new Error(`HTTP ${res.status} on POST /stats/reset`)
   return res.json()
 }
+
+// Incremental splitter for the raw-text completions style, where the model
+// embeds its chain-of-thought inline between <think> ... </think> markers.
+const THINK_OPEN = '<think>'
+const THINK_CLOSE = '</think>'
+
+export function createThinkSplitter() {
+  let buffer = ''
+  let inThink = false
+  // Feed raw text chunks; returns { reasoning, content } for this step.
+  return (chunk) => {
+    buffer += chunk
+    let reasoning = ''
+    let content = ''
+    while (buffer.length > 0) {
+      if (inThink) {
+        const end = buffer.indexOf(THINK_CLOSE)
+        if (end === -1) {
+          reasoning += buffer
+          buffer = ''
+          break
+        }
+        reasoning += buffer.slice(0, end)
+        buffer = buffer.slice(end + THINK_CLOSE.length)
+        inThink = false
+      } else {
+        const start = buffer.indexOf(THINK_OPEN)
+        if (start === -1) {
+          content += buffer
+          buffer = ''
+          break
+        }
+        content += buffer.slice(0, start)
+        buffer = buffer.slice(start + THINK_OPEN.length)
+        inThink = true
+      }
+    }
+    return { reasoning, content }
+  }
+}
+
+// Stream a chat turn from the backend /api/v1/chat proxy.
+// onReasoning(textChunk), onDelta(textChunk), onDone(donePayload), onError(err)
+export async function streamChat(
+  { messages, api = 'chat', maxTokens, temperature, thinking = true },
+  { onReasoning, onDelta, onDone, onError, signal } = {},
+) {
+  const body = { messages, api, stream: true, thinking }
+  if (maxTokens != null) body.max_tokens = maxTokens
+  if (temperature != null) body.temperature = temperature
+
+  let res
+  try {
+    res = await fetch(`${BASE}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      body: JSON.stringify(body),
+      signal,
+    })
+  } catch (err) {
+    onError?.(err?.message || 'Request failed')
+    return
+  }
+
+  if (!res.ok || !res.body) {
+    let detail = `HTTP ${res.status} on POST /chat`
+    try {
+      const j = await res.json()
+      if (j?.detail) detail = j.detail
+    } catch {
+      /* non-JSON error body */
+    }
+    onError?.(detail)
+    return
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let pending = ''
+
+  const handleFrame = (frame) => {
+    let event = 'message'
+    const dataLines = []
+    for (const raw of frame.split('\n')) {
+      const line = raw.replace(/\r$/, '')
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim())
+    }
+    if (dataLines.length === 0) return
+    let data
+    try {
+      data = JSON.parse(dataLines.join('\n'))
+    } catch {
+      return
+    }
+    if (event === 'reasoning') onReasoning?.(data.text || '')
+    else if (event === 'delta') onDelta?.(data.text || '')
+    else if (event === 'done') onDone?.(data)
+    else if (event === 'error') onError?.(data.message || 'Stream error')
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      pending += decoder.decode(value, { stream: true })
+      let idx
+      while ((idx = pending.indexOf('\n\n')) !== -1) {
+        const frame = pending.slice(0, idx)
+        pending = pending.slice(idx + 2)
+        if (frame.trim()) handleFrame(frame)
+      }
+    }
+    if (pending.trim()) handleFrame(pending)
+  } catch (err) {
+    onError?.(err?.message || 'Stream interrupted')
+  }
+}

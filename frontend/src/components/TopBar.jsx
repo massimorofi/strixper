@@ -81,6 +81,7 @@ export default function TopBar({
           {[
             { id: 'live', label: 'Live Server Metrics' },
             { id: 'tuning', label: 'Strix Halo Fine-Tuning' },
+            { id: 'chat', label: 'AI-Chat' },
           ].map((t) => (
             <button
               key={t.id}

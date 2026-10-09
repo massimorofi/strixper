@@ -24,13 +24,21 @@ this document reflects the **shipped app**.
 |   |  - Session statistics (min/avg/max)| |  - 8-check compliance audit table   |    |
 |   |  - 4 time-series charts (info btn) | |    (PASS / WARN / FAIL)             |    |
 |   +------------------------------------+ +------------------------------------+    |
+|   +------------------------------------+                                           |
+|   |    Tab 3: AI-Chat                   |                                           |
+|   |  - Streaming chat (4 API styles)    |                                           |
+|   |  - Collapsible chain-of-thought     |                                           |
+|   |  - Per-turn token / speed stats     |                                           |
+|   +------------------------------------+                                           |
 +------------------------------------------^----------------------------------------+
-| REST API (JSON over HTTP)
+| REST API (JSON over HTTP) + SSE (text/event-stream for chat)
 +------------------------------------------v----------------------------------------+
 |                                  PYTHON BACKEND                                    |
 |                          (FastAPI / Uvicorn + asyncio)                             |
 |                                                                                    |
 |  HalogenClient   -> httpx  -> Halogen /health /metrics /v1/models /cache            |
+|                 -> POST /v1/messages/count_tokens, /v1/chat/completions,            |
+|                    /v1/messages, /v1/responses, /v1/completions                     |
 |  SystemMonitor   -> sysfs / procfs (GTT, VRAM, RAM, CPU)                            |
 |  RocmMonitor     -> `rocm-smi` subprocess (GPU util %, VRAM)                        |
 |  TuningChecker   -> shell commands (uname, tuned-adm, lspci, ls, ...)               |
@@ -64,6 +72,13 @@ v                                               v
    udev rules, each reported PASS / WARN / FAIL with its measured impact.
 6. **In-context documentation** — every chart and every top KPI card carries an
    **info button** that opens a modal explaining the measures shown there.
+7. **AI Chat** — a streaming chat tab that sends the conversation to Halogen and
+   renders the reply token-by-token, with the model's chain-of-thought collapsed
+   under each answer. The user can switch between Halogen's four inference API
+   styles (OpenAI Chat Completions, Anthropic Messages, OpenAI Responses, and
+   raw Text Completions) from the UI to compare them, toggle the model's
+   thinking on/off, and cap the response length. See §3.3 (`POST /api/v1/chat`)
+   and §5.4 (Tab 3).
 
 ---
 
@@ -109,6 +124,7 @@ All endpoints are mounted under the `/api/v1` prefix.
 | `/api/v1/config` | `POST` | On-demand | Update runtime settings (poll interval) |
 | `/api/v1/stats/reset` | `POST` | On-demand (button) | Zero the session statistics and restart the clock |
 | `/api/v1/count-tokens` | `POST` | On-demand (widget) | Count the input tokens of a prompt (proxies Halogen) |
+| `/api/v1/chat` | `POST` | On-demand (AI-Chat tab) | Streaming chat completion (proxies Halogen, 4 API styles) |
 | `/api/v1/healthz` | `GET` | On-demand | Backend's own liveness (independent of Halogen) |
 
 Interactive API docs are served at `http://<host>:8000/docs`.
@@ -320,6 +336,100 @@ Notes:
 * `422` if `text` is blank or missing (Pydantic validation).
 * `502` if Halogen is unreachable or returns an error / unexpected payload.
 
+#### `POST /api/v1/chat`
+
+Sends a conversation to Halogen and streams the assistant reply back. This is the
+endpoint behind the **AI-Chat** tab. It fronts Halogen's four inference endpoints
+behind **one normalized interface**, so the frontend renders identically no
+matter which upstream API style is chosen.
+
+**Request body:**
+
+```json
+{
+  "messages": [
+    { "role": "user", "content": "What is the capital of France?" }
+  ],
+  "api": "chat",
+  "stream": true,
+  "thinking": true,
+  "max_tokens": 1024,
+  "temperature": 0.7
+}
+```
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `messages` | array | required | 1–200 turns; each `{role, content}`, `role ∈ {user, assistant, system}`, `content` 1–100,000 chars, non-blank |
+| `api` | string | `"chat"` | Upstream style: `chat` \| `messages` \| `responses` \| `completions` |
+| `stream` | bool | `true` | `true` = SSE stream, `false` = single JSON object |
+| `thinking` | bool | `true` | `false` suppresses the model's chain-of-thought |
+| `max_tokens` | int | `null` | 1–32,768; omitted = server default |
+| `temperature` | float | `null` | 0.0–2.0; omitted = server default |
+
+**Upstream API mapping.** The `api` field selects which Halogen endpoint is called
+and how the payload is shaped:
+
+| `api` | Halogen endpoint | Payload shape |
+| --- | --- | --- |
+| `chat` | `POST /v1/chat/completions` | `{model, messages, stream, …}` (OpenAI) |
+| `messages` | `POST /v1/messages` | system turns hoisted to a top-level `system` string; `anthropic-version: 2023-06-01` header |
+| `responses` | `POST /v1/responses` | `{model, input: <last user turn>, stream, max_output_tokens, …}` |
+| `completions` | `POST /v1/completions` | `{model, prompt: <last user turn>, stream, …}` (raw text) |
+
+**Thinking control.** Halogen always emits chain-of-thought by default. When
+`thinking: false`, the backend injects the appropriate suppression per style:
+`reasoning_effort: "none"` for `chat`/`completions`,
+`reasoning: {effort: "none"}` for `responses`, and
+`thinking: {type: "disabled"}` for `messages`. All four were verified to stop
+emitting reasoning with these fields.
+
+**Streaming response (`stream: true`).** `Content-Type: text/event-stream`, with
+`Cache-Control: no-cache`, `Connection: keep-alive` and `X-Accel-Buffering: no`.
+The backend **normalizes** every upstream event into one of four events so the UI
+is style-independent:
+
+| Event | Data | Meaning |
+| --- | --- | --- |
+| `reasoning` | `{"text": "…"}` | A chain-of-thought chunk |
+| `delta` | `{"text": "…"}` | An answer-text chunk |
+| `done` | `{"finish_reason": "…", "usage": {…}, "timings": {…}}` | Terminal event |
+| `error` | `{"message": "…"}` | Failure mid-stream (Halogen down / bad request) |
+
+Each upstream style is translated by a dedicated extractor:
+
+| `api` | reasoning source | answer source | done signal |
+| --- | --- | --- | --- |
+| `chat` | `choices[0].delta.reasoning_content` | `choices[0].delta.content` | `choices[0].finish_reason` |
+| `messages` | `content_block_delta.thinking_delta` | `content_block_delta.text_delta` | `message_delta.stop_reason` |
+| `responses` | `response.reasoning_text.delta` | `response.output_text.delta` | `response.completed` |
+| `completions` | *(none — inline in raw text)* | `choices[0].text` | `choices[0].finish_reason` |
+
+> **Note on `completions`:** the raw text-completion style has no separate
+> reasoning channel. The model embeds its thinking inline between literal
+> `<|im_start|>think … <|im_end|>` markers. The frontend splits this
+> client-side (`createThinkSplitter` in `api.js`) so the UI still shows the
+> chain-of-thought collapsed separately. The other three styles deliver
+> reasoning on its own event and need no client-side splitting.
+
+**Non-streaming response (`stream: false`).** A single JSON object in the common
+shape:
+
+```json
+{
+  "content": "The capital of France is Paris.",
+  "reasoning": "We need to answer briefly…",
+  "finish_reason": "stop",
+  "model": "halogen-qwen3.8-flash-next",
+  "usage": { "prompt_tokens": 54, "completion_tokens": 16, "total_tokens": 70 },
+  "timings": { "predicted_per_second": 27.9, "predicted_ms": 573.3, "cache_n": 54 }
+}
+```
+
+Errors: `422` on invalid body (Pydantic). `502` if Halogen is unreachable or
+returns an error (for `stream: false`; for `stream: true` the failure surfaces as
+an `error` SSE event instead).
+
 #### `GET /api/v1/healthz`
 
 Returns `{ "status": "ok" }`. Independent of Halogen reachability.
@@ -342,6 +452,16 @@ Async `httpx` client for the Halogen endpoints.
 * `count_tokens(messages, model, system=None, tools=None)` →
   `POST /v1/messages/count_tokens` — returns `{ "input_tokens": <int> }`.
   The `model` field is required by Halogen; omitting it yields HTTP 500.
+* `post_json(path, payload, headers=None)` → generic blocking JSON `POST` with a
+  long chat timeout (300 s read / 10 s connect), `raise_for_status()`, returns
+  the parsed dict. Used by the chat proxy for `stream: false` requests.
+* `stream_sse(path, payload, headers=None)` → async generator that POSTs and
+  iterates the upstream SSE stream line-by-line, keeping only `data:` lines,
+  skipping blanks and the `[DONE]` sentinel, and yielding each `json.loads()`
+  chunk (unparsable lines skipped). Used for `stream: true` requests.
+* `chat_completion(messages, model, max_tokens=None, temperature=None, **extra)`
+  → blocking `POST /v1/chat/completions`.
+* `chat_completion_stream(...)` → same payload, yields parsed SSE chunks.
 * `snapshot()` fetches `/health`, `/metrics`, `/v1/models` and `/cache`
   concurrently (`asyncio.gather`); `/metrics`, `/v1/models` and `/cache` are
   best-effort (a failure yields `{}`), `/health` is required.
@@ -473,7 +593,8 @@ on shutdown.
 * Manual refresh button.
 * Theme toggle (dark default; persisted to `localStorage` under
   `strixper-theme`).
-* Tab switcher (Live / Tuning); `#tuning` in the URL opens Tab 2.
+* Tab switcher (Live / Tuning / AI-Chat); `#tuning` opens Tab 2 and `#chat`
+  opens Tab 3.
 
 ### 5.2 Tab 1: Live Server Metrics
 
@@ -537,7 +658,58 @@ The frontend keeps a rolling history buffer of the last **120 samples**
   expected value, and impact. Status is always conveyed by **icon + label**,
   never color alone.
 
-### 5.4 Theme & Color
+### 5.4 Tab 3: AI-Chat
+
+A classic streaming chat interface (`components/AIChatTab.jsx`) backed by
+`POST /api/v1/chat` (§3.3). The whole tab is a single card with three regions:
+a controls bar, a scrolling message list, and a composer.
+
+**Controls bar (top).**
+
+* **API selector** — `Chat Completions` (default), `Anthropic Messages`,
+  `Responses`, `Text Completions`. Changing it switches the upstream Halogen
+  endpoint used for subsequent turns (see the mapping in §3.3). The current
+  style and its upstream path are shown in the header subtitle.
+* **Max tokens** — numeric input (1–32,768), sent as `max_tokens`.
+* **Thinking** — checkbox (default on). Unchecking sends `thinking: false` so
+  the model suppresses its chain-of-thought.
+* **Clear conversation** — erases the message list and any error banner.
+
+**Message list (middle).** User turns render as right-aligned bubbles; assistant
+turns as left-aligned bubbles with an avatar. Each assistant bubble contains:
+
+* A **collapsible reasoning block** (collapsed by default) showing the model's
+  chain-of-thought with its character count.
+* The **answer text**, streamed in live with a blinking caret while generating.
+* A **per-turn stats line** (after completion): input/output token counts,
+  decode speed (tok/s), wall-clock seconds, and `finish_reason`.
+
+While a turn is in flight, the composer's Send button becomes a **Stop** button
+that aborts the stream via `AbortController`. Errors surface as a red banner
+above the composer.
+
+**Composer (bottom).** A textarea with **Enter to send** / **Shift+Enter for a
+newline**. Empty input disables Send.
+
+**Client-side streaming.** `streamChat()` in `api.js` uses `fetch` +
+`ReadableStream` (not `EventSource`, which cannot POST) and parses the SSE
+frames, dispatching `onReasoning` / `onDelta` / `onDone` / `onError` callbacks.
+For the `completions` style, `createThinkSplitter()` incrementally splits the
+raw text on the `<|im_start|>…<|im_end|>` markers so reasoning and
+answer render separately, matching the other three styles.
+
+**Conversation persistence.** Switching tabs must **not** discard the chat. The
+chat tab is therefore kept mounted at all times and merely hidden with a CSS
+`hidden` class when another tab is selected — unmounting it would destroy the
+message list, the draft, and any stream in flight. The conversation is also
+mirrored to `localStorage` (key `strixper-chat`, capped at the last 100 turns)
+so it survives a page reload; restored messages are forced to
+`streaming: false`, since a reload interrupts any stream that was running.
+**Clear conversation** empties both the list and the stored copy. Because a
+hidden element has no layout, the auto-scroll-to-bottom effect also runs when
+the tab becomes active again, not only when messages change.
+
+### 5.5 Theme & Color
 
 Chart colors are hex (not CSS vars) because Recharts writes SVG presentation
 attributes. Both modes were validated with the dataviz palette validator
@@ -552,7 +724,7 @@ attributes. Both modes were validated with the dataviz palette validator
 
 Status colors: `PASS #0ca30c`, `WARN #fab219`, `FAIL #d03b3b`.
 
-### 5.5 Formatting helpers (`format.js`)
+### 5.6 Formatting helpers (`format.js`)
 
 `fmtInt` (thousands separators), `fmtNum(v, digits)`, `fmtPct(v, digits)`,
 `fmtTime(iso)` (en-GB time). Null values render as `—`.
@@ -572,6 +744,7 @@ backend/
       config_routes.py      GET/POST /config
       stats_routes.py       POST /stats/reset
       tokens.py             POST /count-tokens (Halogen count_tokens proxy)
+      chat.py               POST /chat (streaming chat proxy, 4 API styles)
     services/
       halogen_client.py     async Halogen HTTP client + Prometheus parser
       system_monitor.py     sysfs/procfs telemetry (GTT/VRAM/RAM/CPU)
@@ -581,7 +754,7 @@ backend/
 frontend/
   src/
     App.jsx                 tabs, theme, polling, 120-sample history buffer
-    api.js                  fetch helpers (fetchLiveStatus, postConfig, resetStats, countTokens)
+    api.js                  fetch helpers (fetchLiveStatus, postConfig, resetStats, countTokens, streamChat, createThinkSplitter)
     theme.js                chart + status color tokens (light/dark)
     format.js               number/percent/time formatters
     components/
@@ -594,6 +767,7 @@ frontend/
       CacheStatsCard.jsx    Halogen prompt-cache telemetry card (GET /cache)
       TokenCounter.jsx      on-demand prompt token counter (POST /count-tokens)
       TuningTab.jsx         Tab 2 (banner + audit table)
+      AIChatTab.jsx         Tab 3 (streaming chat, reasoning, API style switch)
     charts/
       ChartCard.jsx         chart wrapper with info button
       InfoModal.jsx         portal modal (backdrop / X / Escape to close)
@@ -648,14 +822,18 @@ several design decisions:
    (session min/avg/max + reset), `RuntimeState`, `build_live_snapshot`,
    `poll_loop`, `managed_poller`.
 6. **TuningChecker** — the 8 checks + `run_all_checks` + `get_system_info`.
-7. **Routers** — `live`, `tuning`, `config_routes`, `stats_routes`, `healthz`.
+7. **Routers** — `live`, `tuning`, `config_routes`, `stats_routes`, `tokens`,
+   `chat`, `healthz`.
 8. **Frontend scaffold** — Vite + React + Tailwind + TanStack Query + Recharts +
    lucide-react; theme tokens; formatters; `api.js`.
 9. **Tab 1** — 4 KPI cards (each with info modal), secondary counters,
    `StatsSummary` with reset, 4 charts (each with info modal), 120-sample
    history buffer.
 10. **Tab 2** — system banner + audit table with PASS/WARN/FAIL badges.
-11. **Packaging** — `Dockerfile` (multi-stage: build frontend, serve from
+11. **Tab 3 (AI-Chat)** — `streamChat` SSE client + `createThinkSplitter` in
+    `api.js`; `AIChatTab.jsx` with message list, collapsible reasoning, API
+    style switch, thinking toggle, max-tokens input, and stop/clear controls.
+12. **Packaging** — `Dockerfile` (multi-stage: build frontend, serve from
     FastAPI), `run.sh` (dev: backend + Vite concurrently), `stop.sh`.
 12. **Verify** — `cd frontend && npm run build`; restart backend; confirm
     live-status, stats reset, tuning checks, and all info modals render.
