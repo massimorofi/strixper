@@ -5,7 +5,20 @@ containerized LLM inference server. Configurations are stored locally as a
 JSON list (see services/runner_store.py) and can be created, edited, deleted
 and selected from the dashboard.
 
-Starting a run launches the configured docker command as a subprocess and
+The stored command is a **template**: wherever a value should be
+variable -- a model directory, a port, a context size -- the configuration
+declares a named parameter and the command references it as
+``{parameter_name}``::
+
+    -v {models}/weights.hgn:/models/w.hgn:ro -p 0.0.0.0:{port}:{port}
+
+Parameters are edited in the same form as the command, added and removed
+freely, and validated on save so no placeholder is left unfilled. At run
+time the backend renders the template against the parameter values and
+launches the resulting command; a run may also override individual values
+without saving them first.
+
+Starting a run launches the rendered docker command as a subprocess and
 streams its merged stdout/stderr back to the browser as Server-Sent Events:
 
     event: stdout  data: {"text": "..."}    output chunk
@@ -29,6 +42,12 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
+from ..services.params import (
+    MAX_PARAMS,
+    ParamError,
+    merge_values,
+    render_command,
+)
 from ..services.runner_store import (
     MAX_COMMAND_CHARS,
     MAX_DESCRIPTION_CHARS,
@@ -53,10 +72,19 @@ def get_store() -> RunnerStore:
     return _store
 
 
+class RunnerParameter(BaseModel):
+    """One named value substituted into the docker command template."""
+
+    name: str = Field(..., min_length=1, max_length=60)
+    label: str = Field(default="", max_length=120)
+    value: str = Field(default="")
+
+
 class RunnerConfigCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=MAX_NAME_CHARS)
     docker_command: str = Field(..., min_length=1, max_length=MAX_COMMAND_CHARS)
     description: str = Field(default="", max_length=MAX_DESCRIPTION_CHARS)
+    parameters: list[RunnerParameter] = Field(default_factory=list, max_length=MAX_PARAMS)
 
     @field_validator("name", "docker_command")
     @classmethod
@@ -72,6 +100,10 @@ class RunnerConfigUpdate(BaseModel):
         default=None, min_length=1, max_length=MAX_COMMAND_CHARS
     )
     description: Optional[str] = Field(default=None, max_length=MAX_DESCRIPTION_CHARS)
+    # Omitted leaves the parameter list untouched; [] clears it.
+    parameters: Optional[list[RunnerParameter]] = Field(
+        default=None, max_length=MAX_PARAMS
+    )
 
 
 def _sse(event: str, data: dict[str, Any]) -> str:
@@ -116,6 +148,7 @@ async def create_config(body: RunnerConfigCreate) -> dict[str, Any]:
             name=body.name,
             docker_command=body.docker_command,
             description=body.description,
+            parameters=[p.model_dump() for p in body.parameters],
         )
     except RunnerStoreError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -129,6 +162,11 @@ async def update_config(config_id: str, body: RunnerConfigUpdate) -> dict[str, A
             name=body.name,
             docker_command=body.docker_command,
             description=body.description,
+            parameters=(
+                [p.model_dump() for p in body.parameters]
+                if body.parameters is not None
+                else None
+            ),
         )
     except RunnerStoreError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -146,14 +184,55 @@ async def delete_config(config_id: str) -> dict[str, Any]:
 # -- Running configurations ------------------------------------------------------
 
 
+class RunRequest(BaseModel):
+    """Optional run-time overrides for the configuration's parameters.
+
+    Keys must be parameters the configuration already declares; the values
+    here win over the stored ones for this run only and are not persisted.
+    """
+
+    values: Optional[dict[str, str]] = Field(default=None)
+
+
+class PreviewRequest(BaseModel):
+    """Command template + parameters to render without saving or running."""
+
+    docker_command: str = Field(..., min_length=1, max_length=MAX_COMMAND_CHARS)
+    parameters: list[RunnerParameter] = Field(default_factory=list, max_length=MAX_PARAMS)
+
+
+@router.post("/runner/preview")
+async def preview_command(body: PreviewRequest) -> dict[str, Any]:
+    """Render a docker command template against its parameters.
+
+    Lets the UI show the exact command a run would launch, using the same
+    code path the run itself uses.
+    """
+    try:
+        params = [p.model_dump() for p in body.parameters]
+        command = render_command(body.docker_command, params)
+    except ParamError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"command": command}
+
+
 @router.post("/runner/configs/{config_id}/run")
-async def run_config(config_id: str) -> StreamingResponse:
+async def run_config(
+    config_id: str, body: Optional[RunRequest] = None
+) -> StreamingResponse:
     cfg = get_store().get(config_id)
     if cfg is None:
         raise HTTPException(status_code=404, detail="configuration not found")
 
     run_id = uuid.uuid4().hex[:12]
-    command = cfg["docker_command"]
+
+    # Reconstruct the concrete command from the stored template and the
+    # parameter values (request overrides take precedence over stored).
+    try:
+        params = merge_values(cfg.get("parameters") or [], body.values if body else None)
+        command = render_command(cfg["docker_command"], params)
+    except ParamError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # Allocate a pseudo-terminal so the command sees a real TTY. This lets
     # `docker run -it ...` (TTY-allocating flags) work from the dashboard;

@@ -92,17 +92,27 @@ export const deleteRunnerConfig = (id) =>
 export const stopRunnerRun = (runId) =>
   sendJSON('POST', `/runner/runs/${runId}/stop`, {})
 
-// Stream a docker run from the backend. onStdout(textChunk), onStarted(info),
-// onExit({exit_code}), onError(message).
+// Render a command template against its parameters without running it.
+// Returns { command }; throws with the backend's message on a bad template.
+export const previewRunnerCommand = (docker_command, parameters = []) =>
+  sendJSON('POST', '/runner/preview', { docker_command, parameters })
+
+// Stream a docker run from the backend. `values` optionally overrides
+// parameter values for this run only (not persisted).
+// onStdout(textChunk), onStarted(info), onExit({exit_code}), onError(message).
 export async function streamRunnerRun(
   configId,
-  { onStdout, onStarted, onExit, onError, signal } = {},
+  { values, onStdout, onStarted, onExit, onError, signal } = {},
 ) {
   let res
   try {
     res = await fetch(`${BASE}/runner/configs/${configId}/run`, {
       method: 'POST',
-      headers: { Accept: 'text/event-stream' },
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream',
+      },
+      body: JSON.stringify(values ? { values } : {}),
       signal,
     })
   } catch (err) {

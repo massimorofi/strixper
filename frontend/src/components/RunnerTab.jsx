@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  ChevronDown,
+  ChevronRight,
   Loader2,
   Pencil,
   Play,
@@ -19,21 +21,182 @@ import {
   updateRunnerConfig,
 } from '../api.js'
 import { fmtTime } from '../format.js'
+import {
+  MAX_PARAMS,
+  missingParameters,
+  normaliseRows,
+  renderTemplate,
+  unusedParameters,
+  validateRows,
+} from '../params.js'
 
-const EMPTY_FORM = { name: '', docker_command: '', description: '' }
+const EMPTY_FORM = {
+  name: '',
+  docker_command: '',
+  description: '',
+  parameters: [],
+}
+
+const inputCls =
+  'w-full rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-page)] px-3 py-2 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--series-1)] focus:outline-none'
+const monoCls =
+  'w-full rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-page)] px-3 py-2 font-mono text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--series-1)] focus:outline-none'
+
+/**
+ * Editable list of run parameters. Each parameter is a named value the
+ * command template references as `{name}`; rows can be added and removed
+ * freely. Name validity and duplicate detection are reported per row.
+ */
+function ParametersEditor({ params, onChange }) {
+  const rowErrors = validateRows(params)
+
+  const update = (i, key, value) =>
+    onChange(params.map((p, j) => (j === i ? { ...p, [key]: value } : p)))
+  const add = () =>
+    onChange([...params, { name: '', label: '', value: '' }])
+  const remove = (i) => onChange(params.filter((_, j) => j !== i))
+
+  return (
+    <div>
+      <div className="mb-1 flex items-center justify-between">
+        <span className="text-xs font-medium uppercase tracking-wide text-[var(--text-muted)]">
+          Run parameters
+        </span>
+        <button
+          type="button"
+          onClick={add}
+          disabled={params.length >= MAX_PARAMS}
+          className="inline-flex items-center gap-1 rounded-md border border-[var(--border-hairline)] px-2 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--surface-card)] hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          <Plus size={12} />
+          Add parameter
+        </button>
+      </div>
+
+      {params.length === 0 ? (
+        <p className="rounded-lg border border-dashed border-[var(--border-hairline)] px-3 py-2 text-xs text-[var(--text-muted)]">
+          No parameters yet. Write a variable part of the command as{' '}
+          <code className="font-mono text-[var(--text-secondary)]">{'{name}'}</code>{' '}
+          and add a matching parameter here.
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {params.map((p, i) => (
+            <div
+              key={i}
+              className="grid grid-cols-1 items-start gap-2 rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-card)] p-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.1fr)_minmax(0,1.6fr)_auto]"
+            >
+              <input
+                type="text"
+                value={p.name}
+                onChange={(e) => update(i, 'name', e.target.value)}
+                maxLength={60}
+                placeholder="name"
+                spellCheck={false}
+                className={`font-mono text-xs ${inputCls} ${
+                  rowErrors[i]
+                    ? 'border-[var(--status-critical)]'
+                    : 'border-transparent'
+                }`}
+              />
+              <input
+                type="text"
+                value={p.label}
+                onChange={(e) => update(i, 'label', e.target.value)}
+                maxLength={120}
+                placeholder="Label (optional)"
+                className={inputCls}
+              />
+              <input
+                type="text"
+                value={p.value}
+                onChange={(e) => update(i, 'value', e.target.value)}
+                placeholder="value"
+                spellCheck={false}
+                className={monoCls}
+              />
+              <button
+                type="button"
+                onClick={() => remove(i)}
+                title={`Remove ${p.name || 'parameter'}`}
+                className="mt-1 inline-flex items-center rounded-md border border-[var(--border-hairline)] p-2 text-[var(--status-critical)] transition-colors hover:bg-[var(--surface-page)]"
+              >
+                <Trash2 size={13} />
+              </button>
+              {rowErrors[i] && (
+                <p className="text-[11px] text-[var(--status-critical)] sm:col-span-4">
+                  {rowErrors[i]}
+                </p>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Collapsible view of the command the run will actually launch. */
+function CommandPreview({ command }) {
+  const [open, setOpen] = useState(false)
+  if (!command) return null
+  return (
+    <div className="rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-page)]">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-1.5 px-3 py-2 text-left text-xs font-medium text-[var(--text-secondary)] transition-colors hover:text-[var(--text-primary)]"
+      >
+        {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        Rendered command
+      </button>
+      {open && (
+        <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words border-t border-[var(--border-hairline)] p-3 font-mono text-[11px] leading-relaxed text-[var(--text-secondary)]">
+          {command}
+        </pre>
+      )}
+    </div>
+  )
+}
 
 function ConfigForm({ initial, saving, error, onSubmit, onCancel }) {
   const [form, setForm] = useState(initial || EMPTY_FORM)
   const isEdit = Boolean(initial?.id)
 
   useEffect(() => {
-    setForm(initial || EMPTY_FORM)
+    setForm(
+      initial
+        ? { ...initial, parameters: normaliseRows(initial.parameters) }
+        : EMPTY_FORM,
+    )
   }, [initial])
 
   const set = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.value }))
 
+  // Live feedback on how the command template and the parameter list line
+  // up. The backend re-checks both on save; this just avoids the surprise.
+  const missing = useMemo(
+    () => missingParameters(form.docker_command || '', form.parameters || []),
+    [form.docker_command, form.parameters],
+  )
+  const unused = useMemo(
+    () => unusedParameters(form.docker_command || '', form.parameters || []),
+    [form.docker_command, form.parameters],
+  )
+  const rowErrors = useMemo(
+    () => validateRows(form.parameters || []).some(Boolean),
+    [form.parameters],
+  )
+  const preview = useMemo(() => {
+    try {
+      return renderTemplate(form.docker_command || '', form.parameters || [])
+    } catch {
+      return null
+    }
+  }, [form.docker_command, form.parameters])
+
   const canSubmit =
-    form.name.trim() && form.docker_command.trim() && !saving
+    form.name.trim() && form.docker_command.trim() && !saving && !rowErrors
 
   return (
     <div className="rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-4">
@@ -64,7 +227,7 @@ function ConfigForm({ initial, saving, error, onSubmit, onCancel }) {
             onChange={set('name')}
             maxLength={120}
             placeholder="e.g. Qwen3 local inference"
-            className="w-full rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-page)] px-3 py-2 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--series-1)] focus:outline-none"
+            className={inputCls}
           />
         </label>
 
@@ -77,10 +240,32 @@ function ConfigForm({ initial, saving, error, onSubmit, onCancel }) {
             onChange={set('docker_command')}
             rows={4}
             spellCheck={false}
-            placeholder={'docker run --rm -it --device /dev/kfd ... my-llm-image'}
-            className="w-full resize-y rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-page)] px-3 py-2 font-mono text-xs text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--series-1)] focus:outline-none"
+            placeholder={
+              'docker run --rm -it -v {models}/weights.hgn:/models/w.hgn:ro -p 0.0.0.0:{port}:{port} my-llm-image'
+            }
+            className={`${monoCls} resize-y`}
           />
         </label>
+
+        <ParametersEditor
+          params={form.parameters || []}
+          onChange={(parameters) => setForm((f) => ({ ...f, parameters }))}
+        />
+
+        {missing.length > 0 && (
+          <div className="rounded-lg border border-[var(--status-warning)] px-3 py-1.5 text-xs text-[var(--status-warning)]">
+            Command uses {missing.map((n) => `{${n}}`).join(', ')} but no such
+            parameter is defined.
+          </div>
+        )}
+        {unused.length > 0 && (
+          <div className="rounded-lg border border-[var(--border-hairline)] px-3 py-1.5 text-xs text-[var(--text-muted)]">
+            Not referenced by the command:{' '}
+            {unused.map((n) => `{${n}}`).join(', ')}
+          </div>
+        )}
+
+        <CommandPreview command={preview} />
 
         <label className="block">
           <span className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--text-muted)]">
@@ -92,7 +277,7 @@ function ConfigForm({ initial, saving, error, onSubmit, onCancel }) {
             onChange={set('description')}
             maxLength={1000}
             placeholder="What this run does"
-            className="w-full rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-page)] px-3 py-2 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--series-1)] focus:outline-none"
+            className={inputCls}
           />
         </label>
 
@@ -106,7 +291,14 @@ function ConfigForm({ initial, saving, error, onSubmit, onCancel }) {
           <button
             type="button"
             disabled={!canSubmit}
-            onClick={() => onSubmit(form)}
+            onClick={() =>
+              onSubmit({
+                name: form.name,
+                docker_command: form.docker_command,
+                description: form.description,
+                parameters: form.parameters || [],
+              })
+            }
             className="inline-flex items-center gap-1.5 rounded-md bg-[var(--series-1)] px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {saving ? (
@@ -150,6 +342,7 @@ function ConfigList({ configs, runningId, onSelectRun, onEdit, onDelete }) {
     <ul className="space-y-2">
       {configs.map((c) => {
         const isRunning = runningId === c.id
+        const params = c.parameters || []
         return (
           <li
             key={c.id}
@@ -179,6 +372,19 @@ function ConfigList({ configs, runningId, onSelectRun, onEdit, onDelete }) {
                 >
                   {c.docker_command}
                 </p>
+                {params.length > 0 && (
+                  <div className="mt-1.5 flex flex-wrap gap-1">
+                    {params.map((p) => (
+                      <span
+                        key={p.name}
+                        className="rounded bg-[var(--surface-page)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--text-secondary)]"
+                        title={`${p.label || p.name}: ${p.value}`}
+                      >
+                        {p.name}={p.value}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
             <div className="mt-2 flex items-center gap-2">
@@ -243,19 +449,21 @@ export default function RunnerTab({ active = true }) {
   const handleSubmit = async (form) => {
     setSaving(true)
     setFormError(null)
+    const payload = {
+      name: form.name.trim(),
+      docker_command: form.docker_command.trim(),
+      description: (form.description || '').trim(),
+      parameters: (form.parameters || []).map((p) => ({
+        name: (p.name || '').trim(),
+        label: (p.label || '').trim(),
+        value: p.value ?? '',
+      })),
+    }
     try {
       if (formInitial?.id) {
-        await updateRunnerConfig(formInitial.id, {
-          name: form.name.trim(),
-          docker_command: form.docker_command.trim(),
-          description: (form.description || '').trim(),
-        })
+        await updateRunnerConfig(formInitial.id, payload)
       } else {
-        await createRunnerConfig({
-          name: form.name.trim(),
-          docker_command: form.docker_command.trim(),
-          description: (form.description || '').trim(),
-        })
+        await createRunnerConfig(payload)
       }
       setFormInitial(null)
       await refresh()

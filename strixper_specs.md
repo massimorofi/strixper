@@ -137,7 +137,8 @@ All endpoints are mounted under the `/api/v1` prefix.
 | `/api/v1/runner/configs` | `POST` | On-demand (LLM-Runner tab) | Create a new run configuration |
 | `/api/v1/runner/configs/{id}` | `PUT` | On-demand (LLM-Runner tab) | Edit an existing configuration |
 | `/api/v1/runner/configs/{id}` | `DELETE` | On-demand (LLM-Runner tab) | Delete a configuration |
-| `/api/v1/runner/configs/{id}/run` | `POST` | On-demand (LLM-Runner tab) | Start the configured docker command (SSE stream) |
+| `/api/v1/runner/configs/{id}/run` | `POST` | On-demand (LLM-Runner tab) | Start the rendered docker command (SSE stream) |
+| `/api/v1/runner/preview` | `POST` | On-demand (LLM-Runner tab) | Render a command template against its parameters, without running |
 | `/api/v1/runner/runs/{run_id}/stop` | `POST` | On-demand (LLM-Runner tab) | Stop a running docker command |
 | `/api/v1/healthz` | `GET` | On-demand | Backend's own liveness (independent of Halogen) |
 
@@ -450,39 +451,71 @@ The LLM-Runner tab lets the user **create, run and store** the docker command
 used to launch a containerized LLM inference server. Configurations are stored
 locally as a JSON list on the backend disk (see §4.6), so they survive restarts.
 
-**Configuration object** (all six fields always present):
+**Configuration object** (all seven fields always present):
 
 ```json
 {
   "id": "a9be92b171ae",
   "name": "Qwen3 local inference",
-  "docker_command": "docker run --rm --device /dev/kfd ... my-llm-image",
+  "docker_command": "docker run -v {models}/w.hgn:/models/w.hgn:ro -p 0.0.0.0:{port}:{port} {image}",
   "description": "optional free-text note",
+  "parameters": [
+    { "name": "models", "label": "Models directory", "value": "/srv/models" },
+    { "name": "port", "label": "API port", "value": "8731" },
+    { "name": "image", "label": "Docker image", "value": "my-llm-image:latest" }
+  ],
   "created_at": "2026-10-09T18:37:58Z",
   "updated_at": "2026-10-09T18:37:58Z"
 }
 ```
 
+`docker_command` is a **template**: wherever a value should be variable the
+command references a parameter as `{parameter_name}`, and the parameter's
+`value` is substituted in at run time (see §4.7). A configuration with an
+empty `parameters` list is a plain, unparameterised command and behaves
+exactly as before.
+
+**Parameters.** Each parameter has `name` (1–60 chars, an identifier —
+letters, digits and underscore, not starting with a digit), `label`
+(optional, ≤ 120; falls back to the name) and `value` (≤ 4,000 chars).
+Up to 40 parameters per configuration. Names are unique case-insensitively.
+On every create and update the store checks that **every placeholder in the
+command has a matching parameter**, so a saved configuration always renders
+into a complete command — `400` naming the missing ones otherwise. Parameters
+the command does not reference are allowed (useful while editing); the UI
+lists them as a hint.
+
 `GET /api/v1/runner/configs` → `{ "configs": [ <configuration>, … ] }`.
 
 `GET /api/v1/runner/configs/{id}` → the single configuration, or `404`.
 
-`POST /api/v1/runner/configs` — body `{ name, docker_command, description? }`.
+`POST /api/v1/runner/configs` — body `{ name, docker_command, description?, parameters? }`.
 `name` (1–120 chars) and `docker_command` (1–10,000 chars) are required and
-non-blank; `description` is optional (≤ 1,000 chars). Names are unique
-(case-insensitive). Returns the created configuration. `400` on a blank field
-or a duplicate name.
+non-blank; `description` is optional (≤ 1,000 chars); `parameters` is
+optional (defaults to an empty list). Names are unique (case-insensitive).
+Returns the created configuration. `400` on a blank field, a duplicate name,
+a malformed parameter, or a placeholder with no matching parameter.
 
 `PUT /api/v1/runner/configs/{id}` — body accepts any subset of
-`{ name, docker_command, description }`; omitted fields are left unchanged.
-Returns the updated configuration. `400` on validation / duplicate name,
-`404` if the id is unknown.
+`{ name, docker_command, description, parameters }`; omitted fields are left
+unchanged (sending `parameters: []` clears the list). Returns the updated
+configuration. `400` on validation / duplicate name, `404` if the id is
+unknown. A rejected update leaves the stored configuration completely
+untouched — the whole resulting state is validated before anything is written.
 
 `DELETE /api/v1/runner/configs/{id}` → `{ "deleted": "<id>" }`, or `404`.
 
-**`POST /api/v1/runner/configs/{id}/run`** — launches the stored
-`docker_command` as a shell subprocess and streams its merged stdout/stderr
-back as `text/event-stream` (same SSE framing as `/api/v1/chat`):
+**`POST /runner/preview`** — body `{ docker_command, parameters? }`. Renders
+the template against the parameters and returns `{ "command": "…" }` without
+saving or running anything, so the UI can show exactly what a run would
+launch through the same code path the run itself uses. `400` if a referenced
+parameter is missing or blank.
+
+**`POST /api/v1/runner/configs/{id}/run`** — renders the stored
+`docker_command` against the configuration's parameter values, launches the
+resulting command as a shell subprocess, and streams its merged
+stdout/stderr back as `text/event-stream` (same SSE framing as
+`/api/v1/chat`):
 
 | Event | Data | Meaning |
 | --- | --- | --- |
@@ -490,6 +523,17 @@ back as `text/event-stream` (same SSE framing as `/api/v1/chat`):
 | `stdout` | `{"text": "…"}` | An output chunk (stdout + stderr merged) |
 | `exit` | `{"exit_code": 0}` | Process terminated |
 | `error` | `{"message": "…"}` | Failed to start / stream failure |
+
+The `command` in the `started` event is the **rendered** command — the
+template with every `{placeholder}` already replaced — so what actually ran
+is always visible in the stream.
+
+An optional body `{ "values": { "port": "9000", … } }` overrides individual
+parameter values for this run only; nothing is written back to the store.
+Override keys must be parameters the configuration already declares — an
+unknown key is a `400` rather than a silent no-op, so a typo cannot quietly
+leave the stored value in place. `400` is also returned if a parameter the
+template needs ends up blank.
 
 The subprocess is launched attached to a **pseudo-terminal (PTY)** so the
 command sees a real TTY. This is required for TTY-allocating docker flags
@@ -666,10 +710,50 @@ Persists the LLM-Runner docker configurations to a JSON file on disk.
   non-blank; `description` optional (≤ 1,000). Names are unique case-insensitive
   (`RunnerStoreError` on a duplicate). Each config gets a 12-hex-char `id` and
   `created_at` / `updated_at` timestamps.
+* **Template validation:** on create *and* update the stored command and
+  parameter list are checked together (`validate_template`) so no configuration
+  can be saved with a `{placeholder}` that has no matching parameter.
+* **Update ordering:** `update` resolves the complete resulting configuration,
+  validates it, and only then assigns — a payload rejected by validation leaves
+  the in-memory copy as it was, not just the file on disk.
+* **Load-time migration:** configurations written before `parameters` existed
+  have no such key; `_load` normalises it to `[]`. A stored `parameters` list
+  that no longer validates (a hand-edited file, say) is dropped to `[]` rather
+  than making the whole store unreadable.
 * `list()`, `get(id)`, `create(...)`, `update(id, ...)`, `delete(id)`.
 
 The router (`routers/runner.py`) holds one lazily-created store instance and a
 dict of active runs (`run_id -> subprocess handle`) so runs can be stopped by id.
+
+### 4.7 Parameter templates (`services/params.py`)
+
+The substitution layer shared by the store (validation) and the run path
+(rendering).
+
+* **Syntax.** Placeholders are `{parameter_name}`, matched by
+  `\{([A-Za-z_][A-Za-z0-9_]*)\}` — only identifier-shaped braces count, so a
+  stray `{` in a JSON literal or format string is left alone.
+* **Values are inserted verbatim**, with no shell quoting. The command template
+  is already raw shell and may legitimately contain `$(...)` substitutions, so
+  quoting would get in the way. The consequence is that a parameter feeding a
+  path or argument must not contain shell-significant characters it doesn't
+  mean; the non-blank check on render catches the common case of an unset value.
+* **Limits.** Name ≤ 60 chars, label ≤ 120, value ≤ 4,000, at most 40
+  parameters per configuration.
+* **Functions.** `normalise_parameters(raw)` validates and reduces a payload to
+  `{name, label, value}` rows (empty label → name); `find_placeholders(cmd)`,
+  `missing_parameters(cmd, params)`, `unused_parameters(cmd, params)` for
+  author-time feedback; `validate_template(cmd, params)` raises on any unfilled
+  placeholder; `merge_values(params, overrides)` applies run-time overrides,
+  rejecting unknown keys; `render_command(cmd, params)` produces the final
+  string, raising if a referenced value is blank.
+* All failures raise `ParamError` (a `ValueError`), which the router surfaces as
+  `400` and the store re-raises as `RunnerStoreError`.
+
+`frontend/src/params.js` mirrors the read-only helpers (`findPlaceholders`,
+`missingParameters`, `unusedParameters`, `renderTemplate`) plus `validateRows`
+for per-row form feedback, so the form can give live warnings. The backend stays
+the authority: it re-validates on save and at run time.
 
 ---
 
@@ -814,20 +898,40 @@ a single column:
 
 * **Left — Saved configurations.** A heading with a **New** button (opens a
   blank form). Below it, a list of stored configs, each showing its name, its
-  description (if any) and the docker command (truncated, full command in the
-  `title` tooltip). Per-config actions: **Run** (▶, primary), **Edit** (pencil)
-  and **Delete** (trash, right-aligned). While a config is running it shows a
+  description (if any), the docker command template (truncated, full template in
+  the `title` tooltip) and — when the config has them — a wrapped row of
+  `name=value` chips, one per parameter, each carrying the parameter's label in
+  its `title`. Per-config actions: **Run** (▶, primary), **Edit** (pencil) and
+  **Delete** (trash, right-aligned). While a config is running it shows a
   pulsing `RUNNING` badge and its **Run** and **Delete** buttons are disabled
   (Edit stays available). The empty state shows a terminal icon with a short
   prompt to create a configuration.
 * **Right — Form + Run console.**
   * **Form** (`ConfigForm`): `Name` (≤ 120), `Docker command` (monospace
-    textarea, `spellCheck={false}`) and optional `Description` (≤ 1000). Create
-    mode posts a new config; editing an existing one (via the Edit button)
-    pre-fills the form and PUTs the changes. Submit is disabled until both name
-    and command are non-blank. An inline error banner shows validation failures
-    (e.g. a duplicate name). Editing shows a Cancel control (header `X` and a
-    footer button) that reverts to a blank form.
+    textarea, `spellCheck={false}`), the **Run parameters** editor, and optional
+    `Description` (≤ 1000). Create mode posts a new config; editing an existing
+    one (via the Edit button) pre-fills the form and PUTs the changes. Submit is
+    disabled until both name and command are non-blank and no parameter row is
+    invalid. An inline error banner shows validation failures (e.g. a duplicate
+    name). Editing shows a Cancel control (header `X` and a footer button) that
+    reverts to a blank form.
+  * **Run parameters editor** (`ParametersEditor`): a list of rows, each with
+    `name` (monospace), `Label (optional)` and `value` (monospace) inputs plus a
+    **Remove** (trash) button; an **Add parameter** button sits in the section
+    header and is disabled at the 40-parameter cap. Rows can be added and removed
+    in any order. Each row validates its own name (identifier-shaped, not
+    duplicated case-insensitively) and shows the problem inline in red under that
+    row. With no parameters the section shows a dashed hint explaining the
+    `{name}` syntax.
+  * **Live template feedback.** As the command and parameters are edited, the
+    form reports: placeholders used by the command with no matching parameter
+    (amber warning, listing them — this is what the backend rejects on save), and
+    defined parameters the command never references (neutral hint). Both update
+    on every keystroke.
+  * **Rendered command preview** (`CommandPreview`): a collapsed disclosure that
+    expands to show the concrete command the current template + parameter values
+    produce, so the exact command line can be checked before running. Hidden when
+    the template can't be rendered (blank values).
   * **Run console:** a fixed-height (~420 px) scrolling monospace pane. Pressing
     **Run** starts the configured command and streams its live output in,
     appending chunks as they arrive with a blinking caret at the end while
@@ -884,7 +988,7 @@ backend/
       stats_routes.py       POST /stats/reset
       tokens.py             POST /count-tokens (Halogen count_tokens proxy)
       chat.py               POST /chat (streaming chat proxy, 4 API styles)
-      runner.py             LLM-Runner: config CRUD + run (SSE) + stop
+      runner.py             LLM-Runner: config CRUD + run (SSE) + stop + preview
     services/
       halogen_client.py     async Halogen HTTP client + Prometheus parser
       system_monitor.py     sysfs/procfs telemetry (GTT/VRAM/RAM/CPU)
@@ -892,14 +996,16 @@ backend/
       tuning_checker.py     8-check compliance audit + system info
       live_service.py       MetricStats / StatsTracker / RuntimeState / poll loop
       runner_store.py       JSON-persisted store for LLM-Runner docker configs
+      params.py             {name} template validation + command rendering
     data/
       llm_runner_configs.json   runtime store (gitignored)
 frontend/
   src/
     App.jsx                 tabs, theme, polling, 120-sample history buffer
-    api.js                  fetch helpers (fetchLiveStatus, postConfig, resetStats, countTokens, streamChat, createThinkSplitter, and the runner client: fetchRunnerConfigs, createRunnerConfig, updateRunnerConfig, deleteRunnerConfig, streamRunnerRun, stopRunnerRun, sendJSON)
+    api.js                  fetch helpers (fetchLiveStatus, postConfig, resetStats, countTokens, streamChat, createThinkSplitter, and the runner client: fetchRunnerConfigs, createRunnerConfig, updateRunnerConfig, deleteRunnerConfig, previewRunnerCommand, streamRunnerRun, stopRunnerRun, sendJSON)
     theme.js                chart + status color tokens (light/dark)
     format.js               number/percent/time formatters
+    params.js               client-side {name} template helpers (placeholders, missing/unused, render, row validation)
     components/
       TopBar.jsx            connection, refresh, theme, tabs
       StatTile.jsx          KPI card with info button
