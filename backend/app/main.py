@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .config import settings
-from .routers import config_routes, live, stats_routes, tuning
+from .routers import config_routes, live, stats_routes, tokens, tuning
 from .services.live_service import RuntimeState, managed_poller
 
 
@@ -44,6 +44,7 @@ app.include_router(live.router, prefix="/api/v1")
 app.include_router(tuning.router, prefix="/api/v1")
 app.include_router(config_routes.router, prefix="/api/v1")
 app.include_router(stats_routes.router, prefix="/api/v1")
+app.include_router(tokens.router, prefix="/api/v1")
 
 
 @app.get("/api/v1/healthz")

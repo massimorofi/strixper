@@ -30,7 +30,7 @@ this document reflects the **shipped app**.
 |                                  PYTHON BACKEND                                    |
 |                          (FastAPI / Uvicorn + asyncio)                             |
 |                                                                                    |
-|  HalogenClient   -> httpx  -> Halogen /health /metrics /v1/models                   |
+|  HalogenClient   -> httpx  -> Halogen /health /metrics /v1/models /cache            |
 |  SystemMonitor   -> sysfs / procfs (GTT, VRAM, RAM, CPU)                            |
 |  RocmMonitor     -> `rocm-smi` subprocess (GPU util %, VRAM)                        |
 |  TuningChecker   -> shell commands (uname, tuned-adm, lspci, ls, ...)               |
@@ -48,8 +48,8 @@ v                                               v
 ### 1.2 Core Capabilities
 
 1. **Live Metrics Polling** — an async backend poller reads Halogen's `/health`,
-   `/metrics`, `/v1/models` at a configurable interval (default **5 s**) and
-   merges them with local hardware telemetry into one snapshot.
+   `/metrics`, `/v1/models` and `/cache` at a configurable interval (default
+   **5 s**) and merges them with local hardware telemetry into one snapshot.
 2. **Local Hardware Telemetry** — GTT/VRAM from amdgpu `sysfs`, RAM/CPU from
    `procfs`.
 3. **GPU Monitoring via `rocm-smi`** — a short-lived `rocm-smi` subprocess per
@@ -108,6 +108,7 @@ All endpoints are mounted under the `/api/v1` prefix.
 | `/api/v1/config` | `GET` | On-demand | Read current runtime settings |
 | `/api/v1/config` | `POST` | On-demand | Update runtime settings (poll interval) |
 | `/api/v1/stats/reset` | `POST` | On-demand (button) | Zero the session statistics and restart the clock |
+| `/api/v1/count-tokens` | `POST` | On-demand (widget) | Count the input tokens of a prompt (proxies Halogen) |
 | `/api/v1/healthz` | `GET` | On-demand | Backend's own liveness (independent of Halogen) |
 
 Interactive API docs are served at `http://<host>:8000/docs`.
@@ -140,7 +141,35 @@ first request if not yet available).
     "prompt_tokens_total": 1362385.0,
     "tokens_predicted_total": 247778.0,
     "prompt_tokens_cached_total": 27223757.0,
-    "draft_acceptance_rate": 0.7261
+    "draft_acceptance_rate": 0.7261,
+    "cache": {
+      "entries": 24,
+      "bytes": 2793351648,
+      "last_entry_bytes": 116389652,
+      "max_entries": 24,
+      "hits": 62,
+      "misses": 9,
+      "stores": 135,
+      "evicted": 2,
+      "prompt_tokens_saved": 4019426,
+      "store_ms_total": 3666.5,
+      "restore_ms_total": 344.9,
+      "last_store_ms": 0.0,
+      "last_restore_ms": 0.0,
+      "refused": 0,
+      "rows_copied": 2,
+      "rows_copied_ms": 0.3,
+      "superseded": 52,
+      "composable_context": { "chunks": 0, "bytes": 0, "stored": 0, "composed": 0, "evicted": 0, "composed_tokens": 0 },
+      "disk": { "on": false, "records": 0, "lineages": 0, "bytes": 0, "budget_bytes": 0, "hits": 0, "misses": 0, "persisted": 0, "branches": 0, "evicted": 0, "skipped": 0, "restore_ms_total": 0.0, "restored_bytes": 0 },
+      "tapped": 29,
+      "full_hits": 3,
+      "pool": { "waiting_for_room": 0, "waiting_s": 0.0, "relocated": 0, "cold_resorts": 0, "positions": 524288, "used": 288512, "busy_regions": 0, "held_regions": 7, "room_clamped": 0, "moved": 2, "packed": 0, "taken_over": 0, "usage_ratio": 0.5503 },
+      "dropped": 19,
+      "hit_rate": 0.8784,
+      "token_hit_rate": 0.9652,
+      "snapshot_places": ["system_end", "last_user_start", "history_end"]
+    }
   },
   "hardware": {
     "gpu": {
@@ -176,6 +205,8 @@ first request if not yet available).
     "gpu_util_pct": { "min": 13.0, "max": 99.0, "avg": 61.2, "count": 18 },
     "cpu_pct": { "min": 1.07, "max": 12.4, "avg": 4.1, "count": 20 },
     "draft_acceptance": { "min": 72.41, "max": 72.42, "avg": 72.41, "count": 21 },
+    "cache_hit_rate": { "min": 87.7, "max": 88.6, "avg": 88.0, "count": 21 },
+    "cache_token_hit_rate": { "min": 96.5, "max": 96.7, "avg": 96.5, "count": 21 },
     "started_at": "2026-10-03T22:18:46Z",
     "samples": 21
   }
@@ -251,6 +282,44 @@ without waiting out the old interval.
 Zeros the running min/avg/max accumulators and restarts the session clock.
 Returns the fresh (empty) stats snapshot.
 
+#### `POST /api/v1/count-tokens`
+
+Counts the input tokens of a prompt **without generating**, by proxying Halogen's
+Anthropic-compatible `POST /v1/messages/count_tokens`. Useful for checking the
+exact token cost (including chat-template framing) before sending a request.
+
+**Request body:**
+
+```json
+{
+  "text": "The user prompt to count",
+  "system": "Optional system prompt"
+}
+```
+
+`text` is required, non-blank, up to 2,000,000 characters. `system` is optional.
+
+**JSON Response Schema:**
+
+```json
+{
+  "input_tokens": 65,
+  "model": "halogen-qwen3.8-flash-next",
+  "chars": 60,
+  "system_chars": 0
+}
+```
+
+Notes:
+* `input_tokens` is the token count **including** the chat-template overhead, not
+  just the raw characters. Short inputs are dominated by template framing
+  (e.g. a 25-character prompt counts as 59 tokens).
+* The model id is taken from the live `/health` snapshot (`state.model_name`),
+  refreshed every poll — Halogen requires a `model` field and rejects the request
+  with HTTP 500 if it is missing.
+* `422` if `text` is blank or missing (Pydantic validation).
+* `502` if Halogen is unreachable or returns an error / unexpected payload.
+
 #### `GET /api/v1/healthz`
 
 Returns `{ "status": "ok" }`. Independent of Halogen reachability.
@@ -261,18 +330,24 @@ Returns `{ "status": "ok" }`. Independent of Halogen reachability.
 
 ### 4.1 `HalogenClient` (`services/halogen_client.py`)
 
-Async `httpx` client for the three Halogen endpoints.
+Async `httpx` client for the Halogen endpoints.
 
 * `get_health()` → `GET /health` (required; raises on failure).
 * `get_metrics()` → `GET /metrics`, parsed by `parse_prometheus()` into
   `{metric_name: float}` (comment lines and unparsable lines skipped).
 * `get_models()` → `GET /v1/models`.
-* `snapshot()` fetches all three concurrently (`asyncio.gather`); `/metrics`
-  and `/v1/models` are best-effort (a failure yields `{}`), `/health` is
-  required.
+* `get_cache()` → `GET /cache` — Halogen-specific prompt-cache counters
+  (hits/misses, stores/evictions, `prompt_tokens_saved`, store/restore latency,
+  pool usage, disk-tier state).
+* `count_tokens(messages, model, system=None, tools=None)` →
+  `POST /v1/messages/count_tokens` — returns `{ "input_tokens": <int> }`.
+  The `model` field is required by Halogen; omitting it yields HTTP 500.
+* `snapshot()` fetches `/health`, `/metrics`, `/v1/models` and `/cache`
+  concurrently (`asyncio.gather`); `/metrics`, `/v1/models` and `/cache` are
+  best-effort (a failure yields `{}`), `/health` is required.
 
-`build_halogen_state(health, metrics, models)` maps the raw Prometheus metrics to
-the `halogen` section:
+`build_halogen_state(health, metrics, models, cache)` maps the raw Halogen
+payloads to the `halogen` section:
 
 | Output field | Source |
 | --- | --- |
@@ -286,6 +361,7 @@ the `halogen` section:
 | `tokens_predicted_total` | `llamacpp:tokens_predicted_total` |
 | `prompt_tokens_cached_total` | `halogen:prompt_tokens_cached_total` |
 | `draft_acceptance_rate` | `halogen:draft_tokens_accepted_total / halogen:draft_tokens_total` (rounded 4dp) |
+| `cache` | `GET /cache` payload passed through verbatim (empty `{}` if unavailable) |
 
 ### 4.2 `SystemMonitor` (`services/system_monitor.py`)
 
@@ -354,21 +430,23 @@ reporting yet", not a real zero.
 **`StatsTracker`** — accumulates session-wide stats.
 
 * Tracked keys: `prompt_tps`, `decode_tps`, `gtt_used_gb`, `gtt_pct`,
-  `vram_pct`, `gpu_util_pct`, `cpu_pct`, `draft_acceptance`.
+  `vram_pct`, `gpu_util_pct`, `cpu_pct`, `draft_acceptance`,
+  `cache_hit_rate`, `cache_token_hit_rate`.
 * **`IGNORE_ZERO_KEYS = ("prompt_tps", "decode_tps", "gpu_util_pct", "cpu_pct", "draft_acceptance")`**
   — these discard zero readings from **both the average and the minimum** (a 0
   means the engine/metric wasn't reporting activity). The memory series
-  (`gtt_used_gb`, `gtt_pct`, `vram_pct`) keep their true minimum including any
-  zeros.
-* `draft_acceptance` is recorded as a **percentage** (the raw
-  `draft_acceptance_rate` ratio × 100), so its min/avg/max are in %.
+  (`gtt_used_gb`, `gtt_pct`, `vram_pct`) and the cache hit-rate series keep
+  their true minimum including any zeros.
+* `draft_acceptance`, `cache_hit_rate` and `cache_token_hit_rate` are recorded
+  as **percentages** (the raw ratio × 100), so their min/avg/max are in %.
 * `record(sample)` adds one sample; `snapshot()` returns
   `{key: {min, max, avg, count}, started_at, samples}`; `reset()` zeroes
   everything and restarts `started_at`.
 
 **`RuntimeState`** — `poll_interval`, `latest`, `wake` (asyncio.Event),
 `halogen` (HalogenClient), `monitor` (SystemMonitor), `rocm` (RocmMonitor),
-`stats` (StatsTracker).
+`stats` (StatsTracker), `model_name` (served model id, refreshed from `/health`
+on every poll and used by `/api/v1/count-tokens`).
 
 **`build_live_snapshot(state)`** — polls Halogen and rocm **concurrently**
 (`asyncio.gather(..., return_exceptions=True)`), reads local hardware, attaches
@@ -418,11 +496,25 @@ Layout, top to bottom:
 cached prompt tokens, CPU % + thread count.
 
 **C. Session Statistics** (`StatsSummary`) — a min / avg / max table over the
-seven tracked series, with a **"Reset statistics"** button (calls
-`POST /api/v1/stats/reset`, then refetches). Shows "since {started_at} · N
-samples".
+ten tracked series (prompt/decode t/s, GTT GB/%, VRAM %, GPU util %, CPU %,
+draft acceptance %, cache hit rate %, cache token hit rate %), with a
+**"Reset statistics"** button (calls `POST /api/v1/stats/reset`, then
+refetches). Shows "since {started_at} · N samples".
 
-**D. Dynamic charts (2-up grid).** Each chart card has an **info button**
+**D. Prompt Cache + Token Counter (2-up grid).**
+
+* **Prompt Cache card** (`CacheStatsCard`) — Halogen prompt-cache telemetry from
+  `GET /cache` (surfaced as `halogen.cache`): request hit rate, token hit rate,
+  prompt tokens saved, cache entries (live/max), hits, misses, stores, evicted,
+  pool usage, cumulative store/restore latency, and refused stores. Header shows
+  whether the disk cache tier is on. Has an info modal explaining each measure.
+  Renders `—` for any field missing (e.g. when `/cache` is unavailable).
+* **Token Counter** (`TokenCounter`) — a textarea + **"Count tokens"** button
+  (⌘/Ctrl+Enter also submits) that calls `POST /api/v1/count-tokens` and shows
+  the resulting input tokens, character count, and chars/token ratio. Shows an
+  inline error on failure.
+
+**E. Dynamic charts (2-up grid).** Each chart card has an **info button**
 (top-right `ⓘ`) opening a modal that explains the measures in that chart.
 
 * **Chart A — Token Throughput** (line): Prompt t/s (blue) vs Decode t/s
@@ -479,6 +571,7 @@ backend/
       tuning.py             GET /tuning-check, GET /system-info
       config_routes.py      GET/POST /config
       stats_routes.py       POST /stats/reset
+      tokens.py             POST /count-tokens (Halogen count_tokens proxy)
     services/
       halogen_client.py     async Halogen HTTP client + Prometheus parser
       system_monitor.py     sysfs/procfs telemetry (GTT/VRAM/RAM/CPU)
@@ -488,7 +581,7 @@ backend/
 frontend/
   src/
     App.jsx                 tabs, theme, polling, 120-sample history buffer
-    api.js                  fetch helpers (fetchLiveStatus, postConfig, resetStats)
+    api.js                  fetch helpers (fetchLiveStatus, postConfig, resetStats, countTokens)
     theme.js                chart + status color tokens (light/dark)
     format.js               number/percent/time formatters
     components/
@@ -496,8 +589,10 @@ frontend/
       StatTile.jsx          KPI card with info button
       Meter.jsx             progress bar
       StatusBadge.jsx       PASS/WARN/FAIL badge
-      LiveTab.jsx           Tab 1 (KPI cards, stats, charts)
+      LiveTab.jsx           Tab 1 (KPI cards, stats, cache + token counter, charts)
       StatsSummary.jsx      min/avg/max table + reset button
+      CacheStatsCard.jsx    Halogen prompt-cache telemetry card (GET /cache)
+      TokenCounter.jsx      on-demand prompt token counter (POST /count-tokens)
       TuningTab.jsx         Tab 2 (banner + audit table)
     charts/
       ChartCard.jsx         chart wrapper with info button

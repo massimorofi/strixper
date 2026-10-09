@@ -1,9 +1,10 @@
 """Async client for the Halogen LLM server.
 
-Talks to three endpoints:
-  GET /health     -- liveness, model, slots, queue, capabilities
-  GET /metrics    -- Prometheus-style counters and gauges
-  GET /v1/models  -- served model metadata
+Talks to four endpoints:
+  GET  /health                   -- liveness, model, slots, queue, capabilities
+  GET  /metrics                  -- Prometheus-style counters and gauges
+  GET  /cache                    -- prompt-cache counters (Halogen-specific)
+  POST /v1/messages/count_tokens -- input token counting (Anthropic-compatible)
 """
 
 from __future__ import annotations
@@ -38,8 +39,9 @@ def build_halogen_state(
     health: dict[str, Any],
     metrics: dict[str, float],
     models: dict[str, Any],
+    cache: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
-    """Merge the three Halogen payloads into the `halogen` section of live-status."""
+    """Merge the Halogen payloads into the `halogen` section of live-status."""
     draft_total = metrics.get("halogen:draft_tokens_total")
     draft_accepted = metrics.get("halogen:draft_tokens_accepted_total")
     acceptance: Optional[float] = None
@@ -68,6 +70,7 @@ def build_halogen_state(
         "tokens_predicted_total": metrics.get("llamacpp:tokens_predicted_total"),
         "prompt_tokens_cached_total": metrics.get("halogen:prompt_tokens_cached_total"),
         "draft_acceptance_rate": acceptance,
+        "cache": cache or {},
     }
 
 
@@ -96,16 +99,46 @@ class HalogenClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def snapshot(self) -> dict[str, Any]:
-        """Fetch all three endpoints concurrently and merge them.
+    async def get_cache(self) -> dict[str, Any]:
+        """Prompt-cache counters (Halogen-specific observability endpoint)."""
+        resp = await self._client.get(f"{self.base_url}/cache")
+        resp.raise_for_status()
+        return resp.json()
 
-        /health is required (raises on failure); /metrics and /v1/models are
-        best-effort so a partial outage still yields usable numbers.
+    async def count_tokens(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        system: Optional[str] = None,
+        tools: Optional[list[dict[str, Any]]] = None,
+    ) -> dict[str, Any]:
+        """Count input tokens for a message list without generating.
+
+        Uses the Anthropic-compatible /v1/messages/count_tokens endpoint.
+        Returns {"input_tokens": <int>}.
         """
-        health, metrics, models = await asyncio.gather(
+        payload: dict[str, Any] = {"model": model, "messages": messages}
+        if system:
+            payload["system"] = system
+        if tools:
+            payload["tools"] = tools
+        resp = await self._client.post(
+            f"{self.base_url}/v1/messages/count_tokens", json=payload
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def snapshot(self) -> dict[str, Any]:
+        """Fetch all endpoints concurrently and merge them.
+
+        /health is required (raises on failure); /metrics, /v1/models and /cache
+        are best-effort so a partial outage still yields usable numbers.
+        """
+        health, metrics, models, cache = await asyncio.gather(
             self.get_health(),
             self.get_metrics(),
             self.get_models(),
+            self.get_cache(),
             return_exceptions=True,
         )
         if isinstance(health, BaseException):
@@ -114,4 +147,6 @@ class HalogenClient:
             metrics = {}
         if isinstance(models, BaseException):
             models = {}
-        return build_halogen_state(health, metrics, models)
+        if isinstance(cache, BaseException):
+            cache = {}
+        return build_halogen_state(health, metrics, models, cache)

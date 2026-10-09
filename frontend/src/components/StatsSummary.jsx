@@ -12,6 +12,8 @@ const ROWS = [
   { label: 'GPU utilization', key: 'gpu_util_pct', unit: '%', digits: 1 },
   { label: 'CPU utilization', key: 'cpu_pct', unit: '%', digits: 1 },
   { label: 'Draft acceptance', key: 'draft_acceptance', unit: '%', digits: 1 },
+  { label: 'Cache hit rate', key: 'cache_hit_rate', unit: '%', digits: 1 },
+  { label: 'Cache token hit rate', key: 'cache_token_hit_rate', unit: '%', digits: 1 },
 ]
 
 function fmtSince(iso) {

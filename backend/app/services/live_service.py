@@ -64,6 +64,8 @@ class StatsTracker:
         "gpu_util_pct",
         "cpu_pct",
         "draft_acceptance",
+        "cache_hit_rate",
+        "cache_token_hit_rate",
     )
 
     # Throughput, utilization and acceptance-rate metrics: a 0 reading means
@@ -118,6 +120,9 @@ class RuntimeState:
         self.monitor: SystemMonitor = SystemMonitor()
         self.rocm: RocmMonitor = RocmMonitor()
         self.stats: StatsTracker = StatsTracker()
+        # Served model id, refreshed from /health on every poll. Used by
+        # /api/v1/count-tokens (the model field is required by Halogen).
+        self.model_name: str = "halogen-qwen3.8-flash-next"
 
 
 def utc_now_iso() -> str:
@@ -139,6 +144,10 @@ async def build_live_snapshot(state: RuntimeState) -> dict[str, Any]:
     else:
         halogen_data = halogen_result
         connected = True
+        # Keep the served model id current for the count-tokens proxy.
+        served_model = halogen_data.get("model")
+        if served_model:
+            state.model_name = served_model
 
     if isinstance(rocm_result, BaseException):
         rocm_data = {"available": False, "error": str(rocm_result)}
@@ -150,6 +159,7 @@ async def build_live_snapshot(state: RuntimeState) -> dict[str, Any]:
 
     # Accumulate session-wide statistics (since startup / last reset).
     draft_rate = halogen_data.get("draft_acceptance_rate")
+    cache = halogen_data.get("cache") or {}
     state.stats.record(
         {
             "prompt_tps": halogen_data.get("prompt_tokens_per_sec"),
@@ -161,6 +171,16 @@ async def build_live_snapshot(state: RuntimeState) -> dict[str, Any]:
             "cpu_pct": hardware.get("cpu", {}).get("usage_pct"),
             # Store as a percentage (0-100) to match the other % series.
             "draft_acceptance": (draft_rate * 100) if draft_rate is not None else None,
+            "cache_hit_rate": (
+                cache.get("hit_rate") * 100
+                if cache.get("hit_rate") is not None
+                else None
+            ),
+            "cache_token_hit_rate": (
+                cache.get("token_hit_rate") * 100
+                if cache.get("token_hit_rate") is not None
+                else None
+            ),
         }
     )
 

@@ -5,6 +5,8 @@ import { fmtInt, fmtNum, fmtPct } from '../format.js'
 import StatTile from './StatTile.jsx'
 import Meter from './Meter.jsx'
 import StatsSummary from './StatsSummary.jsx'
+import CacheStatsCard from './CacheStatsCard.jsx'
+import TokenCounter from './TokenCounter.jsx'
 import InfoModal from '../charts/InfoModal.jsx'
 import ThroughputChart from '../charts/ThroughputChart.jsx'
 import KvPoolChart from '../charts/KvPoolChart.jsx'
@@ -191,6 +193,12 @@ export default function LiveTab({ data, history, theme, onResetStats }) {
 
       {/* Session statistics (min / avg / max since startup) */}
       <StatsSummary stats={data?.stats} onReset={onResetStats} />
+
+      {/* Prompt cache telemetry + on-demand token counter */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <CacheStatsCard cache={halogen.cache} />
+        <TokenCounter model={halogen.model} />
+      </div>
 
       {/* Dynamic charts */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
