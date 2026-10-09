@@ -29,3 +29,6 @@ build/
 
 # Logs
 *.log
+
+# LLM-Runner local config store
+backend/data/

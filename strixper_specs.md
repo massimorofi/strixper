@@ -25,11 +25,12 @@ this document reflects the **shipped app**.
 |   |  - 4 time-series charts (info btn) | |    (PASS / WARN / FAIL)             |    |
 |   +------------------------------------+ +------------------------------------+    |
 |   +------------------------------------+                                           |
-|   |    Tab 3: AI-Chat                   |                                           |
-|   |  - Streaming chat (4 API styles)    |                                           |
-|   |  - Collapsible chain-of-thought     |                                           |
-|   |  - Per-turn token / speed stats     |                                           |
-|   +------------------------------------+                                           |
+|   |    Tab 3: AI-Chat                   |  +------------------------------------+   |
+|   |  - Streaming chat (4 API styles)    |  |   Tab 4: LLM-Runner               |   |
+|   |  - Collapsible chain-of-thought     |  |  - Create/edit docker run configs   |   |
+|   |  - Per-turn token / speed stats     |  |  - Run container, live output       |   |
+|   +------------------------------------+  |  - Store configs locally (JSON)     |   |
+|                                           +------------------------------------+   |
 +------------------------------------------^----------------------------------------+
 | REST API (JSON over HTTP) + SSE (text/event-stream for chat)
 +------------------------------------------v----------------------------------------+
@@ -79,6 +80,12 @@ v                                               v
    raw Text Completions) from the UI to compare them, toggle the model's
    thinking on/off, and cap the response length. See §3.3 (`POST /api/v1/chat`)
    and §5.4 (Tab 3).
+8. **LLM-Runner** — a tab to create, run and locally store the docker command
+   used to launch a containerized LLM inference server. Configurations are kept
+   in a JSON file on disk, listed for selection, editable, and each can be
+   started with a button that streams the container's live output; a running
+   container can be stopped on demand. See §3.3 (runner endpoints), §4.6
+   (`RunnerStore`) and §5.5 (Tab 4).
 
 ---
 
@@ -125,6 +132,13 @@ All endpoints are mounted under the `/api/v1` prefix.
 | `/api/v1/stats/reset` | `POST` | On-demand (button) | Zero the session statistics and restart the clock |
 | `/api/v1/count-tokens` | `POST` | On-demand (widget) | Count the input tokens of a prompt (proxies Halogen) |
 | `/api/v1/chat` | `POST` | On-demand (AI-Chat tab) | Streaming chat completion (proxies Halogen, 4 API styles) |
+| `/api/v1/runner/configs` | `GET` | On-demand (LLM-Runner tab) | List stored docker run configurations |
+| `/api/v1/runner/configs/{id}` | `GET` | On-demand | Fetch one stored configuration |
+| `/api/v1/runner/configs` | `POST` | On-demand (LLM-Runner tab) | Create a new run configuration |
+| `/api/v1/runner/configs/{id}` | `PUT` | On-demand (LLM-Runner tab) | Edit an existing configuration |
+| `/api/v1/runner/configs/{id}` | `DELETE` | On-demand (LLM-Runner tab) | Delete a configuration |
+| `/api/v1/runner/configs/{id}/run` | `POST` | On-demand (LLM-Runner tab) | Start the configured docker command (SSE stream) |
+| `/api/v1/runner/runs/{run_id}/stop` | `POST` | On-demand (LLM-Runner tab) | Stop a running docker command |
 | `/api/v1/healthz` | `GET` | On-demand | Backend's own liveness (independent of Halogen) |
 
 Interactive API docs are served at `http://<host>:8000/docs`.
@@ -430,6 +444,66 @@ Errors: `422` on invalid body (Pydantic). `502` if Halogen is unreachable or
 returns an error (for `stream: false`; for `stream: true` the failure surfaces as
 an `error` SSE event instead).
 
+#### LLM-Runner endpoints
+
+The LLM-Runner tab lets the user **create, run and store** the docker command
+used to launch a containerized LLM inference server. Configurations are stored
+locally as a JSON list on the backend disk (see §4.6), so they survive restarts.
+
+**Configuration object** (all six fields always present):
+
+```json
+{
+  "id": "a9be92b171ae",
+  "name": "Qwen3 local inference",
+  "docker_command": "docker run --rm --device /dev/kfd ... my-llm-image",
+  "description": "optional free-text note",
+  "created_at": "2026-10-09T18:37:58Z",
+  "updated_at": "2026-10-09T18:37:58Z"
+}
+```
+
+`GET /api/v1/runner/configs` → `{ "configs": [ <configuration>, … ] }`.
+
+`GET /api/v1/runner/configs/{id}` → the single configuration, or `404`.
+
+`POST /api/v1/runner/configs` — body `{ name, docker_command, description? }`.
+`name` (1–120 chars) and `docker_command` (1–10,000 chars) are required and
+non-blank; `description` is optional (≤ 1,000 chars). Names are unique
+(case-insensitive). Returns the created configuration. `400` on a blank field
+or a duplicate name.
+
+`PUT /api/v1/runner/configs/{id}` — body accepts any subset of
+`{ name, docker_command, description }`; omitted fields are left unchanged.
+Returns the updated configuration. `400` on validation / duplicate name,
+`404` if the id is unknown.
+
+`DELETE /api/v1/runner/configs/{id}` → `{ "deleted": "<id>" }`, or `404`.
+
+**`POST /api/v1/runner/configs/{id}/run`** — launches the stored
+`docker_command` as a shell subprocess and streams its merged stdout/stderr
+back as `text/event-stream` (same SSE framing as `/api/v1/chat`):
+
+| Event | Data | Meaning |
+| --- | --- | --- |
+| `started` | `{"run_id": "…", "command": "…"}` | Process launched |
+| `stdout` | `{"text": "…"}` | An output chunk (stdout + stderr merged) |
+| `exit` | `{"exit_code": 0}` | Process terminated |
+| `error` | `{"message": "…"}` | Failed to start / stream failure |
+
+The subprocess is launched attached to a **pseudo-terminal (PTY)** so the
+command sees a real TTY. This is required for TTY-allocating docker flags
+(`-t` / `-it`); without a PTY Docker aborts with *"cannot attach stdin to a
+TTY-enabled container because stdin is not a terminal"*. The PTY emits CRLF,
+which the backend normalises to LF before streaming. The run is assigned a
+`run_id` (sent in the `started` event). The process is terminated
+automatically when the client disconnects. `404` if the config is unknown;
+`502` if the command cannot be launched.
+
+**`POST /api/v1/runner/runs/{run_id}/stop`** — sends `SIGTERM` to the running
+process (escalating to `SIGKILL` after a 5 s grace period). Returns
+`{ "stopped": "<run_id>" }`, or `404` if the run is not active.
+
 #### `GET /api/v1/healthz`
 
 Returns `{ "status": "ok" }`. Independent of Halogen reachability.
@@ -578,6 +652,25 @@ snapshot (§3.3).
 manager that starts the loop on startup and cancels it + closes the Halogen client
 on shutdown.
 
+### 4.6 `RunnerStore` (`services/runner_store.py`)
+
+Persists the LLM-Runner docker configurations to a JSON file on disk.
+
+* **Storage path:** `backend/data/llm_runner_configs.json` by default; override
+  with the `RUNNER_STORE_PATH` environment variable (used by tests / alt layouts).
+* **Atomic writes:** each mutation writes a temp file then `os.replace`s it over
+  the target, so a crash mid-write cannot corrupt the store. A missing or corrupt
+  file is treated as an empty list and rewritten on the next successful mutation.
+* **Concurrency:** all mutations take an `asyncio.Lock`.
+* **Validation:** `name` (1–120) and `docker_command` (1–10,000) required and
+  non-blank; `description` optional (≤ 1,000). Names are unique case-insensitive
+  (`RunnerStoreError` on a duplicate). Each config gets a 12-hex-char `id` and
+  `created_at` / `updated_at` timestamps.
+* `list()`, `get(id)`, `create(...)`, `update(id, ...)`, `delete(id)`.
+
+The router (`routers/runner.py`) holds one lazily-created store instance and a
+dict of active runs (`run_id -> subprocess handle`) so runs can be stopped by id.
+
 ---
 
 ## 5. Frontend Dashboard Specification
@@ -593,8 +686,9 @@ on shutdown.
 * Manual refresh button.
 * Theme toggle (dark default; persisted to `localStorage` under
   `strixper-theme`).
-* Tab switcher (Live / Tuning / AI-Chat); `#tuning` opens Tab 2 and `#chat`
-  opens Tab 3.
+* Tab switcher (Live Server Metrics / Strix Halo Fine-Tuning / AI-Chat /
+  LLM-Runner). The URL hash selects the initial tab (`#live`, `#tuning`, `#chat`
+  or `#runner`); any other value falls back to `live`.
 
 ### 5.2 Tab 1: Live Server Metrics
 
@@ -709,7 +803,52 @@ so it survives a page reload; restored messages are forced to
 hidden element has no layout, the auto-scroll-to-bottom effect also runs when
 the tab becomes active again, not only when messages change.
 
-### 5.5 Theme & Color
+### 5.5 Tab 4: LLM-Runner
+
+A docker run manager (`components/RunnerTab.jsx`) backed by the
+`/api/v1/runner/*` endpoints (§3.3). Three functions: **create**, **run** and
+**store** the docker command that launches a containerized LLM inference
+server. A responsive grid — on `lg`+ screens the config list takes one of three
+columns and the form/console take the other two; below `lg` everything stacks to
+a single column:
+
+* **Left — Saved configurations.** A heading with a **New** button (opens a
+  blank form). Below it, a list of stored configs, each showing its name, its
+  description (if any) and the docker command (truncated, full command in the
+  `title` tooltip). Per-config actions: **Run** (▶, primary), **Edit** (pencil)
+  and **Delete** (trash, right-aligned). While a config is running it shows a
+  pulsing `RUNNING` badge and its **Run** and **Delete** buttons are disabled
+  (Edit stays available). The empty state shows a terminal icon with a short
+  prompt to create a configuration.
+* **Right — Form + Run console.**
+  * **Form** (`ConfigForm`): `Name` (≤ 120), `Docker command` (monospace
+    textarea, `spellCheck={false}`) and optional `Description` (≤ 1000). Create
+    mode posts a new config; editing an existing one (via the Edit button)
+    pre-fills the form and PUTs the changes. Submit is disabled until both name
+    and command are non-blank. An inline error banner shows validation failures
+    (e.g. a duplicate name). Editing shows a Cancel control (header `X` and a
+    footer button) that reverts to a blank form.
+  * **Run console:** a fixed-height (~420 px) scrolling monospace pane. Pressing
+    **Run** starts the configured command and streams its live output in,
+    appending chunks as they arrive with a blinking caret at the end while
+    running. The header shows the run status (`Idle` / `Running` (spinner) /
+    `Exited (code)` — green on 0, red otherwise) and a **Stop** button while
+    running. The footer shows the finish time and exit code after completion.
+    Runtime/stream errors render as an inline red banner inside the console.
+
+Like the chat tab, the runner is **kept mounted** (hidden with a CSS `hidden`
+class) when another tab is selected, so switching tabs never interrupts a
+running container's output stream. The console auto-scrolls to the bottom on new
+output and when the tab is re-shown.
+
+**Client-side streaming.** `streamRunnerRun()` in `api.js` uses `fetch` with a
+`ReadableStream` reader (an `EventSource` cannot POST) and parses the SSE frames,
+dispatching `onStarted` / `onStdout` / `onExit` / `onError` callbacks. **Stop**
+aborts the in-flight `AbortController` *and* calls
+`POST /api/v1/runner/runs/{run_id}/stop`; the `run_id` is captured from the
+`started` event.
+
+### 5.6 Theme & Color
 
 Chart colors are hex (not CSS vars) because Recharts writes SVG presentation
 attributes. Both modes were validated with the dataviz palette validator
@@ -724,7 +863,7 @@ attributes. Both modes were validated with the dataviz palette validator
 
 Status colors: `PASS #0ca30c`, `WARN #fab219`, `FAIL #d03b3b`.
 
-### 5.6 Formatting helpers (`format.js`)
+### 5.7 Formatting helpers (`format.js`)
 
 `fmtInt` (thousands separators), `fmtNum(v, digits)`, `fmtPct(v, digits)`,
 `fmtTime(iso)` (en-GB time). Null values render as `—`.
@@ -745,16 +884,20 @@ backend/
       stats_routes.py       POST /stats/reset
       tokens.py             POST /count-tokens (Halogen count_tokens proxy)
       chat.py               POST /chat (streaming chat proxy, 4 API styles)
+      runner.py             LLM-Runner: config CRUD + run (SSE) + stop
     services/
       halogen_client.py     async Halogen HTTP client + Prometheus parser
       system_monitor.py     sysfs/procfs telemetry (GTT/VRAM/RAM/CPU)
       rocm_monitor.py       GPU util + VRAM via `rocm-smi`
       tuning_checker.py     8-check compliance audit + system info
       live_service.py       MetricStats / StatsTracker / RuntimeState / poll loop
+      runner_store.py       JSON-persisted store for LLM-Runner docker configs
+    data/
+      llm_runner_configs.json   runtime store (gitignored)
 frontend/
   src/
     App.jsx                 tabs, theme, polling, 120-sample history buffer
-    api.js                  fetch helpers (fetchLiveStatus, postConfig, resetStats, countTokens, streamChat, createThinkSplitter)
+    api.js                  fetch helpers (fetchLiveStatus, postConfig, resetStats, countTokens, streamChat, createThinkSplitter, and the runner client: fetchRunnerConfigs, createRunnerConfig, updateRunnerConfig, deleteRunnerConfig, streamRunnerRun, stopRunnerRun, sendJSON)
     theme.js                chart + status color tokens (light/dark)
     format.js               number/percent/time formatters
     components/
@@ -768,6 +911,7 @@ frontend/
       TokenCounter.jsx      on-demand prompt token counter (POST /count-tokens)
       TuningTab.jsx         Tab 2 (banner + audit table)
       AIChatTab.jsx         Tab 3 (streaming chat, reasoning, API style switch)
+      RunnerTab.jsx         Tab 4 (create/run/store docker run configs)
     charts/
       ChartCard.jsx         chart wrapper with info button
       InfoModal.jsx         portal modal (backdrop / X / Escape to close)
@@ -823,7 +967,7 @@ several design decisions:
    `poll_loop`, `managed_poller`.
 6. **TuningChecker** — the 8 checks + `run_all_checks` + `get_system_info`.
 7. **Routers** — `live`, `tuning`, `config_routes`, `stats_routes`, `tokens`,
-   `chat`, `healthz`.
+    `chat`, `runner`, `healthz`.
 8. **Frontend scaffold** — Vite + React + Tailwind + TanStack Query + Recharts +
    lucide-react; theme tokens; formatters; `api.js`.
 9. **Tab 1** — 4 KPI cards (each with info modal), secondary counters,
@@ -833,7 +977,13 @@ several design decisions:
 11. **Tab 3 (AI-Chat)** — `streamChat` SSE client + `createThinkSplitter` in
     `api.js`; `AIChatTab.jsx` with message list, collapsible reasoning, API
     style switch, thinking toggle, max-tokens input, and stop/clear controls.
-12. **Packaging** — `Dockerfile` (multi-stage: build frontend, serve from
+12. **Tab 4 (LLM-Runner)** — `RunnerStore` (JSON-persisted config CRUD) +
+    `runner.py` router (config CRUD, run with SSE output stream, stop);
+    `RunnerTab.jsx` with the config list, create/edit form, and live run
+    console with stop control. Keep the tab mounted so a run survives tab
+    switches.
+13. **Packaging** — `Dockerfile` (multi-stage: build frontend, serve from
     FastAPI), `run.sh` (dev: backend + Vite concurrently), `stop.sh`.
-12. **Verify** — `cd frontend && npm run build`; restart backend; confirm
-    live-status, stats reset, tuning checks, and all info modals render.
+14. **Verify** — `cd frontend && npm run build`; restart backend; confirm
+    live-status, stats reset, tuning checks, all info modals, and the
+    LLM-Runner create/run/stop flow render.

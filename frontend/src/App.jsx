@@ -4,11 +4,12 @@ import TopBar from './components/TopBar.jsx'
 import LiveTab from './components/LiveTab.jsx'
 import TuningTab from './components/TuningTab.jsx'
 import AIChatTab from './components/AIChatTab.jsx'
+import RunnerTab from './components/RunnerTab.jsx'
 import { fetchLiveStatus, postConfig } from './api.js'
 
 const MAX_SAMPLES = 120
 
-const VALID_TABS = ['live', 'tuning', 'chat']
+const VALID_TABS = ['live', 'tuning', 'chat', 'runner']
 
 export default function App() {
   const [tab, setTab] = useState(() => {
@@ -100,6 +101,11 @@ export default function App() {
             discards the conversation, the draft, or an in-flight stream. */}
         <div className={tab === 'chat' ? '' : 'hidden'}>
           <AIChatTab active={tab === 'chat'} />
+        </div>
+        {/* The runner also stays mounted so a running container's stream is
+            not interrupted by switching tabs. */}
+        <div className={tab === 'runner' ? '' : 'hidden'}>
+          <RunnerTab active={tab === 'runner'} />
         </div>
       </main>
     </div>

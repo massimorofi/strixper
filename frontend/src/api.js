@@ -48,6 +48,123 @@ export async function resetStats() {
   return res.json()
 }
 
+// -- LLM-Runner: docker run configurations -----------------------------------
+
+export const fetchRunnerConfigs = () => getJSON('/runner/configs')
+export const fetchRunnerConfig = (id) => getJSON(`/runner/configs/${id}`)
+
+async function sendJSON(method, path, body) {
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    let detail = `HTTP ${res.status} on ${method} ${path}`
+    try {
+      const j = await res.json()
+      if (j?.detail) detail = j.detail
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(detail)
+  }
+  return res.json()
+}
+
+export const createRunnerConfig = (cfg) => sendJSON('POST', '/runner/configs', cfg)
+export const updateRunnerConfig = (id, cfg) =>
+  sendJSON('PUT', `/runner/configs/${id}`, cfg)
+export const deleteRunnerConfig = (id) =>
+  fetch(`${BASE}/runner/configs/${id}`, { method: 'DELETE' }).then(async (res) => {
+    if (!res.ok) {
+      let detail = `HTTP ${res.status} on DELETE /runner/configs/${id}`
+      try {
+        const j = await res.json()
+        if (j?.detail) detail = j.detail
+      } catch {
+        /* non-JSON error body */
+      }
+      throw new Error(detail)
+    }
+    return res.json()
+  })
+export const stopRunnerRun = (runId) =>
+  sendJSON('POST', `/runner/runs/${runId}/stop`, {})
+
+// Stream a docker run from the backend. onStdout(textChunk), onStarted(info),
+// onExit({exit_code}), onError(message).
+export async function streamRunnerRun(
+  configId,
+  { onStdout, onStarted, onExit, onError, signal } = {},
+) {
+  let res
+  try {
+    res = await fetch(`${BASE}/runner/configs/${configId}/run`, {
+      method: 'POST',
+      headers: { Accept: 'text/event-stream' },
+      signal,
+    })
+  } catch (err) {
+    onError?.(err?.message || 'Request failed')
+    return
+  }
+
+  if (!res.ok || !res.body) {
+    let detail = `HTTP ${res.status} on POST /runner/configs/${configId}/run`
+    try {
+      const j = await res.json()
+      if (j?.detail) detail = j.detail
+    } catch {
+      /* non-JSON error body */
+    }
+    onError?.(detail)
+    return
+  }
+
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let pending = ''
+
+  const handleFrame = (frame) => {
+    let event = 'message'
+    const dataLines = []
+    for (const raw of frame.split('\n')) {
+      const line = raw.replace(/\r$/, '')
+      if (line.startsWith('event:')) event = line.slice(6).trim()
+      else if (line.startsWith('data:')) dataLines.push(line.slice(5).trim())
+    }
+    if (dataLines.length === 0) return
+    let data
+    try {
+      data = JSON.parse(dataLines.join('\n'))
+    } catch {
+      return
+    }
+    if (event === 'started') onStarted?.(data)
+    else if (event === 'stdout') onStdout?.(data.text || '')
+    else if (event === 'exit') onExit?.(data)
+    else if (event === 'error') onError?.(data.message || 'Stream error')
+  }
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      pending += decoder.decode(value, { stream: true })
+      let idx
+      while ((idx = pending.indexOf('\n\n')) !== -1) {
+        const frame = pending.slice(0, idx)
+        pending = pending.slice(idx + 2)
+        if (frame.trim()) handleFrame(frame)
+      }
+    }
+    if (pending.trim()) handleFrame(pending)
+  } catch (err) {
+    onError?.(err?.message || 'Stream interrupted')
+  }
+}
+
 // Incremental splitter for the raw-text completions style, where the model
 // embeds its chain-of-thought inline between <think> ... </think> markers.
 const THINK_OPEN = '<think>'
