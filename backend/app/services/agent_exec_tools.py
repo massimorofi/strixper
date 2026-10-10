@@ -119,6 +119,25 @@ def _resolve(path: str, workspace: str) -> str:
     return os.path.realpath(candidate)
 
 
+def _unwrap_redirect(href: str) -> str:
+    """Extract the real target from a search-engine redirect link.
+
+    DuckDuckGo uses ``//duckduckgo.com/l/?uddg=<encoded>`` and Bing uses
+    ``<url>&url=<encoded>``; both hide the destination behind an
+    intermediate hop.
+    """
+    from urllib.parse import parse_qs, unquote, urlparse
+
+    if "uddg=" in href:
+        try:
+            q = parse_qs(urlparse(href, scheme="https").query)
+            if q.get("uddg"):
+                return unquote(q["uddg"][0])
+        except Exception:  # noqa: BLE001
+            pass
+    return href
+
+
 def build_exec_tools(state: Any, workspace: str) -> list[FunctionTool]:
     """Build the full-access tools bound to a working directory.
 
@@ -179,10 +198,14 @@ def build_exec_tools(state: Any, workspace: str) -> list[FunctionTool]:
         """
         if engine == "brave":
             url = "https://search.brave.com/search"
-            pattern = (
-                r'<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>'
-            )
+            pattern = r'<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>'
             blocked = ("search.brave", "brave.com", "accounts.google")
+        elif engine == "duckduckgo":
+            url = "https://html.duckduckgo.com/html/"
+            pattern = (
+                r'<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>'
+            )
+            blocked = ("duckduckgo.com/l", "duckduckgo.com/#")
         else:
             url = "https://www.bing.com/search"
             pattern = r'<h2[^>]*>\s*<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>'
@@ -206,9 +229,15 @@ def build_exec_tools(state: Any, workspace: str) -> list[FunctionTool]:
             title = html.unescape(_TAG_RE.sub("", raw)).strip()
             if len(title) < 12:
                 continue
+            href = html.unescape(href)
+            # DuckDuckGo and some Bing links are redirect wrappers; unwrap
+            # the real target so fetch_url gets a usable address.
+            href = _unwrap_redirect(href)
+            if not href.startswith("http"):
+                continue
             if any(b in href for b in blocked):
                 continue
-            out.append({"title": title[:200], "url": html.unescape(href)})
+            out.append({"title": title[:200], "url": href})
         return out
 
     @function_tool
@@ -230,7 +259,7 @@ def build_exec_tools(state: Any, workspace: str) -> list[FunctionTool]:
         # Brave first: it renders real organic results for technical
         # queries. Bing is kept as a fallback in case Brave changes layout
         # or rate-limits us.
-        for engine in ("brave", "bing"):
+        for engine in ("brave", "duckduckgo", "bing"):
             try:
                 page = await _scrape(engine, query)
             except Exception as exc:  # noqa: BLE001

@@ -1298,7 +1298,7 @@ Registered only when the request sets `full_access`, which also forces
 | Tool | What it does | Bounds |
 | --- | --- | --- |
 | `fetch_url(url, as_text=True)` | HTTP(S) GET, follows redirects, returns `{status, final_url, content_type, body}` | 20 s timeout, 400 KB cap, HTML→text by default |
-| `search_web(query, max_results=8)` | Web search via Brave, Bing as fallback; returns `{query, count, results:[{title,url}]}` | 20 s per engine, 1–20 results |
+| `search_web(query, max_results=8)` | Web search via Brave → DuckDuckGo → Bing; returns `{query, count, results:[{title,url}]}` | 20 s per engine, 1–20 results |
 | `run_shell(command, timeout_seconds=120)` | `bash -c` via `asyncio.create_subprocess_exec`, returns `{exit_code, stdout, stderr}` | 120 s default, 900 s max |
 | `run_python(code, timeout_seconds=120)` | Writes `{workspace}/agent_{sha256[:12]}.py`, runs it under `python3` | same timeouts, `stdin=DEVNULL` |
 | `write_file(path, content, append=False)` | Writes/appends in the workspace | — |
@@ -1337,21 +1337,25 @@ volume in `strixper.sh`, so generated scripts and downloads survive a container
 recreate. It is gitignored and `.dockerignore`d.
 
 **`search_web` is fragile by construction.** It scrapes search-engine HTML with
-a regex; there is no API involved. It tries **Brave** first and falls back to
-**Bing**, deduplicating by URL, and reports which engines failed. The ordering is
-empirical, not arbitrary:
+a regex; there is no API involved. It walks **Brave → DuckDuckGo → Bing**,
+deduplicating by URL, and reports which engines failed. Each engine is tried in
+order and the first one to fill the requested count wins, so a rate-limit or a
+broken parser on one engine costs a retry, not the request.
 
-| Engine | Result on this setup |
-| --- | --- |
-| Brave | Relevant organic results; plain external anchors |
-| Bing | Returned generic "Strix" matches (security tools, Wikipedia) regardless of the technical query |
-| DuckDuckGo (`html`, `lite`) | HTTP 202 with a region-selector page, no results |
-| Startpage | "privacy please" interstitial |
-| Searx (`format=json`) | Empty |
+Two practical notes from testing:
 
-Brave's markup is undocumented and can change without notice, which is the whole
-reason for the fallback chain rather than a single parser. `fetch_url` does not
-depend on any of it — give the agent a URL directly and it is fine.
+* **Brave rate-limits.** It returns HTTP 429 under repeated use from the same
+  address. The fallback chain covers this; a single-engine implementation would
+  not have.
+* **Redirect wrappers.** DuckDuckGo returns `//duckduckgo.com/l/?uddg=<encoded>`
+  and Bing wraps its targets similarly. `_unwrap_redirect()` decodes the real
+  destination so the agent can pass the URL straight to `fetch_url`.
+
+Bing was tried first and returned generic "Strix" matches (security tools,
+Wikipedia) regardless of the technical query, which is why it sits last.
+Startpage returns a "privacy please" interstitial and Searx `format=json`
+returns empty. `fetch_url` does not depend on any of it — give the agent a URL
+directly and it is fine.
 
 **TLS is verified by default.** `AGENT_TLS_VERIFY=0` disables it for deployments
 behind a TLS-terminating proxy whose CA is absent from the container trust store.

@@ -420,7 +420,7 @@ telemetry — the agent can browse, search, run code, and write files:
 | Tool | What it does |
 | --- | --- |
 | `fetch_url` | Fetches any HTTP(S) page and returns readable text (or raw body for APIs) |
-| `search_web` | Web search (Brave, Bing fallback), returns result titles and links |
+| `search_web` | Web search (Brave → DuckDuckGo → Bing), returns result titles and links |
 | `run_shell` | Runs a bash command, returns exit code, stdout, stderr |
 | `run_python` | Writes the snippet to the workspace and runs it under `python3` |
 | `write_file` | Writes or appends a file in the workspace |
@@ -451,10 +451,11 @@ TLS verification is on for `fetch_url` and `search_web`. Set
 `AGENT_TLS_VERIFY=0` only if you sit behind a TLS-terminating proxy whose CA
 is not in the container trust store.
 
-`search_web` scrapes Brave Search first and falls back to Bing. Neither is
-an API: both are undocumented HTML, so a redesign can break the parser or
-trigger a CAPTCHA. `fetch_url` does not depend on it — give the agent a URL
-directly and it is fine.
+`search_web` scrapes public search engines — Brave, then DuckDuckGo, then Bing —
+and stops as soon as one fills the requested count. None of them is an API: all
+are undocumented HTML, so a redesign can break a parser, and Brave rate-limits
+(HTTP 429) under heavy use. The chain absorbs that. `fetch_url` does not depend
+on any of it — give the agent a URL directly and it is fine.
 
 ### Endpoints
 
