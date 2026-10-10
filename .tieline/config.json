@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "product": {
+    "name": "Strixper",
+    "repo_name": "strixper"
+  },
+  "repository": {
+    "root": "..",
+    "source_roots": [
+      "backend",
+      "frontend"
+    ],
+    "ignore": [
+      ".git",
+      ".tieline",
+      "backend/.venv",
+      "backend/data",
+      "backend/agent_workspace",
+      "**/.env",
+      "**/.env.*",
+      "**/secrets/**",
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/__pycache__/**",
+      "**/*.pyc",
+      "backend/.pytest_cache",
+      "dist",
+      "build",
+      "coverage",
+      "vendor",
+      ".next",
+      "tmp"
+    ]
+  },
+  "context": {
+    "sources": [
+      {
+        "id": "source-1",
+        "type": "description",
+        "location": null,
+        "content": "A dashboard for monitoring and supervising local LLM inference on AMD Strix Halo systems.",
+        "allow_external_fetch": false
+      }
+    ]
+  },
+  "runtime": {
+    "default_embedding_provider": "local",
+    "default_database_mode": "offline"
+  },
+  "files": {
+    "spec_directory": "spec",
+    "manifest": "manifest"
+  },
+  "created_at": "2026-10-10T20:08:43.600Z",
+  "updated_at": "2026-10-10T20:08:43.600Z"
+}

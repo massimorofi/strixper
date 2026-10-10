@@ -124,6 +124,40 @@ export const fetchRunnerRuns = () => getJSON('/runner/runs').then((j) => j?.runs
 export const fetchRunnerLiveStatus = (runId) =>
   getJSON(`/runner/runs/${runId}/live-status`)
 
+// -- Agent skills and MCP extensions --------------------------------------
+
+export const fetchAgentSkills = () => getJSON('/agent/skills')
+
+async function sendMCPJSON(method, path, token, body) {
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      'X-MCP-Admin-Token': token,
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  })
+  if (!res.ok) {
+    throw new Error(await readError(res, `HTTP ${res.status} on ${method} ${path}`))
+  }
+  return res.status === 204 ? null : res.json()
+}
+
+export const fetchMCPServers = (token) =>
+  sendMCPJSON('GET', '/agent/mcp-servers', token)
+export const saveMCPServer = (token, server, exists) =>
+  sendMCPJSON(
+    exists ? 'PUT' : 'POST',
+    exists ? `/agent/mcp-servers/${encodeURIComponent(server.id)}` : '/agent/mcp-servers',
+    token,
+    server,
+  )
+export const deleteMCPServer = (token, id) =>
+  sendMCPJSON('DELETE', `/agent/mcp-servers/${encodeURIComponent(id)}`, token)
+export const testMCPServer = (token, server) =>
+  sendMCPJSON('POST', '/agent/mcp-servers/test', token, server)
+
 // Render a command template against its parameters without running it.
 // Returns { command }; throws with the backend's message on a bad template.
 export const previewRunnerCommand = (docker_command, parameters = []) =>

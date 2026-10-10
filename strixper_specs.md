@@ -122,6 +122,8 @@ v                                               v
 * **Config:** `python-dotenv` (`.env` file).
 * **Agentic chat:** `openai-agents` (OpenAI Agents SDK, Python), driven through
   Halogen's OpenAI-compatible endpoint — no OpenAI account required.
+* **Agent extensions:** `PyYAML` for safe Agent Skill manifest parsing and the
+  `mcp` Python SDK for MCP stdio clients.
 * **Frontend:** React 18 + **Vite**.
 * **Styling:** **Tailwind CSS** (utility classes, CSS custom-property theming).
 * **Data fetching:** **TanStack Query** (`@tanstack/react-query`) with `refetchInterval`.
@@ -158,6 +160,11 @@ Read from environment variables / a `.env` file (`backend/app/config.py`):
 | `AGENT_INSTRUCTIONS` | built-in | Optional replacement for the agent system prompt (see §3.3) |
 | `AGENT_WORKSPACE` | `backend/agent_workspace` | Full-access working directory (see §4.12) |
 | `AGENT_TLS_VERIFY` | `1` | TLS verification for `fetch_url` / `search_web` (see §4.12) |
+| `SKILLS_DIR` | `<repository>/skills` (Docker: `/app/skills`) | Read-only root containing drop-in Agent Skill folders |
+| `STRIXPER_DATA_DIR` | `backend/data` | Persistent runtime data root; MCP config is stored here |
+| `MCP_SERVERS_DIR` | `<repository>/mcp-servers` (Docker: `/mcp-servers`) | Per-server MCP package root; server-ID subdirectories and shared `bin/` are added to child process `PATH` |
+| `MCP_ADMIN_TOKEN` | unset (management disabled) | Required high-entropy token for MCP management endpoints; supplied as `X-MCP-Admin-Token` |
+| `MCP_CALL_TIMEOUT_SECONDS` | `30` | MCP tool-call timeout |
 
 `HALOGEN_HOST` is easy to over-read: it is where the dashboard starts
 looking, not where it keeps looking. As soon as an engine is started through
@@ -184,6 +191,11 @@ All endpoints are mounted under the `/api/v1` prefix.
 | `/api/v1/chat` | `POST` | On-demand (AI-Chat tab) | Streaming chat completion (proxies Halogen, 4 API styles) |
 | `/api/v1/agent/chat` | `POST` | On-demand (AI-Chat tab, Agent mode) | Agentic tool-driven chat (SSE) |
 | `/api/v1/agent/tools` | `GET` | On-demand | Tool inventory for the current permission set |
+| `/api/v1/agent/skills` | `GET` | AI-Chat Extensions / agent request | Rescan installed skills and return valid skills plus manifest errors |
+| `/api/v1/agent/mcp-servers` | `GET` | AI-Chat Extensions | Protected MCP config/runtime status (requires `X-MCP-Admin-Token`) |
+| `/api/v1/agent/mcp-servers` | `POST` | AI-Chat Extensions | Protected create; enabling launches the configured stdio command |
+| `/api/v1/agent/mcp-servers/{id}` | `PUT` / `DELETE` | AI-Chat Extensions | Protected update/delete; closes the previous process/session |
+| `/api/v1/agent/mcp-servers/test` | `POST` | AI-Chat Extensions | Protected temporary connection/tool-list test; always closes the session |
 | `/api/v1/runner/configs` | `GET` | On-demand (LLM-Runner tab) | List stored docker run configurations |
 | `/api/v1/runner/configs/{id}` | `GET` | On-demand | Fetch one stored configuration |
 | `/api/v1/runner/configs` | `POST` | On-demand (LLM-Runner tab) | Create a new run configuration |
@@ -612,7 +624,58 @@ Useful for confirming which tools an agent turn will actually see. `start_engine
 and `stop_engine` appear only with `?allow_actions=true`. With
 `?full_access=true` the seven research/execution tools of §4.12 join them, and the
 response also carries `full_access` and a `tier` label
-(`read-only` / `actions` / `full`).
+(`read-only` / `actions` / `full`). The bounded skill tools are also listed.
+MCP tools appear only when their server is enabled, connected, and its configured
+minimum access level is met by the current request.
+
+#### Agent extension APIs
+
+`GET /api/v1/agent/skills` rescans `SKILLS_DIR` and returns each valid skill's
+name/description plus manifest or validation errors. Skill directories contain a
+standard `SKILL.md`; they are not imported as Python. The agent receives only
+the skill index initially and loads full instructions or bounded, path-confined
+resources on demand with `list_skills`, `load_skill`, and
+`read_skill_resource`.
+
+MCP management (`GET/POST /api/v1/agent/mcp-servers`,
+`PUT/DELETE /api/v1/agent/mcp-servers/{id}`, and
+`POST /api/v1/agent/mcp-servers/test`) requires `MCP_ADMIN_TOKEN` and the
+`X-MCP-Admin-Token` header. If no token is configured the management API
+returns `503` and cannot be enabled from the browser. The stdio-only config
+store is versioned JSON under `STRIXPER_DATA_DIR/mcp_servers.json`, atomically
+written with restrictive file permissions, and contains secret references
+rather than credential values. Each server is connected lazily when an
+eligible agent request first needs it; failed servers are reported in status
+without preventing unrelated tools from working. Application shutdown closes
+all MCP sessions and subprocesses.
+
+`MCP_SERVERS_DIR` is the single install root for stdio MCP packages. Each
+server is installed under a child directory matching its Strixper server ID;
+the manager prepends that child's `bin`, `.venv/bin`, and `node_modules/.bin`,
+plus the shared `MCP_SERVERS_DIR/bin`, to the child process `PATH`. The Docker launcher mounts
+the persistent `strixper-mcp-servers` volume at `/mcp-servers`; the image
+seeds its bundled packages into a new volume. Tieline is pinned at
+`mcp-servers/tieline/package-lock.json`, and
+`mcp-servers/tieline/strixper-mcp-config.json` seeds default config only when
+the persistent MCP config is missing. Legacy Tieline `npx` entries are
+migrated to the installed per-server executable during backend initialization.
+
+The Docker launcher separately mounts the repository read-only at
+`/workspace/strixper` and supplies `TIELINE_WORKSPACE` to the Tieline server.
+The repository's `.tieline/` workspace and compiled code-topology artifact
+remain at the repository root so code-context queries see the actual project.
+An empty contract has no accepted product-intent records until Capabilities,
+Stories, and Acceptance Criteria are authored. Because Tieline exposes both
+read and planning-write tools and the manager gates access per server, its
+default minimum access is `actions`; the AI Chat **Allow actions** switch also
+enables Strixper's engine start/stop tools.
+
+An MCP stdio server command runs with the backend user's privileges. It is
+treated as trusted executable code, not sandboxed; do not enable servers you
+do not trust. `MCP_ADMIN_TOKEN` protects management operations only, not the
+rest of the dashboard API. The token is sent over HTTP by the browser; use
+localhost, an SSH tunnel, or HTTPS for MCP administration. Do not expose the
+dashboard to untrusted networks.
 
 #### LLM-Runner endpoints
 
@@ -1504,6 +1567,13 @@ a controls bar, a scrolling message list, and a composer.
 * **Thinking** — checkbox (default on). Unchecking sends `thinking: false` so
   the model suppresses its chain-of-thought.
 * **Clear conversation** — erases the message list and any error banner.
+* **Conversation / Extensions sub-navigation** — Extensions shows the
+  discovered skill folders and validation errors, plus the MCP server manager.
+  Skills are installed by dropping a folder into `SKILLS_DIR` and rescanning.
+  The MCP view requires the administrator token, keeps it in component memory
+  only, supports stdio server CRUD/test/status, and never displays resolved
+  secret values. Enabling a stdio command requires an explicit warning
+  confirmation.
 
 **Message list (middle).** User turns render as right-aligned bubbles; assistant
 turns as left-aligned bubbles with an avatar. Each assistant bubble contains:
@@ -1683,7 +1753,7 @@ backend/
       stats_routes.py       POST /stats/reset
       tokens.py             POST /count-tokens (Halogen count_tokens proxy)
       chat.py               POST /chat (streaming chat proxy, 4 API styles)
-      agent.py              POST /agent/chat, GET /agent/tools (agentic chat)
+      agent.py               agent chat, tools, skills, protected MCP APIs
       runner.py             LLM-Runner: config CRUD + start/watch/stop + preview
     services/
       docker_control.py     stop/kill/inspect the container a run owns
@@ -1698,6 +1768,8 @@ backend/
       params.py             {name} template validation + command rendering
       agent_tools.py        tool functions exposed to the agent (read-only + gated)
       agent_exec_tools.py   full-access tier: web, shell, python, file I/O
+      skill_loader.py       safe SKILL.md discovery and bounded resource loading
+      mcp_manager.py        persisted MCP config, stdio process/session lifecycle
     data/
       llm_runner_configs.json   runtime store (gitignored)
       engine_target.json        remembered engine target (gitignored)
@@ -1719,6 +1791,7 @@ frontend/
       TokenCounter.jsx      on-demand prompt token counter (POST /count-tokens)
       TuningTab.jsx         Tab 2 (banner + audit table)
       AIChatTab.jsx         Tab 3 (streaming chat, reasoning, agent mode, tool steps)
+      AgentExtensions.jsx   AI Chat skill discovery and protected MCP manager
       RunnerTab.jsx         Tab 4 (create/run/store docker run configs)
     charts/
       ChartCard.jsx         chart wrapper with info button
@@ -1729,6 +1802,8 @@ frontend/
       KvPoolChart.jsx       Chart C
       QueueChart.jsx        Chart D
 Dockerfile
+skills/
+  research-review/SKILL.md example drop-in research workflow
 run.sh
 stop.sh
 build_img.sh
@@ -1851,8 +1926,9 @@ The root `Dockerfile` is a multi-stage production image:
    Python 3.12, ROCm userspace including `rocm-smi`, and the utilities needed
    by the backend. Python dependencies are installed in `/opt/venv`.
 3. The runtime copies the Docker CLI from `docker:cli`, installs
-   `backend/requirements.txt`, copies the backend and frontend build, and uses
-   `docker-entrypoint.sh` to `exec` Uvicorn as PID 1.
+   the pinned Tieline Node.js MCP server and `backend/requirements.txt`, copies
+   the backend and frontend build, and uses `docker-entrypoint.sh` to seed the
+   initial MCP config if needed and `exec` Uvicorn as PID 1.
 
 The image binds `BIND_HOST=0.0.0.0`, `BIND_PORT=8000` by default. Its Docker
 healthcheck polls `/api/v1/healthz`; this is backend liveness and does not imply
@@ -1874,7 +1950,19 @@ The dashboard container relies on host facilities and must be created with:
 * The named `strixper-agent-ws` volume mounted at `/app/backend/agent_workspace`
   so the full-access tier's downloads and generated scripts survive a recreate.
 * The named `strixper-data` volume mounted at `/app/backend/data` to preserve
-  Runner configs and the remembered engine target across container removal.
+  Runner configs, the remembered engine target, and non-secret MCP server
+  configuration across container removal.
+* The named `strixper-mcp-servers` volume mounted at `/mcp-servers` for
+  per-server MCP packages and binaries. Tieline is installed beneath
+  `/mcp-servers/tieline`; install future server packages under a subdirectory
+  matching their configured MCP server ID.
+* The repository `skills/` directory mounted read-only at `/app/skills`.
+  Add a child folder with `SKILL.md` on the host and rescan in AI Chat →
+  Extensions to discover it without rebuilding the image.
+* The repository root mounted read-only at `/workspace/strixper` for Tieline's
+  local code-context MCP server; `TIELINE_WORKSPACE` points to this mount.
+* `MCP_ADMIN_TOKEN` passed from the host environment (or `MCP_ENV_FILE`
+  supplied to `strixper.sh`) when enabling protected MCP administration.
 
 The provided `strixper.sh` resolves host GPU group IDs and sets these runtime
 options when creating the container. With host networking, Docker port

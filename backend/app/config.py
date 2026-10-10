@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -71,6 +72,25 @@ class Settings:
         self.agent_workspace: str = os.getenv(
             "AGENT_WORKSPACE", os.path.join(_backend_dir, "agent_workspace")
         ).strip()
+        self.skills_dir: str = os.getenv(
+            "SKILLS_DIR",
+            str(Path(__file__).resolve().parents[2] / "skills"),
+        ).strip()
+        self.data_dir: str = os.getenv(
+            "STRIXPER_DATA_DIR",
+            str(Path(_backend_dir) / "data"),
+        ).strip()
+        self.mcp_servers_dir: str = os.getenv(
+            "MCP_SERVERS_DIR",
+            str(Path(__file__).resolve().parents[2] / "mcp-servers"),
+        ).strip()
+        # MCP server commands execute as this process and inherit the
+        # container's mounts/privileges. Management APIs fail closed unless
+        # an administrator configures a high-entropy bearer token.
+        self.mcp_admin_token: str = os.getenv("MCP_ADMIN_TOKEN", "").strip()
+        self.mcp_call_timeout_seconds: float = _get_float(
+            "MCP_CALL_TIMEOUT_SECONDS", 30.0
+        )
 
 
 settings = Settings()

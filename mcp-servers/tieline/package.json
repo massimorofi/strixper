@@ -1,0 +1,8 @@
+{
+  "name": "strixper-tieline-mcp",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "tieline": "0.1.29"
+  }
+}

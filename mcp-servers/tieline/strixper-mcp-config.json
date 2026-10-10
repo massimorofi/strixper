@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "servers": [
+    {
+      "id": "tieline",
+      "transport": "stdio",
+      "command": "tieline",
+      "args": [
+        "serve"
+      ],
+      "env": {
+        "TIELINE_WORKSPACE": {
+          "secretRef": "TIELINE_WORKSPACE"
+        }
+      },
+      "enabled": true,
+      "minimum_access": "actions"
+    }
+  ]
+}

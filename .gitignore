@@ -15,6 +15,7 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+mcp-servers/**/node_modules/
 
 # Build output
 frontend/dist/
@@ -35,4 +36,5 @@ backend/data/
 
 # Agent full-access workspace (runtime artifacts, mounted as a volume)
 backend/agent_workspace/
-
+#Secrets
+secrets

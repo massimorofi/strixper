@@ -2,261 +2,224 @@
 
 ## Overview
 
-Extend the agent with a plugin system for **skills** (local Python modules) and **MCP servers** (remote tool servers), both exposed as `FunctionTool` to the OpenAI Agents SDK.
+Add two distinct extension mechanisms to Agent mode:
+
+1. **Skills** are drop-in folders containing a `SKILL.md` and optional
+   reference material/scripts. They provide on-demand instructions; they are
+   not imported as Python modules and do not implicitly add executable tools.
+2. **MCP servers** expose tools through the MCP protocol. Their configuration
+   is managed in the AI-Chat Extensions view and persisted by the backend.
+
+The agent remains the existing OpenAI Agents SDK agent talking to the selected
+local inference engine. Skills provide progressive instructions; built-in and
+MCP tools provide callable capabilities. Keep those concepts separate.
+
+**Review verdict:** the initial proposal had the right feature areas but was
+not safe or specific enough to implement as written. The corrected plan uses
+standard drop-in skill folders, structured MCP session management, redacted
+persistent configuration, and explicit access/security gates. MCP management
+is gated by a separately configured high-entropy admin token; since the
+dashboard's other APIs remain unauthenticated, do not expose the dashboard to
+untrusted networks. Use localhost/SSH tunneling or HTTPS for admin sessions.
 
 ---
 
-## 1. Skills (Local Plugin System)
+## 1. Skills (Drop-in Agent Skill Folders)
 
 ### 1.1 Directory Structure
 ```
-strixper/
-├── skills/                    # <-- new directory (configurable via env)
-│   ├── __init__.py
-│   ├── builtin/               # shipped skills (read-only)
-│   │   ├── __init__.py
-│   │   ├── system_info.py
-│   │   └── docker_utils.py
-│   └── user/                  # user-installed skills (read-write)
-│       ├── __init__.py
-│       └── my_custom_skill.py
+skills/                         # host-mounted; configurable via SKILLS_DIR
+├── summarize-research/
+│   ├── SKILL.md                # required manifest + instructions
+│   ├── references/
+│   │   └── source-checklist.md
+│   └── scripts/                # optional; only run through permitted tools
+└── another-skill/
+    └── SKILL.md
 ```
 
-### 1.2 Skill Module Interface
-Each skill is a Python module exporting:
-```python
-# skills/user/my_skill.py
-from agents import FunctionTool, function_tool
-from typing import Any
+### 1.2 File format and behavior
 
-# Required: list of FunctionTool instances
-TOOLS: list[FunctionTool] = []
+Use the common Agent Skills `SKILL.md` convention, not a Strixper-specific
+Python module API. Require YAML frontmatter with `name` and `description`;
+the name must match the containing folder. The Markdown body contains the
+workflow. References, assets, and scripts are optional. Do not `import` or
+execute files during discovery.
 
-# Optional: metadata
-NAME = "my_skill"
-VERSION = "1.0.0"
-DESCRIPTION = "Does something useful"
-REQUIRES_ACTIONS = False      # if True, only loaded when allow_actions=True
-REQUIRES_FULL_ACCESS = False  # if True, only loaded when full_access=True
+Discovery scans only immediate child directories of `SKILLS_DIR`. Parse
+frontmatter with a safe YAML loader and validate a small allowed metadata
+schema and field-size limits; reject malformed frontmatter, duplicate names,
+and paths escaping the skill directory. Ignore symlinks that resolve outside
+the configured root. Surface invalid folders and parse errors in the
+Extensions UI instead of silently dropping them.
 
-@function_tool
-async def my_tool(param: str) -> str:
-    """Tool description for the agent."""
-    return f"Result: {param}"
+Re-scan on each `GET /agent/skills` and before each agent run (or use a short
+metadata cache invalidated by an explicit rescan). This makes a newly dropped
+folder available without restarting Strixper. Do not cache skill bodies across
+requests unless keyed by file modification time.
 
-TOOLS = [my_tool]
-```
+### 1.3 Progressive loading
 
-### 1.3 Discovery & Loading (`services/skill_loader.py`)
-```python
-def discover_skills(skills_dir: Path) -> list[SkillModule]:
-    """Import all modules in skills_dir/{builtin,user}/"""
-    # 1. Add skills_dir to sys.path
-    # 2. Walk subdirectories, import each module
-    # 3. Validate: has TOOLS list, all items are FunctionTool
-    # 4. Return list of {name, module, tools, metadata}
+Expose a small built-in `list_skills` tool and `load_skill(name)` tool, or
+provide equivalent SDK-supported dynamic instructions. At agent start, include
+only installed skill names and short descriptions in the system instructions.
+When a skill is relevant, the model calls `load_skill` to receive its complete
+`SKILL.md` body. Load an optional reference/script only through a path-confined
+`read_skill_resource(name, relative_path)` tool when the instructions require
+it. Bound file sizes and response bytes. Treat loaded content as untrusted
+guidance subordinate to system policy and request-level tool permissions.
 
-def filter_tools_by_tier(skills, allow_actions, full_access) -> list[FunctionTool]:
-    """Filter skills based on request tier."""
-    # Include if:
-    #   - not REQUIRES_ACTIONS and not REQUIRES_FULL_ACCESS (read-only)
-    #   - REQUIRES_ACTIONS and allow_actions
-    #   - REQUIRES_FULL_ACCESS and full_access
-```
+This keeps every skill's full instructions out of every request's prompt while
+making all installed skills discoverable. A skill contributes instructions,
+not new Python tools. If a future plugin needs to contribute callable code,
+design a separate, explicitly trusted extension API with its own opt-in and
+security review.
 
-### 1.4 Integration Point
-In `agent.py` → `_resolve_tools()`:
-```python
-from .services.skill_loader import discover_skills, filter_tools_by_tier
+### 1.4 Host and Docker setup
 
-def _resolve_tools(state, body):
-    tools = build_tools(state, body.allow_actions or body.full_access)
-    if body.full_access:
-        tools.extend(build_exec_tools(state, settings.agent_workspace))
-    
-    # NEW: Load skills
-    skills_dir = Path(settings.skills_dir)  # env: SKILLS_DIR
-    skills = discover_skills(skills_dir)
-    tools.extend(filter_tools_by_tier(skills, body.allow_actions, body.full_access))
-    
-    return tools
-```
+Add `SKILLS_DIR` to settings, defaulting to a dedicated directory inside the
+repository for local development. For Docker, mount a host directory at a
+stable container path (for example `./skills:/app/skills:ro`) and set
+`SKILLS_DIR=/app/skills`; document that users install a skill by dropping its
+folder there. Resolve the host path relative to the script's own location,
+not the shell's current working directory. Keep skills read-only in the
+container by default; skills that need to create files should use the existing
+agent workspace.
 
-### 1.5 Configuration
-```python
-# config.py additions
-class Settings:
-    skills_dir: str = os.getenv("SKILLS_DIR", 
-        str(Path(__file__).resolve().parent.parent.parent / "skills"))
-```
+### 1.5 API and Extensions UI
+
+Add `GET /api/v1/agent/skills`, returning each installed skill's name,
+description, and validation status (never arbitrary code execution). Add a
+**Conversation / Extensions** sub-navigation inside AI Chat. The Skills view
+shows the configured directory, discovered skills, manifest errors, and a
+rescan action. Installing/removing files remains a filesystem operation:
+users drop/remove folders in `SKILLS_DIR`, then rescan. Do not add an upload
+installer in the first version.
 
 ---
 
-## 2. MCP Servers (Remote Tool Servers)
+## 2. MCP Servers (stdio-first Tool Integration)
 
 ### 2.1 Architecture
 ```
-┌─────────────────┐     JSON-RPC over stdio/HTTP     ┌──────────────┐
+┌─────────────────┐       MCP JSON-RPC             ┌──────────────┐
 │  Agent (this    │ ◄──────────────────────────────► │  MCP Server  │
 │   process)      │                                  │  (any lang)  │
 └─────────────────┘                                  └──────────────┘
        │                                                   │
        ▼                                                   ▼
-FunctionTool                                        Tools/Resources/
-(wraps MCP call)                                    Prompts
+SDK-native MCP server or a typed
+FunctionTool adapter (wraps MCP call)
 ```
 
-### 2.2 MCP Client Wrapper (`services/mcp_client.py`)
-```python
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from agents import FunctionTool, function_tool
+### 2.2 Connection and tool integration
 
-class MCPServer:
-    def __init__(self, name: str, command: str, args: list[str], env: dict = None):
-        self.name = name
-        self.command = command
-        self.args = args
-        self.env = env or {}
-        self._session: ClientSession | None = None
-    
-    async def connect(self):
-        params = StdioServerParameters(
-            command=self.command,
-            args=self.args,
-            env={**os.environ, **self.env}
-        )
-        self._read, self._write = await stdio_client(params).__aenter__()
-        self._session = ClientSession(self._read, self._write)
-        await self._session.initialize()
-        # Fetch tool list
-        self.tools = await self._session.list_tools()
-    
-    async def call_tool(self, name: str, arguments: dict) -> Any:
-        return await self._session.call_tool(name, arguments)
-    
-    async def close(self):
-        if self._session:
-            await self._session.__aexit__(None, None, None)
-```
+Pin a compatible MCP Python SDK version and verify the installed OpenAI Agents
+SDK's MCP integration before implementation. Prefer native MCP support where
+it meets Strixper's lifecycle and permission needs. Otherwise construct the
+SDK's `FunctionTool` with the MCP tool's `inputSchema`; do **not** use an
+untyped `@function_tool async def wrapper(**kwargs)`, which cannot reliably
+generate a valid argument schema. Normalize schemas for the selected local
+engine (including recursively removing unsupported JSON Schema `default`
+annotations, as already required for GUFO) and bound/serialize MCP content and
+error results.
 
-### 2.3 FunctionTool Adapter
-```python
-def wrap_mcp_tool(server: MCPServer, tool_def) -> FunctionTool:
-    """Convert MCP tool definition to OpenAI Agents FunctionTool."""
-    
-    @function_tool
-    async def mcp_tool_wrapper(**kwargs) -> str:
-        result = await server.call_tool(tool_def.name, kwargs)
-        return json.dumps(result.content, ensure_ascii=False)
-    
-    # Copy metadata from MCP tool
-    mcp_tool_wrapper.__name__ = f"mcp_{server.name}_{tool_def.name}"
-    mcp_tool_wrapper.__doc__ = tool_def.description or f"MCP tool: {tool_def.name}"
-    
-    # Use tool_def.inputSchema for parameter validation (optional)
-    return mcp_tool_wrapper
-```
+Use supported SDK context managers for `stdio_client` and `ClientSession`,
+managed with `AsyncExitStack` or equivalent structured lifetime. Never call
+`__aenter__`/`__aexit__` manually without retaining and closing the owning
+context manager. Apply connection, initialization, tool-call, and shutdown
+timeouts; close all sessions and child processes during FastAPI lifespan
+shutdown.
 
-### 2.4 Configuration (JSON/YAML)
+### 2.3 Configuration and secret references
+
+Persist non-secret server configuration in a versioned JSON store under the
+existing mounted backend data directory (for example
+`backend/data/mcp_servers.json`). Write updates atomically and restrict file
+permissions. Example:
+
 ```json
-// config/mcp_servers.json
 {
-  "servers": [
-    {
-      "name": "filesystem",
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
-      "enabled": true,
-      "tier": "full_access"
-    },
-    {
-      "name": "github",
-      "command": "docker",
-      "args": ["run", "-i", "--rm", "mcp/github"],
-      "env": {"GITHUB_TOKEN": "${GITHUB_TOKEN}"},
-      "enabled": true,
-      "tier": "actions"
-    }
-  ]
+  "version": 1,
+  "servers": [{
+    "id": "github",
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-github"],
+    "env": {"GITHUB_TOKEN": {"secretRef": "GITHUB_TOKEN"}},
+    "enabled": false,
+    "minimum_access": "actions"
+  }]
 }
 ```
 
-### 2.5 Connection Management
-```python
-# services/mcp_manager.py
-class MCPManager:
-    def __init__(self, config_path: Path):
-        self.servers: dict[str, MCPServer] = {}
-        self.config = load_config(config_path)
-    
-    async def start_all(self, tier: str):
-        """Connect to all enabled servers matching tier."""
-        for cfg in self.config["servers"]:
-            if not cfg.get("enabled"): continue
-            if cfg["tier"] not in ("read-only", tier): continue  # tier hierarchy
-            
-            server = MCPServer(cfg["name"], cfg["command"], cfg["args"], cfg.get("env"))
-            await server.connect()
-            self.servers[cfg["name"]] = server
-    
-    def get_tools(self) -> list[FunctionTool]:
-        """All tools from all connected servers."""
-        tools = []
-        for server in self.servers.values():
-            for tool_def in server.tools:
-                tools.append(wrap_mcp_tool(server, tool_def))
-        return tools
-    
-    async def shutdown(self):
-        for server in self.servers.values():
-            await server.close()
-```
+Support stdio first. Include an explicit transport discriminator so
+Streamable HTTP can be added later; do not advertise remote HTTP support until
+implemented. Store no secret values in this file or in API responses. Resolve
+explicit environment references using strict syntax and report missing
+references without echoing values. A future secret store can replace
+environment references without changing the UI contract.
 
-### 2.6 Integration Point
-In `agent.py` → lifespan or `_resolve_tools()`:
-```python
-# Option A: Start at startup (persistent connections)
-@asynccontextmanager
-async def lifespan(app):
-    mcp_manager = MCPManager(Path(settings.mcp_config))
-    await mcp_manager.start_all("full_access")  # or based on request
-    app.state.mcp = mcp_manager
-    try:
-        yield
-    finally:
-        await mcp_manager.shutdown()
+### 2.4 Backend management API
 
-# Option B: Per-request (lazy connect)
-def _resolve_tools(state, body):
-    tools = ...
-    if body.full_access:
-        tools.extend(app.state.mcp.get_tools())
-    return tools
-```
+Add an `/api/v1/agent/mcp-servers` API for listing redacted configurations,
+creating/updating/deleting a server, enabling/disabling it, testing its
+connection, and reading runtime status (connected, disabled, or error with a
+redacted diagnostic). Validate IDs, command/args/env schemas, transport,
+access level, and duplicate IDs. Test-connection must create a temporary
+session and always close it. Reconfiguration should validate and connect the
+replacement before swapping out a working connection where possible; failed
+edits must not silently erase the last known-good config.
+
+These are privileged administrative operations, not ordinary chat endpoints.
+Protect all management endpoints with authentication and authorization. Until
+the dashboard has general user authentication and authorization, protect
+these endpoints with a separately configured high-entropy admin bearer token
+and disable management when it is unset. The dashboard's other endpoints
+remain unauthenticated, so operate it only on a trusted network and use
+localhost/SSH tunneling or HTTPS to protect the token in transit. A browser
+confirmation dialog is not authorization.
+
+### 2.5 Manager lifecycle and isolation
+
+Initialize one manager in FastAPI lifespan and close it in `finally`. Enabled
+servers connect lazily on the first eligible agent request and remain
+connected until disabled, reconfigured, or application shutdown. This avoids
+launching unused servers during startup. A server failing to initialize must
+be marked unavailable without taking down the API or unrelated MCP servers.
+Serialize configuration updates and reconnection per server; avoid
+reconnecting all servers for a single edit. Each call routes to its matching
+active session and reports unavailable, timeout, and tool errors explicitly.
+
+The manager may enumerate connected tools for each agent request, but must
+not start or stop servers based only on that request's access tier. Filter
+tool availability per request using the global chat access and the server's
+configured minimum access level.
+
+### 2.6 MCP UI inside AI Chat
+
+Add an **MCP Servers** section to the AI-Chat Extensions view. Show server
+name, transport, enabled state, configured access level, connection status,
+and a safe error summary. Provide add/edit/delete, enable/disable, and
+test-connection controls. Never render secret values after save. Show a clear
+warning before enabling a stdio command: it runs as the backend user inside
+the Strixper container and inherits that container's access (including
+mounted volumes and, where present, the Docker socket). The dashboard has no general authentication boundary suitable for untrusted
+network exposure; do not expose MCP administration to an untrusted network.
+Protect the bearer token in transit using localhost/SSH tunneling or HTTPS.
 
 ---
 
-## 3. Unified Tool Registry
+## 3. Tool Resolution and Permission Model
 
-### 3.1 Single Source of Truth
-```python
-# services/tool_registry.py
-class ToolRegistry:
-    def __init__(self):
-        self.builtin = []      # agent_tools.py + agent_exec_tools.py
-        self.skills = []       # discovered from skills/
-        self.mcp = []          # from MCP servers
-    
-    def get_tools(self, tier: str) -> list[FunctionTool]:
-        tools = self.builtin_for_tier(tier)
-        tools.extend(self.skills_for_tier(tier))
-        if tier == "full_access":
-            tools.extend(self.mcp)
-        return tools
-```
+Resolve built-in tools and eligible MCP tools per request in the existing
+agent tool-resolution path. Skill discovery is not tool registration: the
+available skill descriptions and bounded skill-loading tools are provided as
+agent context. Avoid a second registry that duplicates existing tool
+definitions; extract a shared resolver only if needed to keep chat and
+`/agent/tools` behavior consistent.
 
-### 3.2 Tier Hierarchy
+### 3.1 Tier Hierarchy
 ```
 read-only  ⊂  actions  ⊂  full_access
 ```
@@ -266,27 +229,31 @@ read-only  ⊂  actions  ⊂  full_access
 | Builtin (agent_tools) | ✓ | ✓ | ✓ |
 | Builtin actions | | ✓ | ✓ |
 | Builtin exec (agent_exec_tools) | | | ✓ |
-| Skills (REQUIRES_ACTIONS) | | ✓ | ✓ |
-| Skills (REQUIRES_FULL_ACCESS) | | | ✓ |
-| MCP servers (tier: "actions") | | ✓ | ✓ |
-| MCP servers (tier: "full_access") | | | ✓ |
+| Skill discovery/loading | ✓ | ✓ | ✓ |
+| MCP server minimum access: read-only | ✓ | ✓ | ✓ |
+| MCP server minimum access: actions | | ✓ | ✓ |
+| MCP server minimum access: full_access | | | ✓ |
+
+`minimum_access` is an administrator-controlled availability gate, not proof
+that every server tool is safe at that level. MCP servers can expose
+destructive tools regardless of their metadata. Treat each enabled server as
+trusted and apply the request-level access mode in addition to its configured
+minimum.
 
 ---
 
 ## 4. Implementation Steps
 
-| Phase | Task | Files |
-|-------|------|-------|
-| 1 | Create `skills/` directory structure + `__init__.py` | `skills/builtin/__init__.py`, `skills/user/__init__.py` |
-| 2 | Implement `SkillLoader` discovery | `backend/app/services/skill_loader.py` |
-| 3 | Add `SKILLS_DIR` to config | `backend/app/config.py` |
-| 4 | Integrate into `_resolve_tools()` | `backend/app/routers/agent.py` |
-| 5 | Add MCP client dependency | `requirements.txt` → `mcp` |
-| 6 | Implement `MCPServer` wrapper | `backend/app/services/mcp_client.py` |
-| 7 | Implement `MCPManager` with config | `backend/app/services/mcp_manager.py` |
-| 8 | Add `MCP_CONFIG` to config | `backend/app/config.py` |
-| 9 | Integrate MCP into tool registry | `backend/app/routers/agent.py` or lifespan |
-| 10 | Create example skill + MCP config | `skills/builtin/example.py`, `config/mcp_servers.json.example` |
+| Phase | Deliverable | Acceptance check |
+|-------|-------------|------------------|
+| 0 | Protected MCP management boundary | Require an admin token and disable writes when unset; document that the rest of the dashboard is unauthenticated and require localhost/SSH tunneling or HTTPS for administration. |
+| 1 | Skills manifest parser/discovery and `SKILLS_DIR` | Drop a folder into the mounted directory and discover it on next scan; malformed/duplicate/path-escape cases report errors and no code is imported. |
+| 2 | Skill list/load/resource tools and `GET /agent/skills` | Agent discovers and loads a skill on demand; resource paths stay inside its root and response sizes are bounded. |
+| 3 | AI-Chat Conversation / Extensions view | Skills, validation status, directory, and rescan are visible without disrupting chat. |
+| 4 | MCP dependency/version decision, validated config store, CRUD/status/test APIs | Config persists across restart; secrets are redacted; invalid edits are rejected; test sessions always close. |
+| 5 | MCP manager, schema adapter/native integration, lifespan cleanup | Test servers work independently; a failed server does not break healthy ones; GUFO-compatible schemas/timeouts are verified. |
+| 6 | MCP Servers UI and request access gating | CRUD, test, status, enablement, and access level work end-to-end; disabled/ineligible tools are absent from runs. |
+| 7 | Docker/local docs and end-to-end tests | Host-mounted skill folders work in Docker; backend shutdown closes MCP subprocesses; existing built-in tools still work. |
 
 ---
 
@@ -294,10 +261,13 @@ read-only  ⊂  actions  ⊂  full_access
 
 | Risk | Mitigation |
 |------|------------|
-| Skills execute arbitrary code | Skills run in same process - trust boundary is the deployment. User skills dir should be owned by trusted user. |
-| MCP servers access host | MCP servers run in separate processes. Use Docker/containers for isolation. Deny patterns in `agent_exec_tools.py` don't apply to MCP. |
-| Tool name collisions | Prefix MCP tools with `mcp_{server}_{tool}`, skills with `skill_{name}_{tool}`. |
-| Resource exhaustion | Connection pooling, timeouts, max concurrent MCP calls. |
+| Untrusted skill instructions/resources | Skills are data, not sandboxed prompts; they can attempt prompt injection. Keep folders trusted, bound loaded content, and never treat their text as system policy. Scripts run only through separately permission-gated tools. |
+| MCP stdio command execution | An enabled command runs as the backend user with container-mounted access. Require explicit administrative enablement and a warning; MCP is not sandboxed and is not covered by shell-tool deny rules. |
+| Secrets | Store only environment-variable references; redact config/status/errors and never log resolved values. |
+| Unsafe MCP schemas/results | Validate schemas, normalize unsupported keywords (including `default`), bound input/output, and report errors explicitly. |
+| Tool name collisions | Prefix MCP tools with normalized unique `mcp_{server}_{tool}` names and detect collisions. Skills add no dynamic callable tools. |
+| Resource exhaustion / hangs | Enforce connection/call timeouts, response-size limits, maximum active servers/tools/concurrent calls, and orderly process cleanup. |
+| Administrative API exposure | Existing dashboard authentication/network limits apply; do not expose MCP management to untrusted users or networks. |
 
 ---
 
@@ -305,61 +275,42 @@ read-only  ⊂  actions  ⊂  full_access
 
 ### User installs a skill:
 ```bash
-# Create skill
-mkdir -p skills/user/github_tools
-cat > skills/user/github_tools/__init__.py << 'EOF'
-from agents import FunctionTool, function_tool
-import httpx
+mkdir -p skills/research-review/references
+cat > skills/research-review/SKILL.md <<'EOF'
+---
+name: research-review
+description: Research a topic, compare sources, and produce a cited summary.
+---
 
-@function_tool
-async def create_issue(repo: str, title: str, body: str) -> str:
-    """Create a GitHub issue."""
-    # ... implementation
-    return f"Issue created in {repo}"
-
-TOOLS = [create_issue]
-NAME = "github_tools"
-REQUIRES_FULL_ACCESS = True  # needs network
+When asked to research, gather multiple independent sources, record URLs,
+and distinguish verified facts from inference.
 EOF
 ```
 
-### Configure MCP server:
-```json
-// config/mcp_servers.json
-{
-  "servers": [{
-    "name": "postgres",
-    "command": "docker",
-    "args": ["run", "-i", "--rm", "mcp/postgres", "postgresql://user:pass@host/db"],
-    "enabled": true,
-    "tier": "actions"
-  }]
-}
-```
+### Configure an MCP server:
 
-### Agent automatically gets new tools:
-```python
-# Request with full_access=true now has:
-# - create_issue (from skill)
-# - postgres_query (from MCP)
-# All invoked identically via FunctionTool
-```
+Use the AI-Chat **Extensions → MCP Servers** form to add a server. For stdio,
+provide command/arguments, environment variable references, enabled state, and
+minimum access level. Test it before enabling. Credentials are configured in
+the backend environment; they are not pasted into or stored in the JSON
+configuration.
 
 ---
 
 ## 7. Testing Strategy
 
-1. **Unit**: SkillLoader discovers modules, filters by tier
-2. **Integration**: MCPManager connects to test server (stdio), wraps tools
-3. **E2E**: Agent request with `full_access=true` → tools from skill + MCP appear in `/agent/tools` and are callable
-4. **Security**: Verify tier gating works (skill with `REQUIRES_ACTIONS` not available in read-only)
+1. **Skills unit tests**: frontmatter, required fields/folder-name match, duplicate names, malformed manifests, symlink/path traversal rejection, size limits, rescans, and resource containment.
+2. **MCP unit tests**: config validation/atomic persistence, secret redaction and missing references, schema normalization (including nested `default`), tool-name collisions, and bounded result serialization.
+3. **MCP lifecycle tests**: stdio initialize/call/timeout/failed startup/reconfigure/shutdown; verify all contexts and child processes close and one broken server does not affect healthy servers.
+4. **Agent integration tests**: selected engine receives the right tools for each access level; disabled/ineligible servers are absent; skills load progressively; `/agent/tools` matches actual resolution.
+5. **UI/API tests**: CRUD, test connection, status, error reporting, secret redaction, rescan, and compatibility with existing AI Chat interactions.
 
 ---
 
 ## 8. Future Extensions
 
-- **Hot reload**: Watch `skills/` directory, reload on change
+- **Hot reload**: Watch `skills/` rather than rescanning each request
 - **Skill marketplace**: Install from git/URL via CLI command
-- **MCP over HTTP/SSE**: Support remote MCP servers (not just stdio)
+- **MCP Streamable HTTP**: Support remote MCP servers after stdio lifecycle is stable
 - **Tool permissions**: Per-tool allow/deny lists in config
-- **Skill dependencies**: `requirements.txt` per skill, auto-install
+- **Executable skill extensions**: A separately trusted and explicitly installed plugin format, if instruction/resource skills prove insufficient

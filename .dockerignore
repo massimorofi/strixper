@@ -12,6 +12,7 @@ venv/
 # Node / frontend build artifacts (rebuilt inside the image)
 node_modules/
 frontend/node_modules/
+mcp-servers/**/node_modules/
 frontend/dist/
 dist/
 build/

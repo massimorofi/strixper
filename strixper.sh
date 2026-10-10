@@ -5,6 +5,7 @@ CONTAINER_NAME="${STRIXPER_CONTAINER_NAME:-strixper}"
 IMAGE="${STRIXPER_IMAGE:-strixper-dashboard:latest}"
 BIND_PORT="${BIND_PORT:-8000}"
 ACTION="${1:-start}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
   echo "Usage: $0 {start|stop|restart|recreate|status}" >&2
@@ -41,6 +42,39 @@ container_port() {
   printf '%s' "${configured:-$BIND_PORT}"
 }
 
+requested_mcp_token() {
+  if [[ -n "${MCP_ADMIN_TOKEN:-}" ]]; then
+    printf '%s' "$MCP_ADMIN_TOKEN"
+  elif [[ -n "${MCP_ENV_FILE:-}" ]]; then
+    [[ -r "$MCP_ENV_FILE" ]] || {
+      echo "[strixper] ERROR: MCP_ENV_FILE is not readable: ${MCP_ENV_FILE}" >&2
+      return 1
+    }
+    sed -n 's/^MCP_ADMIN_TOKEN=//p' "$MCP_ENV_FILE" | tail -n 1
+  fi
+}
+
+container_mcp_token() {
+  docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' \
+    "$CONTAINER_NAME" | sed -n 's/^MCP_ADMIN_TOKEN=//p' | head -n 1
+}
+
+check_existing_mcp_configuration() {
+  local expected actual
+  expected="$(requested_mcp_token)" || return 1
+  actual="$(container_mcp_token)"
+
+  if [[ -n "$expected" && "$expected" != "$actual" ]]; then
+    echo "[strixper] ERROR: the existing container does not have the MCP_ADMIN_TOKEN currently supplied to this script." >&2
+    echo "[strixper] Docker cannot change a container's environment after creation; run './strixper.sh recreate' to apply it." >&2
+    return 1
+  fi
+  if [[ -z "$actual" ]]; then
+    echo "[strixper] MCP management is disabled in the existing container (MCP_ADMIN_TOKEN is not set)." >&2
+    echo "[strixper] Set the token, then run './strixper.sh recreate' to enable MCP management." >&2
+  fi
+}
+
 wait_for_api() {
   local port="$1" attempt
   for attempt in $(seq 1 30); do
@@ -56,6 +90,7 @@ wait_for_api() {
 
 start_container() {
   if container_exists; then
+    check_existing_mcp_configuration || return 1
     if container_running; then
       echo "[strixper] ${CONTAINER_NAME} is already running."
       return 0
@@ -89,21 +124,41 @@ start_container() {
   }
 
   echo "[strixper] Creating ${CONTAINER_NAME} from ${IMAGE}."
-  docker run -d \
+  mkdir -p "${SCRIPT_DIR}/skills"
+  local -a docker_args=(
+    run -d
     --name "$CONTAINER_NAME" \
     --restart unless-stopped \
     --network=host \
     -e BIND_HOST=0.0.0.0 \
     -e "BIND_PORT=${BIND_PORT}" \
+    -e SKILLS_DIR=/app/skills \
+    -e MCP_SERVERS_DIR=/mcp-servers \
+    -e TIELINE_WORKSPACE=/workspace/strixper \
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v /etc/group:/etc/group:ro \
     -v strixper-data:/app/backend/data \
     -v strixper-agent-ws:/app/backend/agent_workspace \
+    -v strixper-mcp-servers:/mcp-servers \
+    -v "${SCRIPT_DIR}/skills:/app/skills:ro" \
+    -v "${SCRIPT_DIR}:/workspace/strixper:ro" \
     --device=/dev/kfd \
     --device=/dev/dri \
     --group-add "$video_gid" \
-    --group-add "$render_gid" \
-    "$IMAGE" >/dev/null
+    --group-add "$render_gid"
+  )
+  if [[ -n "${MCP_ENV_FILE:-}" ]]; then
+    [[ -r "$MCP_ENV_FILE" ]] || {
+      echo "[strixper] ERROR: MCP_ENV_FILE is not readable: ${MCP_ENV_FILE}" >&2
+      exit 1
+    }
+    docker_args+=(--env-file "$MCP_ENV_FILE")
+  fi
+  if [[ -n "${MCP_ADMIN_TOKEN:-}" ]]; then
+    docker_args+=(-e MCP_ADMIN_TOKEN)
+  fi
+  docker_args+=("$IMAGE")
+  docker "${docker_args[@]}" >/dev/null
   wait_for_api "$BIND_PORT"
   echo "[strixper] Dashboard is ready at http://<host-lan-ip>:${BIND_PORT}"
 }
@@ -200,6 +255,9 @@ case "$ACTION" in
     stop_stack
     ;;
   restart)
+    if container_exists; then
+      check_existing_mcp_configuration || exit 1
+    fi
     stop_stack
     start_container
     ;;

@@ -7,13 +7,16 @@ import {
   Eraser,
   Eye,
   Loader2,
+  MessageSquareText,
   Send,
+  Settings2,
   Square,
   User,
   Wrench,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
+import AgentExtensions from './AgentExtensions.jsx'
 import {
   createThinkSplitter,
   fetchRunnerRuns,
@@ -356,6 +359,7 @@ function persistMessages(messages) {
 }
 
 export default function AIChatTab({ active = true }) {
+  const [view, setView] = useState('conversation')
   const [messages, setMessages] = useState(loadStoredMessages)
   const [draft, setDraft] = useState('')
   const [api, setApi] = useState('chat')
@@ -600,7 +604,32 @@ export default function AIChatTab({ active = true }) {
   const activeApi = API_OPTIONS.find((o) => o.value === api)
 
   return (
-    <div className="flex h-[calc(100vh-8.5rem)] flex-col overflow-hidden rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)]">
+    <div className="flex h-[calc(100vh-8.5rem)] flex-col gap-2">
+      <nav className="flex shrink-0 gap-1 border-b border-[var(--border-hairline)]" aria-label="AI Chat sections">
+        {[
+          { id: 'conversation', label: 'Conversation', Icon: MessageSquareText },
+          { id: 'extensions', label: 'Extensions', Icon: Settings2 },
+        ].map(({ id, label, Icon }) => (
+          <button
+            key={id}
+            type="button"
+            onClick={() => setView(id)}
+            aria-current={view === id ? 'page' : undefined}
+            className={`inline-flex items-center gap-1.5 border-b-2 px-3 py-2 text-xs font-medium ${
+              view === id
+                ? 'border-[var(--series-1)] text-[var(--text-primary)]'
+                : 'border-transparent text-[var(--text-muted)] hover:text-[var(--text-secondary)]'
+            }`}
+          >
+            <Icon size={14} /> {label}
+          </button>
+        ))}
+      </nav>
+      <div className={view === 'extensions' ? 'flex min-h-0 flex-1' : 'hidden'}>
+        <AgentExtensions active={active && view === 'extensions'} />
+      </div>
+      {view === 'conversation' && (
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)]">
       {/* Controls */}
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-[var(--border-hairline)] px-4 py-2.5">
         <div className="mr-auto">
@@ -803,6 +832,8 @@ export default function AIChatTab({ active = true }) {
           </button>
         </div>
       </div>
+    </div>
+      )}
     </div>
   )
 }

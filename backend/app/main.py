@@ -19,6 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from .config import settings
 from .routers import agent, chat, config_routes, live, runner, stats_routes, tokens, tuning
 from .services.live_service import RuntimeState, managed_poller, set_engine_target
+from .services.mcp_manager import MCPManager
 from .services.run_registry import registry, reconcile_loop
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,10 @@ def _make_adopted_hook(state: RuntimeState):
 async def lifespan(app: FastAPI):
     state = RuntimeState()
     app.state.rt = state
+    mcp_manager = MCPManager(Path(settings.data_dir) / "mcp_servers.json")
+    app.state.mcp = mcp_manager
+    if mcp_manager.manager_status()["config_error"]:
+        logger.error("MCP configuration could not be loaded; management requires repair.")
     on_adopted = _make_adopted_hook(state)
 
     # A docker container outlives the process that started it, so an engine
@@ -87,7 +92,10 @@ async def lifespan(app: FastAPI):
                 await reconcile
             except asyncio.CancelledError:
                 pass
-            await registry.shutdown()
+            try:
+                await mcp_manager.shutdown()
+            finally:
+                await registry.shutdown()
 
 
 app = FastAPI(

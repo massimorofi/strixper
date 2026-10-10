@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "tieline": {
+      "command": "node",
+      "args": [
+        "./mcp-servers/tieline/node_modules/tieline/dist/cli.js",
+        "serve"
+      ],
+      "env": {
+        "TIELINE_WORKSPACE": "."
+      }
+    }
+  }
+}

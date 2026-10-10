@@ -20,6 +20,7 @@ endpoint contracts and `strix_halo_finetuning.md` for the tuning recommendations
 - [Changing ports](#changing-ports-port-conflicts)
 - [API](#api)
 - [Agentic AI Chat](#agentic-ai-chat)
+- [Skills and MCP Extensions](#skills-and-mcp-extensions)
 - [Docker quick start](#docker-quick-start)
 - [Docker Deployment Details](#docker-deployment-details)
 - [Project layout](#project-layout)
@@ -350,6 +351,10 @@ ss -tlnp | grep LISTEN          # see what's already taken
 | `/api/v1/stats/reset` | POST | Reset session statistics to zero |
 | `/api/v1/count-tokens` | POST | Count the input tokens of a prompt (proxies Halogen) |
 | `/api/v1/chat` | POST | Streaming chat completion (4 API styles, SSE) |
+| `/api/v1/agent/skills` | GET | Rescan and list valid skill folders and manifest errors |
+| `/api/v1/agent/mcp-servers` | GET / POST | Protected MCP configuration/status (requires `X-MCP-Admin-Token`) |
+| `/api/v1/agent/mcp-servers/{id}` | PUT / DELETE | Protected MCP server update/removal |
+| `/api/v1/agent/mcp-servers/test` | POST | Protected temporary stdio connection test |
 | `/api/v1/healthz` | GET | Backend liveness |
 
 Interactive API docs: `http://localhost:8000/docs`.
@@ -401,7 +406,7 @@ tool call and a summary of what came back.
 
 ### Tools
 
-The agent has nine read-only tools, always available:
+The agent has nine read-only dashboard tools, always available:
 
 | Tool | What it returns |
 | --- | --- |
@@ -414,6 +419,10 @@ The agent has nine read-only tools, always available:
 | `count_prompt_tokens` | Exact token cost of a prompt |
 | `list_runner_configs` | Saved LLM-Runner configurations |
 | `get_active_run` | The engine run currently tracked, if any |
+
+The bounded `list_skills`, `load_skill`, and `read_skill_resource` tools are
+also available in Agent mode; they discover the drop-in skills described in
+[Skills and MCP Extensions](#skills-and-mcp-extensions).
 
 Two more tools are exposed **only** when you tick **Allow actions**:
 
@@ -525,6 +534,125 @@ which comfortably covers scripts of a few thousand lines.
 describes the dashboard, the Strix Halo context, and when to reach for each
 tool; override it only if you want a different voice or a narrower remit.
 
+### Skills and MCP Extensions
+
+Open **AI Chat → Extensions** to view discovered skills and manage MCP servers.
+Skills are instruction/resource folders, not Python plugins: add a folder with
+a `SKILL.md` under the repository's `skills/` directory (or the configured
+`SKILLS_DIR`), then select **Rescan / refresh**. The included
+`skills/research-review/` folder demonstrates the required frontmatter. The
+agent sees skill names/descriptions and loads full instructions or contained
+reference files only when needed. Skill content is untrusted guidance; it does
+not grant new permissions or execute scripts.
+
+MCP management is disabled until the backend receives `MCP_ADMIN_TOKEN`.
+Generate a high-entropy value and export it before starting Strixper:
+
+```bash
+export MCP_ADMIN_TOKEN="$(openssl rand -hex 32)"
+./strixper.sh start
+echo $MCP_ADMIN_TOKEN
+```
+
+This creates a new dashboard container with the token. If a Strixper container
+already exists, `start` cannot change its environment; the script will report
+that the supplied token does not match and tell you to run
+`./strixper.sh recreate`. Recreating stops the dashboard and its registered
+engine containers before replacing the dashboard container.
+
+Enter that value in the Extensions view to manage stdio servers. Keep it
+private; it grants permission to configure commands that run as the backend
+user. For Docker, the script passes the exported token into the container,
+persists non-secret server configuration in `strixper-data`, and bind-mounts
+the host `skills/` directory read-only at `/app/skills`. To pass other
+environment-backed MCP secrets, use a protected Docker env file:
+
+```bash
+chmod 600 backend/.env
+MCP_ENV_FILE=backend/.env ./strixper.sh start
+```
+
+Include `MCP_ADMIN_TOKEN` in that file if you prefer not to export it. The
+container keeps the environment from when it was created; to enable MCP on an
+existing container, rotate the token, or change referenced secrets, supply the
+updated environment and run `./strixper.sh recreate`.
+
+MCP tools are exposed only when both the server's configured minimum access
+level and the current chat request's access toggle permit them. The admin
+token is a bearer credential sent over HTTP by the browser: manage MCP only
+over localhost, an SSH tunnel, or HTTPS, and do not expose the unauthenticated
+dashboard APIs to untrusted networks. Enabling an MCP stdio command is
+equivalent to trusting code inside the backend container:
+the container has a Docker socket and other mounts, so the command may have
+host-level effects. Do not expose the unauthenticated dashboard or its MCP
+management UI to untrusted networks. Do not place credentials in MCP command
+arguments; configure them as backend environment variables and refer to those
+names in the MCP form. Secrets are not stored in the JSON config or returned
+by the API.
+
+#### MCP server installation root
+
+All MCP server packages belong under the repository's
+[`mcp-servers/`](./mcp-servers/) root, in a per-server subdirectory named to
+match its MCP server ID. Tieline is installed under
+[`mcp-servers/tieline/`](./mcp-servers/tieline/); its pinned package manifest
+and Strixper's default config are stored there. The Docker image installs
+Tieline's package in that directory. On first startup, the entrypoint copies
+`mcp-servers/tieline/strixper-mcp-config.json` to the protected persistent
+`/app/backend/data/mcp_servers.json` path with mode `0600`. Existing MCP
+configuration is preserved, and legacy Tieline `npx` entries are migrated to
+the `mcp-servers/tieline` executable.
+
+For a new Node.js server, install a pinned package under its ID directory:
+
+```bash
+docker exec strixper npm install --prefix /mcp-servers/<server-id> <package>@<version>
+```
+
+Then use that server's installed command in **AI Chat → Extensions**. Strixper
+adds the server-specific `bin/`, `.venv/bin/`, and `node_modules/.bin/`
+directories, plus the shared `mcp-servers/bin/`, to the subprocess `PATH`;
+save only the executable name and arguments in the MCP config. For local
+development, run the same npm install command from the repository root:
+
+```bash
+npm install --prefix mcp-servers/<server-id> <package>@<version>
+```
+`mcp-servers/README.md` describes the installation convention.
+
+In Docker, `/mcp-servers` is the persistent named volume
+`strixper-mcp-servers`. The image seeds its initial Tieline installation into
+an empty volume; adding future packages to the volume preserves them across
+dashboard recreation.
+
+`strixper.sh` mounts this repository read-only at `/workspace/strixper` and
+sets `TIELINE_WORKSPACE` to that path. The server runs as a stdio child process
+inside the dashboard container and starts lazily when an eligible Agent-mode
+chat requests its tools (or when **Test connection** is clicked). Tieline
+provides both read and planning-write tools, so it is configured with
+`minimum_access: "actions"`; enable **Allow actions** in Agent Chat to expose
+them. This same toggle also enables Strixper's engine start/stop tools. The
+Tieline subprocess does not receive the MCP administrator token.
+
+The repository has a Tieline offline workspace at `.tieline/`, including a
+compiled topology snapshot. For development agents, the generated root
+`.mcp.json` launches the package from `mcp-servers/tieline/node_modules`.
+Tieline intent
+queries become meaningful after Capabilities, Stories, and Acceptance Criteria
+have been authored; until then, the MCP server can still provide code-topology
+tools but there is no accepted product contract to query.
+
+To include the bundled server in a new dashboard image and container, rebuild
+and recreate Strixper:
+
+```bash
+./build_img.sh
+./strixper.sh recreate
+```
+
+`recreate` stops the dashboard's registered LLM engine containers before
+replacing Strixper, so schedule it when stopping those engines is acceptable.
+
 ## Docker quick start
 
 For the shortest path see [Quick Start](#quick-start). This section documents
@@ -561,6 +689,7 @@ rebuild from scratch.
 | `-v /etc/group:/etc/group:ro` | Engine commands resolve the host `render` group GID (`getent group render`) |
 | `-v strixper-data:/app/backend/data` | Persists your LLM-Runner configs and the remembered engine target across recreations |
 | `-v strixper-agent-ws:/app/backend/agent_workspace` | Persists files the agent creates when **Full access** is enabled |
+| `-v <repo>/skills:/app/skills:ro` | Makes drop-in skill folders available without rebuilding the image |
 | `--device=/dev/kfd` and `--device=/dev/dri` | Give ROCm SMI access to the host GPU devices |
 | `--group-add ...` | Allow the container to access GPU devices using the host `video` and `render` group IDs |
 

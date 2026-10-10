@@ -17,6 +17,12 @@ RUN npm install --no-audit --no-fund
 COPY frontend/ ./
 RUN npm run build
 
+# Install each bundled Node.js MCP server under the shared installation root.
+FROM node:22-bookworm-slim AS mcp-server-runtime
+WORKDIR /mcp-servers
+COPY mcp-servers/ ./
+RUN npm ci --omit=dev --prefix /mcp-servers/tieline
+
 # ---------- Stage 2: backend runtime ----------
 FROM rocm/dev-ubuntu-24.04:7.2.2
 WORKDIR /app/backend
@@ -24,6 +30,9 @@ WORKDIR /app/backend
 # docker CLI: the LLM-Runner starts/stops engine containers through it,
 # talking to the host daemon via the mounted /var/run/docker.sock.
 COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
+# Node.js MCP servers and their dependencies live under the shared root.
+COPY --from=mcp-server-runtime /usr/local /usr/local
+COPY --from=mcp-server-runtime /mcp-servers /mcp-servers
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3-venv \
