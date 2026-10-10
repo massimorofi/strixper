@@ -14,4 +14,6 @@ async def reset_stats(request: Request) -> dict[str, Any]:
     """Zero out the running min/avg/max accumulators and restart the clock."""
     state = request.app.state.rt
     state.stats.reset()
+    for tracker in state.engine_stats.values():
+        tracker.reset()
     return state.stats.snapshot()

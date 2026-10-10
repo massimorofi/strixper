@@ -30,6 +30,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 import httpx
+from ..services.halogen_client import HalogenClient
+from ..services.run_registry import registry
 
 router = APIRouter(tags=["chat"])
 
@@ -56,6 +58,8 @@ class ChatRequest(BaseModel):
     # Toggle the model's chain-of-thought. Halogen always thinks by default;
     # thinking=False suppresses it (verified per upstream API style).
     thinking: bool = True
+    # An optional managed engine run selected in the AI-Chat UI.
+    run_id: Optional[str] = None
 
     @field_validator("api")
     @classmethod
@@ -295,32 +299,40 @@ def _sync_result(api: str, result: dict[str, Any], model: str) -> dict[str, Any]
 async def chat(body: ChatRequest, request: Request) -> Any:
     """Send the conversation to Halogen and return the assistant reply."""
     state = request.app.state.rt
-    model = state.model_name
+    run = registry.get_run(body.run_id) if body.run_id else None
+    if body.run_id and (run is None or run.status != "running" or not run.engine_url):
+        raise HTTPException(status_code=404, detail="selected engine is no longer running")
+    client = (
+        HalogenClient(run.engine_url)
+        if run is not None and run.engine_url
+        else state.halogen
+    )
+    owns_client = client is not state.halogen
+    model = (run.model_name if run else None) or state.model_name
     extract = _EXTRACTORS[body.api]
     payload, headers = _build_payload(body.api, body, model)
 
     if not body.stream:
         try:
-            result = await state.halogen.post_json(
-                _upstream_path(body.api), payload, headers
-            )
+            result = await client.post_json(_upstream_path(body.api), payload, headers)
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:500] if exc.response is not None else str(exc)
             raise HTTPException(
                 status_code=502,
-                detail=f"Halogen chat failed ({exc.response.status_code}): {detail}",
+                detail=f"Engine chat failed ({exc.response.status_code}): {detail}",
             ) from exc
         except httpx.HTTPError as exc:
             raise HTTPException(
-                status_code=502, detail=f"Halogen unreachable: {exc}"
+                status_code=502, detail=f"Engine unreachable: {exc}"
             ) from exc
+        finally:
+            if owns_client:
+                await client.close()
         return _sync_result(body.api, result, model)
 
     async def event_stream() -> AsyncIterator[str]:
         try:
-            async for chunk in state.halogen.stream_sse(
-                _upstream_path(body.api), payload, headers
-            ):
+            async for chunk in client.stream_sse(_upstream_path(body.api), payload, headers):
                 reasoning, content, done = extract(chunk)
                 if reasoning:
                     yield _sse("reasoning", {"text": reasoning})
@@ -332,10 +344,13 @@ async def chat(body: ChatRequest, request: Request) -> Any:
             detail = exc.response.text[:500] if exc.response is not None else str(exc)
             yield _sse(
                 "error",
-                {"message": f"Halogen chat failed ({exc.response.status_code}): {detail}"},
+                {"message": f"Engine chat failed ({exc.response.status_code}): {detail}"},
             )
         except httpx.HTTPError as exc:
-            yield _sse("error", {"message": f"Halogen unreachable: {exc}"})
+            yield _sse("error", {"message": f"Engine unreachable: {exc}"})
+        finally:
+            if owns_client:
+                await client.close()
 
     return StreamingResponse(
         event_stream(),

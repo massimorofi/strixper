@@ -25,12 +25,14 @@ logger = logging.getLogger(__name__)
 
 
 def _model_for_config(config_id: str) -> Optional[str]:
-    """The ``served_model_name`` a stored configuration declares, if any."""
+    """The best model identifier declared by a stored engine configuration."""
     cfg = runner.get_store().get(config_id) or {}
+    preferred = ("served_model_name", "model", "model_file")
     for param in cfg.get("parameters") or []:
-        if param.get("name") == "served_model_name":
+        if param.get("name") in preferred:
             value = (param.get("value") or "").strip()
-            return value or None
+            if value:
+                return value
     return None
 
 
@@ -53,6 +55,7 @@ def _make_adopted_hook(state: RuntimeState):
             run.config_name,
             model_name=_model_for_config(run.config_id),
         )
+        run.model_name = state.model_name
 
     return on_adopted
 
@@ -84,6 +87,7 @@ async def lifespan(app: FastAPI):
                 await reconcile
             except asyncio.CancelledError:
                 pass
+            await registry.shutdown()
 
 
 app = FastAPI(

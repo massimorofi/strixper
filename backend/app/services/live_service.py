@@ -114,6 +114,34 @@ class StatsTracker:
         self.total_samples = 0
 
 
+class PromptRateTracker:
+    """Measure completed prefill throughput from cumulative engine counters."""
+
+    def __init__(self) -> None:
+        self._tokens: Optional[float] = None
+        self._seconds: Optional[float] = None
+
+    def update(
+        self, tokens: Optional[float], seconds: Optional[float]
+    ) -> Optional[float]:
+        if tokens is None or seconds is None:
+            return None
+
+        previous_tokens = self._tokens
+        previous_seconds = self._seconds
+        self._tokens = tokens
+        self._seconds = seconds
+
+        if previous_tokens is None or previous_seconds is None:
+            return None
+
+        token_delta = tokens - previous_tokens
+        second_delta = seconds - previous_seconds
+        if token_delta <= 0 or second_delta <= 0:
+            return None
+        return token_delta / second_delta
+
+
 class RuntimeState:
     """Mutable runtime state shared between the poller and the API routers."""
 
@@ -131,6 +159,9 @@ class RuntimeState:
         self.monitor: SystemMonitor = SystemMonitor()
         self.rocm: RocmMonitor = RocmMonitor()
         self.stats: StatsTracker = StatsTracker()
+        self.engine_stats: dict[str, StatsTracker] = {}
+        self.prompt_rate_tracker: PromptRateTracker = PromptRateTracker()
+        self.engine_prompt_rate_trackers: dict[str, PromptRateTracker] = {}
         # Which LLM-Runner configuration the current engine came from, for
         # display. None when the target is the startup default.
         self.engine_config_id: Optional[str] = (saved or {}).get("config_id")
@@ -226,11 +257,19 @@ async def build_live_snapshot(state: RuntimeState) -> dict[str, Any]:
     hardware["rocm"] = rocm_data
 
     # Accumulate session-wide statistics (since startup / last reset).
+    prompt_rate = state.prompt_rate_tracker.update(
+        halogen_data.get("prompt_tokens_total"),
+        halogen_data.get("prompt_seconds_total"),
+    )
     draft_rate = halogen_data.get("draft_acceptance_rate")
     cache = halogen_data.get("cache") or {}
     state.stats.record(
         {
-            "prompt_tps": halogen_data.get("prompt_tokens_per_sec"),
+            "prompt_tps": (
+                prompt_rate
+                if prompt_rate is not None
+                else halogen_data.get("prompt_tokens_per_sec")
+            ),
             "decode_tps": halogen_data.get("predicted_tokens_per_sec"),
             "gtt_used_gb": hardware.get("gpu", {}).get("gtt_used_gb"),
             "gtt_pct": hardware.get("gpu", {}).get("gtt_usage_pct"),
@@ -258,6 +297,81 @@ async def build_live_snapshot(state: RuntimeState) -> dict[str, Any]:
         "halogen": halogen_data,
         "hardware": hardware,
         "stats": state.stats.snapshot(),
+    }
+
+
+async def build_run_snapshot(
+    state: RuntimeState, run_id: str, base_url: str
+) -> dict[str, Any]:
+    """Poll one managed engine without changing the dashboard's default target."""
+    client = HalogenClient(base_url)
+    try:
+        halogen_result, rocm_result = await asyncio.gather(
+            client.snapshot(),
+            state.rocm.snapshot(),
+            return_exceptions=True,
+        )
+    finally:
+        await client.close()
+
+    if isinstance(halogen_result, BaseException):
+        halogen_data = {"status": "unreachable", "error": str(halogen_result)}
+        connected = False
+    else:
+        halogen_data = halogen_result
+        connected = True
+
+    if isinstance(rocm_result, BaseException):
+        rocm_data = {"available": False, "error": str(rocm_result)}
+    else:
+        rocm_data = rocm_result
+
+    hardware = state.monitor.snapshot()
+    hardware["rocm"] = rocm_data
+    stats = state.engine_stats.setdefault(run_id, StatsTracker())
+    prompt_rate_tracker = state.engine_prompt_rate_trackers.setdefault(
+        run_id, PromptRateTracker()
+    )
+    prompt_rate = prompt_rate_tracker.update(
+        halogen_data.get("prompt_tokens_total"),
+        halogen_data.get("prompt_seconds_total"),
+    )
+    cache = halogen_data.get("cache") or {}
+    draft_rate = halogen_data.get("draft_acceptance_rate")
+    stats.record(
+        {
+            "prompt_tps": (
+                prompt_rate
+                if prompt_rate is not None
+                else halogen_data.get("prompt_tokens_per_sec")
+            ),
+            "decode_tps": halogen_data.get("predicted_tokens_per_sec"),
+            "gtt_used_gb": hardware.get("gpu", {}).get("gtt_used_gb"),
+            "gtt_pct": hardware.get("gpu", {}).get("gtt_usage_pct"),
+            "vram_pct": rocm_data.get("vram_usage_pct"),
+            "gpu_util_pct": rocm_data.get("gpu_util_pct"),
+            "cpu_pct": hardware.get("cpu", {}).get("usage_pct"),
+            "draft_acceptance": (
+                draft_rate * 100 if draft_rate is not None else None
+            ),
+            "cache_hit_rate": (
+                cache.get("hit_rate") * 100
+                if cache.get("hit_rate") is not None
+                else None
+            ),
+            "cache_token_hit_rate": (
+                cache.get("token_hit_rate") * 100
+                if cache.get("token_hit_rate") is not None
+                else None
+            ),
+        }
+    )
+    return {
+        "timestamp": utc_now_iso(),
+        "connected": connected,
+        "halogen": halogen_data,
+        "hardware": hardware,
+        "stats": stats.snapshot(),
     }
 
 

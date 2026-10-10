@@ -45,7 +45,9 @@ def _clip(value: Any, limit: int) -> str:
     return text
 
 
-def build_tools(state: "RuntimeState", allow_actions: bool) -> list[FunctionTool]:
+def build_tools(
+    state: "RuntimeState", allow_actions: bool, run_id: str | None = None
+) -> list[FunctionTool]:
     """Build the tool set bound to the current runtime state.
 
     Args:
@@ -53,6 +55,21 @@ def build_tools(state: "RuntimeState", allow_actions: bool) -> list[FunctionTool
         allow_actions: Include the engine start/stop tools. These control
             containers through docker and are root-equivalent on the host.
     """
+
+    from .run_registry import registry
+
+    run = registry.get_run(run_id) if run_id else None
+
+    async def engine_call(method: str, *args: Any, **kwargs: Any) -> Any:
+        if run is None or not run.engine_url:
+            return await getattr(state.halogen, method)(*args, **kwargs)
+        from .halogen_client import HalogenClient
+
+        client = HalogenClient(run.engine_url)
+        try:
+            return await getattr(client, method)(*args, **kwargs)
+        finally:
+            await client.close()
 
     # -- read-only tools ------------------------------------------------------
 
@@ -65,9 +82,14 @@ def build_tools(state: "RuntimeState", allow_actions: bool) -> list[FunctionTool
         load, and session throughput averages. Use this for any question
         about what the system is doing right now.
         """
-        from .live_service import build_live_snapshot
+        from .live_service import build_live_snapshot, build_run_snapshot
 
-        return _clip(await build_live_snapshot(state), 6000)
+        snapshot = (
+            await build_run_snapshot(state, run.run_id, run.engine_url)
+            if run is not None and run.engine_url
+            else await build_live_snapshot(state)
+        )
+        return _clip(snapshot, 6000)
 
     @function_tool
     async def get_engine_health() -> str:
@@ -78,7 +100,7 @@ def build_tools(state: "RuntimeState", allow_actions: bool) -> list[FunctionTool
         check whether the engine is reachable and what it actually serves,
         as opposed to what the dashboard was configured to expect.
         """
-        return _clip(await state.halogen.get_health(), 4000)
+        return _clip(await engine_call("get_health"), 4000)
 
     @function_tool
     async def get_engine_metrics() -> str:
@@ -89,7 +111,7 @@ def build_tools(state: "RuntimeState", allow_actions: bool) -> list[FunctionTool
         aggregated snapshot is missing a number, or when asked about one
         specific metric.
         """
-        return _clip(await state.halogen.get_metrics(), 6000)
+        return _clip(await engine_call("get_metrics"), 6000)
 
     @function_tool
     async def get_cache_stats() -> str:
@@ -98,7 +120,7 @@ def build_tools(state: "RuntimeState", allow_actions: bool) -> list[FunctionTool
         Returns cache hit and miss counts and the derived hit ratio.
         Useful when reasoning about why prefill is fast or slow.
         """
-        return _clip(await state.halogen.get_cache(), 3000)
+        return _clip(await engine_call("get_cache"), 3000)
 
     @function_tool
     async def run_tuning_check() -> str:
@@ -132,8 +154,10 @@ def build_tools(state: "RuntimeState", allow_actions: bool) -> list[FunctionTool
         including chat-template overhead. Use this before drafting a long
         prompt so it fits the context window.
         """
-        result = await state.halogen.count_tokens(
-            messages=[{"role": "user", "content": text}], model=state.model_name
+        result = await engine_call(
+            "count_tokens",
+            messages=[{"role": "user", "content": text}],
+            model=(run.model_name if run else None) or state.model_name,
         )
         count = result.get("input_tokens")
         return int(count) if isinstance(count, int) else 0
@@ -162,17 +186,14 @@ def build_tools(state: "RuntimeState", allow_actions: bool) -> list[FunctionTool
 
     @function_tool
     async def get_active_run() -> str:
-        """Report which engine run, if any, is currently active.
+        """List all currently running engine runs.
 
-        Returns the run id, config name, container name, engine URL,
-        start time, status, and any engine-switch error.
+        Each entry includes its run id, config name, container name,
+        engine URL, start time, status, and any engine-switch error.
         """
         from .run_registry import registry
 
-        run = registry.get_active()
-        if run is None:
-            return json.dumps({"active": None, "message": "no engine run is active"})
-        return _clip({"active": run.summary()}, 2000)
+        return _clip({"running": [item.summary() for item in registry.get_running()]}, 3000)
 
     tools: list[FunctionTool] = [
         get_live_status,
@@ -195,8 +216,8 @@ def build_tools(state: "RuntimeState", allow_actions: bool) -> list[FunctionTool
     async def start_engine(config_id: str) -> str:
         """Start the engine for a saved configuration.
 
-        Any currently running engine is stopped first: only one engine can
-        hold the GPU at a time. This is a real, disruptive action.
+        Starts this engine alongside any existing runs. A sufficiently
+        provisioned host is required to run multiple engines concurrently.
 
         Args:
             config_id: The configuration id from list_runner_configs.
@@ -212,29 +233,20 @@ def build_tools(state: "RuntimeState", allow_actions: bool) -> list[FunctionTool
 
     @function_tool
     async def stop_engine(run_id: str) -> str:
-        """Stop the currently running engine container.
+        """Stop one running engine container.
 
         Args:
-            run_id: The run id from get_active_run. It must match the
-                active run; stopping a run that has already been replaced
-                is refused.
+            run_id: The run id from get_active_run.
 
         Returns the method that stopped it (docker stop, docker kill, or
         already exited).
         """
         from .run_registry import registry
 
-        run = registry.get_active()
+        run = registry.get_run(run_id)
         if run is None:
-            return json.dumps({"error": "no engine run is active"})
-        if run.run_id != run_id:
-            return json.dumps(
-                {
-                    "error": "run_id does not match the active run",
-                    "active_run_id": run.run_id,
-                }
-            )
-        method = await registry.stop_active()
+            return json.dumps({"error": f"run {run_id!r} was not found"})
+        method = await registry.stop(run_id)
         return _clip({"stopped": run_id, "method": method}, 1000)
 
     tools.extend([start_engine, stop_engine])

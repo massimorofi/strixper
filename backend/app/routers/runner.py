@@ -51,7 +51,12 @@ from ..services.engine_target import (
     engine_url,
     port_from_params,
 )
-from ..services.live_service import RuntimeState, set_engine_target
+from ..services.docker_control import extract_container_name
+from ..services.live_service import (
+    RuntimeState,
+    build_run_snapshot,
+    set_engine_target,
+)
 from ..services.params import (
     MAX_PARAMS,
     ParamError,
@@ -234,8 +239,15 @@ async def delete_config(config_id: str) -> dict[str, Any]:
     # A running engine was launched from this configuration and is still
     # holding its port and GPU. Deleting the config would leave a live
     # container with nothing describing it -- stop the run first.
-    active = registry.get_active()
-    if active is not None and active.status == "running" and active.config_id == config_id:
+    active = next(
+        (
+            run
+            for run in registry.get_running()
+            if run.config_id == config_id
+        ),
+        None,
+    )
+    if active is not None:
         raise HTTPException(
             status_code=409,
             detail=(
@@ -314,6 +326,11 @@ async def launch_config(
         command = render_command(cfg["docker_command"], params)
     except ParamError as exc:
         raise ValueError(str(exc)) from exc
+    if not extract_container_name(command):
+        raise ValueError(
+            "Docker command must include a unique --name so Strixper can track "
+            "and stop the engine container."
+        )
 
     try:
         run = await registry.start(
@@ -330,10 +347,14 @@ async def launch_config(
     # to launch cannot leave the dashboard pointed at nothing.
     engine_port = port_from_params(params)
     if engine_port is not None:
+        run.engine_url = engine_url(engine_port)
+        run.model_name = _param_value(params, "served_model_name") or _param_value(
+            params, "model_file"
+        )
         try:
             snapshot = await set_engine_target(
                 state,
-                engine_url(engine_port),
+                run.engine_url,
                 config_id,
                 cfg.get("name"),
                 # The chat needs the model id the engine actually serves.
@@ -346,6 +367,10 @@ async def launch_config(
             # The run itself is fine; only the switch failed. Say so rather
             # than leaving the user guessing why the live view is stale.
             run.engine_switch_error = str(exc)
+    else:
+        run.model_name = _param_value(params, "served_model_name") or _param_value(
+            params, "model_file"
+        )
 
     return run.summary()
 
@@ -378,14 +403,30 @@ async def run_config(
 
 @router.get("/runner/active")
 async def get_active_run() -> dict[str, Any]:
-    """The currently running engine, if any.
-
-    Cheap enough for the UI to poll so a run that exits on its own -- a
-    crash, an OOM -- is reflected in the buttons even with no console
-    stream open.
-    """
+    """Compatibility endpoint: the most recently started running engine."""
     run = registry.get_active()
     return {"active": run.summary() if run else None}
+
+
+@router.get("/runner/runs")
+async def get_runs() -> dict[str, Any]:
+    """List each currently running engine and its independent console identity."""
+    return {"runs": [run.summary() for run in registry.get_running()]}
+
+
+@router.get("/runner/runs/{run_id}/live-status")
+async def get_run_live_status(run_id: str, request: Request) -> dict[str, Any]:
+    run = registry.get_run(run_id)
+    if run is None or run.status != "running" or not run.engine_url:
+        raise HTTPException(status_code=404, detail="running engine not found")
+    snapshot = await build_run_snapshot(request.app.state.rt, run_id, run.engine_url)
+    model = snapshot.get("halogen", {}).get("model")
+    if model:
+        run.model_name = model
+    return {
+        **snapshot,
+        "run": run.summary(),
+    }
 
 
 @router.get("/runner/runs/{run_id}/stream")
@@ -395,9 +436,9 @@ async def watch_run(run_id: str) -> StreamingResponse:
     Disconnecting detaches the viewer and nothing else. The run keeps
     going -- stopping it is the Stop button's job, not the connection's.
     """
-    run = registry.get_active()
-    if run is None or run.run_id != run_id:
-        raise HTTPException(status_code=404, detail="run is not active")
+    run = registry.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
 
     return StreamingResponse(
         stream_console(run),
@@ -412,8 +453,17 @@ async def watch_run(run_id: str) -> StreamingResponse:
 
 @router.post("/runner/runs/{run_id}/stop")
 async def stop_run(run_id: str) -> dict[str, Any]:
-    run = registry.get_active()
-    if run is None or run.run_id != run_id:
-        raise HTTPException(status_code=404, detail="run is not active")
-    method = await registry.stop_active()
+    run = registry.get_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    method = await registry.stop(run_id)
     return {"stopped": run_id, "method": method}
+
+
+@router.post("/runner/stop-all")
+async def stop_all_runs() -> dict[str, Any]:
+    results = await registry.stop_all()
+    errors = {run_id: value for run_id, value in results.items() if value.startswith("error:")}
+    if errors:
+        raise HTTPException(status_code=502, detail={"stopped": results, "errors": errors})
+    return {"stopped": results}

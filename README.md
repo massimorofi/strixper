@@ -99,10 +99,12 @@ than failing:
 | **llama.cpp** | `llamacpp:` only | No | Not provided |
 
 Throughput, KV-cache usage, and token totals come from the `llamacpp:` metrics
-that all three expose, so those charts work on any engine. The `halogen:`
-counters and the `/cache` endpoint are Halogen-only and read as absent
-(`None` / `{}`) elsewhere — the dashboard degrades to the available fields
-rather than erroring.
+that all three can expose, so those charts work on any engine when metrics are
+enabled. **Stock `llama-server` disables `/metrics` by default**; its launch
+command must include `--metrics` (as the bundled ROCm10 Gemma configuration
+does). The `halogen:` counters and the `/cache` endpoint are Halogen-only and
+read as absent (`None` / `{}`) elsewhere — the dashboard degrades to the
+available fields rather than erroring.
 
 One asymmetry worth knowing: GUFO reports `llamacpp:prompt_tokens_cached_total`,
 but the dashboard reads cached-token counts from `halogen:prompt_tokens_cached_total`.
@@ -111,30 +113,40 @@ On GUFO that field therefore shows as unavailable even though the number exists.
 Configure a runnable engine in the **LLM-Runner** tab. See
 [strixper_prerequisites.md](./strixper_prerequisites.md) for the host, kernel,
 firmware, GPU driver, and engine/model setup checklist.
+Runner commands must give each container a unique Docker `--name`; Strixper
+uses that name to adopt, monitor, and reliably stop each engine.
 
 ## What it does
 
-- **Live Server Metrics** — polls the engine's `/health`, `/metrics` and
+- **Live Server Metrics** — provides one selectable tab per running engine and
+  polls that engine's `/health`, `/metrics` and
   `/v1/models` and reads local sysfs/procfs telemetry, rendering KPI cards and
   time-series charts (token throughput, KV pool, queue depth, host memory). The
   top **Throughput** card shows the **session average** prefill/decode rate
   rather than the instantaneous gauge, because the per-second throughput gauge
   reads 0 whenever the engine is idle.
+- **Parallel LLM engines** — start multiple distinct Runner configurations at
+  once. Each running engine has its own live console and metrics snapshot;
+  stopping one leaves the others running. The chat engine selector targets a
+  specific run.
 - **GPU Monitoring (rocm-smi)** — reads live GPU compute utilization and VRAM
   usage via `rocm-smi` and plots them alongside GTT and RAM in the memory chart.
   rocm-smi is the authoritative source: it reports higher VRAM usage than raw
   sysfs because it counts driver-reserved allocations.
 - **Session Statistics** — a min / avg / max table (prompt & decode token rate,
   GTT / VRAM usage, GPU utilization, CPU utilization, draft acceptance)
-  accumulated **since the server started**, with a **Reset statistics** button to
-  zero the counters and restart the clock. For the throughput, utilization and
-  acceptance series (prompt/decode t/s, GPU utilization, CPU utilization, draft
-  acceptance) **zero readings are excluded** from both the average and the
-  minimum — a 0 means "idle / not reporting yet", not a real measurement of zero.
+  accumulated for the selected engine since it was first polled (the default
+  target falls back to server-start time), with a **Reset statistics** button
+  that resets every engine's counters and restarts their clocks. For throughput,
+  utilization, and acceptance series (prompt/decode t/s, GPU utilization,
+  CPU utilization, draft acceptance) **zero readings are excluded** from both
+  the average and the minimum — a 0 means "idle / not reporting yet", not a
+  real measurement of zero.
 - **Prompt Cache & Token Counter** — a card with Halogen's prompt-cache telemetry
   (hit rate, tokens saved, stores/evictions, pool usage) and a widget that counts
   the exact token cost of any prompt before you send it.
-- **AI Chat** — a streaming chat tab with two modes. **Plain** is a classic
+- **AI Chat** — a streaming chat tab with an engine selector for choosing among
+  running engines, and two modes. **Plain** is a classic
   one-shot chat: type a request, watch the answer stream in token-by-token, and
   expand the model's chain-of-thought under each reply. Switch between
   Halogen's four inference API styles (**Chat Completions**, **Anthropic
@@ -364,6 +376,10 @@ The stream is normalized to `reasoning`, `delta`, `done` and `error` events so
 the UI is identical regardless of the chosen style. Set `stream: false` for a
 single JSON response instead.
 
+Assistant replies render as GitHub-flavoured Markdown, including tables and
+fenced code blocks. Use **Source** on a reply to switch between the rendered
+view and its original Markdown text.
+
 Your conversation is **not** cleared when you switch tabs — the chat stays
 mounted in the background, so you can check the metrics mid-chat and come back
 to it. It is also saved locally, so it survives a page reload. Use **Clear
@@ -561,11 +577,15 @@ sudo ufw allow 8000/tcp
 ./strixper.sh stop
 ```
 
-The script asks the backend to stop its active LLM-Runner engine before
+The script asks the backend to stop all registered LLM-Runner engines before
 stopping the dashboard. If the dashboard was already stopped, the script
-starts it briefly so it can adopt and stop a configured engine left running.
-Use this script rather than `docker stop strixper`; a direct Docker stop
-bypasses the script's engine cleanup.
+starts it briefly so it can adopt and stop configured engines left running.
+A graceful backend/container shutdown also attempts to stop every registered
+run, but a forced process kill can prevent that cleanup. The wrapper is still
+recommended because it calls the stop-all API and sweeps configured container
+names as a fallback if that API is unavailable. Only Strixper-managed runs and
+containers named by saved Runner configurations are stopped; unrelated Docker
+containers are left alone.
 
 Other useful actions:
 
@@ -575,10 +595,17 @@ Other useful actions:
 ./build_img.sh && ./strixper.sh recreate
 ```
 
-`recreate` stops the active engine, removes the dashboard container, then
+`recreate` stops all managed engines, removes the dashboard container, then
 creates it from the selected image while preserving the `strixper-data` volume.
 Set `STRIXPER_IMAGE` to select a different image tag, or `BIND_PORT` when
 creating the container to use a different listening port.
+
+The Docker container reads Runner configs from the **`strixper-data` volume**.
+The local, gitignored `backend/data/llm_runner_configs.json` is not mounted into
+that volume, so editing it on the host does not update an existing container.
+Create or edit configurations in the LLM-Runner UI (or through its API); if
+you already have a config in a separate local JSON file, import it through the
+API or create it in the UI.
 
 After running `./strixper.sh stop`, remove only the dashboard container with
 `docker rm strixper`; the named `strixper-data` volume remains available for
@@ -621,10 +648,10 @@ manages the dashboard container with these actions:
 | Command | Behavior |
 | --- | --- |
 | `./strixper.sh start` | Start the existing dashboard container or create it from the selected image |
-| `./strixper.sh stop` | Stop the active LLM-Runner run, stop any running containers named by saved Runner configurations, then stop Strixper |
+| `./strixper.sh stop` | Stop all registered LLM-Runner runs, stop any remaining containers named by saved Runner configurations, then stop Strixper |
 | `./strixper.sh restart` | Stop the managed stack and start the dashboard again |
 | `./strixper.sh recreate` | Stop managed engines, remove/recreate the dashboard container, and preserve its data volume |
-| `./strixper.sh status` | Show dashboard status and the active Runner engine, if any |
+| `./strixper.sh status` | Show dashboard status and all running Runner engines |
 
 Use this wrapper rather than `docker stop strixper` when stopping the stack:
 a direct Docker stop does not call the Runner API or stop its engine containers.

@@ -32,15 +32,17 @@ function fmtSince(iso) {
 
 export default function StatsSummary({ stats, onReset }) {
   const [resetting, setResetting] = useState(false)
+  const [resetError, setResetError] = useState('')
 
   const handleReset = async () => {
     if (!window.confirm('Reset all session statistics back to zero?')) return
     setResetting(true)
+    setResetError('')
     try {
       await resetStats()
       onReset?.()
-    } catch {
-      /* reset failed -- the next poll will show the unchanged state */
+    } catch (err) {
+      setResetError(err?.message || 'Failed to reset session statistics')
     } finally {
       setResetting(false)
     }
@@ -70,6 +72,11 @@ export default function StatsSummary({ stats, onReset }) {
           {resetting ? 'Resetting…' : 'Reset statistics'}
         </button>
       </div>
+      {resetError && (
+        <p className="mt-2 text-xs text-[var(--status-critical)]" role="alert">
+          {resetError}
+        </p>
+      )}
 
       <div className="mt-3 overflow-x-auto">
         <table className="w-full border-collapse text-sm">

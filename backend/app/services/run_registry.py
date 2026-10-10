@@ -23,11 +23,10 @@ Two ways a run comes into existence:
   so we follow ``docker logs -f`` instead. Same interface to the caller,
   same stop path.
 
-Concurrency note: every mutating method here is fully synchronous with no
-``await`` inside it, so each one is atomic with respect to other tasks on
-the event loop. That is deliberate -- it removes the need for locks around
-the buffer and the subscriber set. Locks appear only around operations that
-genuinely span an await: stopping, and switching from one run to the next.
+Concurrency note: console-buffer mutations are synchronous on the event
+loop, so they need no locks. Start/adopt setup is serialized by the registry
+lock; stopping uses a separate lock per run, allowing unrelated runs to stop
+independently.
 """
 
 from __future__ import annotations
@@ -198,6 +197,7 @@ class ActiveRun:
     # than launching it.
     adopted: bool = False
     engine_url: Optional[str] = None
+    model_name: Optional[str] = None
     engine_switch_error: str = ""
     console: ConsoleBuffer = field(default_factory=ConsoleBuffer)
 
@@ -220,6 +220,7 @@ class ActiveRun:
             "config_name": self.config_name,
             "container_name": self.container_name,
             "engine_url": self.engine_url,
+            "model_name": self.model_name,
             "started_at": self.started_at,
             "status": self.status,
             "exit_code": self.exit_code,
@@ -386,14 +387,24 @@ async def _pump(run: ActiveRun) -> None:
 
 
 class RunRegistry:
-    """Owns the single active run: start it, adopt one, stop it, watch it."""
+    """Owns concurrent engine runs: start, adopt, stop, and watch each one."""
 
     def __init__(self) -> None:
-        self.current: Optional[ActiveRun] = None
-        self._switch_lock = asyncio.Lock()
+        self.runs: dict[str, ActiveRun] = {}
+        self._lock = asyncio.Lock()
 
     def get_active(self) -> Optional[ActiveRun]:
-        return self.current
+        running = self.get_running()
+        return running[-1] if running else None
+
+    def get_run(self, run_id: str) -> Optional[ActiveRun]:
+        return self.runs.get(run_id)
+
+    def get_running(self) -> list[ActiveRun]:
+        return [run for run in self.runs.values() if run.status == "running"]
+
+    def list_runs(self) -> list[ActiveRun]:
+        return sorted(self.runs.values(), key=lambda run: run.started_at, reverse=True)
 
     async def start(
         self,
@@ -401,26 +412,26 @@ class RunRegistry:
         config_id: str,
         config_name: str,
     ) -> ActiveRun:
-        """Launch a new run, stopping any existing one first.
-
-        The old container is waited out rather than abandoned: two configs
-        that publish the same host port cannot coexist, and firing the new
-        start against a still-held port is exactly the failure a user sees
-        as a mysterious crash-on-start.
-        """
-        async with self._switch_lock:
-            await self._clear_locked()
-
+        """Launch a new run without disturbing any other engine."""
+        async with self._lock:
+            container_name = extract_container_name(command)
+            if container_name and any(
+                run.status == "running" and run.container_name == container_name
+                for run in self.runs.values()
+            ):
+                raise RuntimeError(
+                    f"container {container_name!r} is already tracked as running"
+                )
             run = ActiveRun(
                 run_id=uuid.uuid4().hex[:12],
                 config_id=config_id,
                 config_name=config_name,
-                container_name=extract_container_name(command),
+                container_name=container_name,
                 started_at=_utc_now(),
                 command=command,
             )
             await _launch(run, command)
-            self.current = run
+            self.runs[run.run_id] = run
             self._arm_pump(run)
             return run
 
@@ -432,9 +443,17 @@ class RunRegistry:
         command: str = "",
     ) -> Optional[ActiveRun]:
         """Take over a container this process did not start."""
-        async with self._switch_lock:
-            await self._clear_locked()
-
+        async with self._lock:
+            existing = next(
+                (
+                    run
+                    for run in self.runs.values()
+                    if run.status == "running" and run.container_name == container_name
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing
             proc = await _open_log_follow(container_name)
             if proc is None:
                 return None
@@ -452,69 +471,53 @@ class RunRegistry:
             run.proc = proc
             run.reader = proc.stdout
             run._following_logs = True
-            self.current = run
+            self.runs[run.run_id] = run
             self._arm_pump(run)
             return run
 
     def _arm_pump(self, run: ActiveRun) -> None:
-        """Start the pump, clearing the active slot when the run ends.
-
-        The pump exiting means the run is over whatever the reason, and
-        clearing here is what stops a dead run from being reported as
-        active to a browser polling /runner/active.
-        """
-
         async def wrapped() -> None:
             await _pump(run)
-            if self.current is run:
-                self.current = None
 
         # Keep the strong reference on the run itself: unreferenced tasks
         # can be garbage-collected mid-flight.
         run.pump_task = asyncio.create_task(wrapped())
 
-    async def _clear_locked(self) -> None:
-        """Stop the current run and wait for its resources to be released."""
-        current = self.current
-        if current is None:
-            return
-        if current.status != "running":
-            self.current = None
-            return
-
-        try:
-            await current.stop()
-        except Exception as exc:  # noqa: BLE001 -- a failed stop must not block
-            logger.warning("could not stop previous run %s: %s", current.run_id, exc)
-        self.current = None
-
-        if current.container_name:
-            await _wait_until_gone(current.container_name)
+    async def stop(self, run_id: str) -> Optional[str]:
+        """Stop one run, leaving every other engine untouched."""
+        run = self.runs.get(run_id)
+        if run is None or run.status != "running":
+            return None
+        method = await run.stop()
+        if run.container_name:
+            await _wait_until_gone(run.container_name)
+        return method
 
     async def stop_active(self) -> Optional[str]:
-        """Stop whatever is running and clear it. No-op if nothing is."""
-        async with self._switch_lock:
-            run = self.current
-            if run is None:
-                return None
-            method = await run.stop()
-            self.current = None
-            return method
+        """Compatibility helper: stop the most recently started running run."""
+        run = self.get_active()
+        return await self.stop(run.run_id) if run is not None else None
+
+    async def stop_all(self) -> dict[str, str]:
+        """Stop every running engine and report each stop result."""
+        runs = list(reversed(self.get_running()))
+
+        async def stop_one(run: ActiveRun) -> tuple[str, str]:
+            try:
+                return run.run_id, await self.stop(run.run_id) or "already_exited"
+            except Exception as exc:
+                logger.exception("could not stop run %s", run.run_id)
+                return run.run_id, f"error: {exc}"
+
+        return dict(await asyncio.gather(*(stop_one(run) for run in runs)))
 
     async def shutdown(self) -> None:
-        """Backend is going down.
-
-        The container is deliberately left running: an engine that outlives
-        this process is picked up again by the next one, which is the
-        whole point of treating a run as a server-side resource. Tearing
-        it down here would mean a backend restart silently takes down a
-        serving engine.
-        """
-        async with self._switch_lock:
-            run = self.current
-            self.current = None
-            if run is None:
-                return
+        """Stop managed engines and release console-pump resources."""
+        results = await self.stop_all()
+        for run_id, result in results.items():
+            if result.startswith("error:"):
+                logger.error("engine run %s was not stopped during shutdown: %s", run_id, result)
+        for run in self.runs.values():
             if run.pump_task is not None and not run.pump_task.done():
                 run.pump_task.cancel()
                 try:
@@ -528,8 +531,8 @@ class RunRegistry:
         self,
         configs: list[dict[str, Any]],
         on_adopted: Optional[Callable[[ActiveRun], Awaitable[None]]] = None,
-    ) -> Optional[ActiveRun]:
-        """Find an engine container that is already running, and adopt it.
+    ) -> list[ActiveRun]:
+        """Find all configured engine containers already running, and adopt them.
 
         A container outlives the process that launched it, so after a
         backend restart -- or when something outside this dashboard
@@ -543,18 +546,21 @@ class RunRegistry:
         would actually run, rather than a stored string that may have
         drifted, is the point.
         """
-        if self.current is not None and self.current.status == "running":
-            return self.current
-
         running = set(await list_running_names())
         if not running:
-            return None
+            return []
 
+        adopted: list[ActiveRun] = []
         for cfg in configs or []:
             name = rendered_container_name(cfg)
             if not name or name not in running:
                 continue
 
+            if any(
+                run.status == "running" and run.container_name == name
+                for run in self.runs.values()
+            ):
+                continue
             run = await self.adopt(
                 container_name=name,
                 config_id=cfg.get("id", ""),
@@ -573,8 +579,8 @@ class RunRegistry:
                     run.engine_switch_error = str(exc)
 
             logger.info("adopted already-running engine %s (config %r)", name, cfg.get("name"))
-            return run
-        return None
+            adopted.append(run)
+        return adopted
 
 
 async def _wait_until_gone(name: str, timeout: float = RELEASE_WAIT_SECONDS) -> bool:
@@ -719,9 +725,6 @@ async def reconcile_loop(
     while True:
         await asyncio.sleep(interval)
         try:
-            current = reg.get_active()
-            if current is not None and current.status == "running":
-                continue
             await reg.discover(get_configs(), on_adopted=on_adopted)
         except asyncio.CancelledError:
             raise

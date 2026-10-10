@@ -121,19 +121,9 @@ stop_stack() {
     docker start "$CONTAINER_NAME" >/dev/null
   fi
 
-  local port active_json run_id engine_names engine_name running
+  local port engine_names engine_name running engine_cleanup_failed=0
   port="$(container_port)"
   wait_for_api "$port"
-  active_json="$(curl --fail --silent --show-error --max-time 10 \
-    "http://127.0.0.1:${port}/api/v1/runner/active")" || {
-      echo "[strixper] ERROR: could not query the active LLM-Runner process; leaving dashboard running." >&2
-      return 1
-    }
-  run_id="$(printf '%s' "$active_json" | python3 -c \
-    'import json,sys; data=json.load(sys.stdin); active=data.get("active"); print(active.get("run_id", "") if isinstance(active, dict) else "")')" || {
-      echo "[strixper] ERROR: could not parse the active LLM-Runner response; leaving dashboard running." >&2
-      return 1
-    }
 
   engine_names="$(python3 - "$port" <<'PY'
 import json
@@ -173,16 +163,11 @@ PY
     return 1
   }
 
-  if [[ -n "$run_id" ]]; then
-    echo "[strixper] Stopping active LLM engine run ${run_id}."
-    curl --fail --silent --show-error --max-time 45 \
-      -X POST "http://127.0.0.1:${port}/api/v1/runner/runs/${run_id}/stop" >/dev/null || {
-        echo "[strixper] ERROR: engine stop failed; leaving dashboard running." >&2
-        return 1
-      }
-  else
-    echo "[strixper] No active configured LLM engine run found."
-  fi
+  echo "[strixper] Stopping all registered LLM engine runs."
+  curl --fail --silent --show-error --max-time 300 \
+    -X POST "http://127.0.0.1:${port}/api/v1/runner/stop-all" >/dev/null || {
+      echo "[strixper] WARNING: stop-all API is unavailable or reported a failure; stopping containers from saved configurations directly." >&2
+    }
 
   while IFS= read -r engine_name; do
     [[ -n "$engine_name" ]] || continue
@@ -190,12 +175,17 @@ PY
       if [[ "$running" == "true" ]]; then
         echo "[strixper] Stopping configured engine container ${engine_name}."
         docker stop --time 30 "$engine_name" >/dev/null || {
-          echo "[strixper] ERROR: could not stop engine container ${engine_name}; leaving dashboard running." >&2
-          return 1
+          echo "[strixper] ERROR: could not stop engine container ${engine_name}." >&2
+          engine_cleanup_failed=1
         }
       fi
     fi
   done <<< "$engine_names"
+
+  if [[ "$engine_cleanup_failed" == "1" ]]; then
+    echo "[strixper] ERROR: one or more configured engine containers could not be stopped; leaving dashboard running for recovery." >&2
+    return 1
+  fi
 
   echo "[strixper] Stopping dashboard container."
   docker stop --time 30 "$CONTAINER_NAME" >/dev/null
@@ -229,8 +219,8 @@ case "$ACTION" in
       --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
     if container_running; then
       curl --fail --silent --show-error --max-time 10 \
-        "http://127.0.0.1:$(container_port)/api/v1/runner/active" | \
-        python3 -c 'import json,sys; data=json.load(sys.stdin); active=data.get("active"); print("[strixper] Active engine:", active.get("container_name") or active.get("run_id") if active else "none")'
+        "http://127.0.0.1:$(container_port)/api/v1/runner/runs" | \
+        python3 -c 'import json,sys; runs=json.load(sys.stdin).get("runs", []); print("[strixper] Running engines:", ", ".join((r.get("config_name") or r.get("container_name") or r.get("run_id", "?")) for r in runs) if runs else "none")'
     fi
     ;;
 esac

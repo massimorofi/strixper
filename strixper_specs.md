@@ -68,9 +68,10 @@ v                                               v
 
 ### 1.2 Core Capabilities
 
-1. **Live Metrics Polling** — an async backend poller reads Halogen's `/health`,
-   `/metrics`, `/v1/models` and `/cache` at a configurable interval (default
-   **5 s**) and merges them with local hardware telemetry into one snapshot.
+1. **Live Metrics Polling** — each managed engine is polled at the UI cadence
+   through its own `/health`, `/metrics`, `/v1/models` and `/cache` endpoints;
+   each snapshot is merged with shared local hardware telemetry. The default
+   engine target remains available when no managed run is selected.
 2. **Local Hardware Telemetry** — GTT/VRAM from amdgpu `sysfs`, RAM/CPU from
    `procfs`.
 3. **GPU Monitoring via `rocm-smi`** — a short-lived `rocm-smi` subprocess per
@@ -101,12 +102,15 @@ v                                               v
    shell, Python execution, file I/O). See §3.3
    (`POST /api/v1/agent/chat`), §4.11 (`agent_tools`) and §4.12
    (`agent_exec_tools`).
-9. **LLM-Runner** — a tab to create, run and locally store the docker command
+9. **Parallel LLM engines** — multiple distinct Runner configurations can run
+   concurrently. Each run has its own run ID, console stream, metrics polling,
+   and engine URL; stopping one does not stop the others. The stack stop script
+   stops all registered runs before stopping Strixper.
+10. **LLM-Runner** — a tab to create, run and locally store the docker command
    used to launch a containerized LLM inference server. Configurations are kept
-   in a JSON file on disk, listed for selection, editable, and each can be
-   started with a button that streams the container's live output; a running
-   container can be stopped on demand. See §3.3 (runner endpoints), §4.6
-   (`RunnerStore`) and §5.5 (Tab 4).
+   in a JSON file on disk, listed for selection, editable, and started with
+   per-engine console tabs; each run can be stopped on demand. See §3.3
+   (runner endpoints), §4.6 (`RunnerStore`) and §5.5 (Tab 4).
 
 ---
 
@@ -186,10 +190,13 @@ All endpoints are mounted under the `/api/v1` prefix.
 | `/api/v1/runner/configs/{id}` | `PUT` | On-demand (LLM-Runner tab) | Edit an existing configuration |
 | `/api/v1/runner/configs/{id}` | `DELETE` | On-demand (LLM-Runner tab) | Delete a configuration |
 | `/api/v1/runner/configs/{id}/run` | `POST` | On-demand (LLM-Runner tab) | Start the rendered docker command (returns JSON) |
-| `/api/v1/runner/active` | `GET` | Polled ~3 s (LLM-Runner tab) | The run currently live, or `null` |
+| `/api/v1/runner/active` | `GET` | Compatibility | Most recently started run, or `null` |
+| `/api/v1/runner/runs` | `GET` | Polled ~3 s (Runner, Chat) | All currently running engine runs |
+| `/api/v1/runner/runs/{run_id}/live-status` | `GET` | Polled (Live Metrics) | Per-engine metrics and shared host telemetry |
 | `/api/v1/runner/preview` | `POST` | On-demand (LLM-Runner tab) | Render a command template against its parameters, without running |
 | `/api/v1/runner/runs/{run_id}/stream` | `GET` | Per viewer (LLM-Runner tab) | Attach to the live console (SSE) |
 | `/api/v1/runner/runs/{run_id}/stop` | `POST` | On-demand (LLM-Runner tab) | Stop a running docker command |
+| `/api/v1/runner/stop-all` | `POST` | Stack shutdown | Stop every managed engine run |
 | `/api/v1/healthz` | `GET` | On-demand | Backend's own liveness (independent of Halogen) |
 
 Interactive API docs are served at `http://<host>:8000/docs`.
@@ -816,17 +823,20 @@ payloads to the `halogen` section:
 | `prompt_tokens_per_sec` | `llamacpp:prompt_tokens_seconds` |
 | `predicted_tokens_per_sec` | `llamacpp:predicted_tokens_seconds` |
 | `prompt_tokens_total` | `llamacpp:prompt_tokens_total` |
+| `prompt_seconds_total` | `llamacpp:prompt_seconds_total` |
 | `tokens_predicted_total` | `llamacpp:tokens_predicted_total` |
 | `prompt_tokens_cached_total` | `halogen:prompt_tokens_cached_total` |
 | `draft_acceptance_rate` | `halogen:draft_tokens_accepted_total / halogen:draft_tokens_total` (rounded 4dp) |
 | `cache` | `GET /cache` payload passed through verbatim (empty `{}` if unavailable) |
 
 **Metric namespaces are not uniform across engines.** The `llamacpp:` keys come
-from `llama.cpp`'s own Prometheus exporter and are therefore present under
-GUFO and a stock `llama-server` as well; the `halogen:` keys and the `/cache`
-endpoint are Halogen-specific. The mapping above already reflects this: the
-throughput, KV-usage, and token-total fields read from `llamacpp:` and work on
-any engine, while `kv_pool_positions`, `prompt_tokens_cached_total`,
+from `llama.cpp`'s own Prometheus exporter and are therefore available under
+GUFO and `llama-server` when metrics are enabled; stock `llama-server` disables
+the `/metrics` endpoint by default and requires `--metrics`. The ROCm10 Gemma
+Runner configuration includes this flag. The `halogen:` keys and the `/cache`
+endpoint are Halogen-specific. The mapping above reflects this: the throughput,
+KV-usage, and token-total fields read from `llamacpp:` and work on engines
+exposing metrics, while `kv_pool_positions`, `prompt_tokens_cached_total`,
 `draft_acceptance_rate`, and `cache` depend on Halogen and read as absent
 (`None` / `{}`) elsewhere. Nothing in the merge raises on a missing key, so a
 non-Halogen engine yields a partially populated snapshot rather than an
@@ -838,7 +848,7 @@ Verified against the shipped binaries rather than assumed:
 | --- | --- | --- | --- | --- |
 | Halogen | Yes | Yes | Yes | Yes |
 | GUFO | No | Yes | No | Yes |
-| `llama-server` | No | Yes | No | No |
+| `llama-server` (with `--metrics`) | No | Yes | No | No |
 
 (Confirmed by inspecting the shipped binaries: the route strings compiled into
 `gufo` include `/v1/messages/count_tokens`; the `llama-server` build in the
@@ -991,6 +1001,11 @@ Persists the LLM-Runner docker configurations to a JSON file on disk.
     engine appended to the file by hand disappears the moment a config is saved
     from the UI.
   Edit the file with the backend stopped, or use the LLM-Runner UI.
+* **Docker data is volume-backed.** `strixper.sh` mounts the named
+  `strixper-data` volume at `/app/backend/data`; the host checkout's ignored
+  `backend/data/llm_runner_configs.json` is not mounted. Host-side changes to
+  that file therefore do not appear in Docker. Create configs in the UI/API or
+  explicitly import them into the volume-backed store.
 * `list()`, `get(id)`, `create(...)`, `update(id, ...)`, `delete(id)`.
 
 The router (`routers/runner.py`) holds one lazily-created store instance and a
@@ -1058,8 +1073,8 @@ through the docker CLI.
   `halt_method` back. Nothing stops a run on browser disconnect any more —
   see §4.10.
 * **Fallback chain.** `docker stop` → `docker kill` → kill the client process.
-  A run whose command has no `--name` reports `method: "process"` and can
-  still orphan its container; configurations should always pass `--name`.
+  A run command without a Docker `--name` is rejected before launch; this is
+  required so Strixper can reliably track, adopt, and stop every engine.
 * **`list_running_names()`** — `docker ps --format {{.Names}}`, `[]` on any
   failure. One call rather than one `inspect` per configuration, because
   discovery runs on a timer.
@@ -1069,13 +1084,14 @@ through the docker CLI.
 
 ### 4.9 `engine_target` (`services/engine_target.py`)
 
-Which engine the dashboard reads its live metrics from.
+The default engine target used by the compatibility live-status endpoint and
+manual target editor. Managed engines have independent per-run targets.
 
-**Why this exists.** `HALOGEN_HOST` is read once at process launch, so a
-dashboard configured for one engine can never see another. Running a second
-engine — a different model, a different server, a different port — left the
-live view polling a dead address. The target is now a piece of runtime state
-rather than a startup constant.
+**Why this exists.** `HALOGEN_HOST` is read once at process launch, so the
+dashboard could not follow Runner-launched engines on other ports. The default
+target remains runtime state, while each managed run also stores its own
+engine URL so multiple engines can be polled without changing one another's
+target.
 
 * **Two different addresses, deliberately not conflated.**
   - `bind` (a *configuration parameter*, rendered into `-p {bind}:{port}`)
@@ -1205,22 +1221,19 @@ run does not care. It is stopped only by an explicit stop.
 
 * **No locks around the buffer or the subscriber set, deliberately.** Every
   mutating method there is fully synchronous with no `await` inside it, so
-  each is atomic with respect to other tasks on the event loop. Locks appear
-  only around work that genuinely spans an await: stopping, and switching
-  from one run to the next (`_switch_lock`).
+  each is atomic with respect to other tasks on the event loop. Each run has
+  its own stop lock; the registry serializes start/adopt operations while
+  leaving already-running engines alone.
 
-* **Switching runs awaits the old stop.** Two stored configurations that
-  publish the same host port cannot coexist. Starting a run stops the
-  current one and then `_wait_until_gone()` polls until docker reports the
-  old container actually gone (up to `RUNNER_RELEASE_WAIT`) before
-  launching, because firing the new start against a still-held port is the
-  failure that reads as a mysterious crash-on-start. The *new*
-  configuration is validated — rendered, container name extracted — before
-  anything running is touched, so a typo in the new config cannot take down
-  a working engine.
+* **Independent concurrent runs.** Starting a run does not stop any existing
+  engine. A duplicate container name is rejected; otherwise each engine
+  receives its own run ID, output pump, console buffer, stop lock and metrics
+  target. Configurations that publish the same host port still conflict at
+  Docker/network level and need distinct ports.
 
 * **Reconcile, not a one-shot scan.** Adoption runs at startup *and* on a
-  timer (`RUNNER_RECONCILE`, default 20 s) whenever nothing is active. A
+  timer (`RUNNER_RECONCILE`, default 20 s), including while other runs are
+  active, so discovering one engine never blocks adoption of another. A
   startup-only scan has a hole in it: if the backend restarts while
   `docker run` is still pulling an image, the container does not exist
   yet, nothing adopts it, and the dashboard stays blind to it forever. The
@@ -1232,10 +1245,11 @@ run does not care. It is stopped only by an explicit stop.
   container is up (`docker ps`). Matching against what would actually run,
   rather than a stored string that may have drifted, is the point.
 
-* **Backend shutdown leaves containers running.** Deliberate, and
-  consistent with "on open, detect which engine is running": a restart of
-  the dashboard should not silently take down an engine that is serving.
-  The next startup adopts it again.
+* **Graceful backend shutdown stops every managed run.** The registry stops
+  all tracked engine containers concurrently before releasing console pumps.
+  `strixper.sh stop` calls the stop-all API first and sweeps saved container
+  names as a recovery path. After an ungraceful process kill, startup discovery
+  can still adopt any surviving configured containers.
 
 * **Deleting a running configuration is refused** with `409`. It would
   leave a live container with nothing describing it. Stop the run first.
@@ -1244,7 +1258,7 @@ run does not care. It is stopped only by an explicit stop.
 
 Builds the tool set handed to the agent for a single request.
 
-* `build_tools(state, allow_actions)` → `list[FunctionTool]`.
+* `build_tools(state, allow_actions, run_id=None)` → `list[FunctionTool]`.
   A **new list is built per request**, not once at import: the SDK binds the
   enabled/disabled decision and the closure over `state` at decoration time, so
   a module-level list would freeze the permission set forever.
@@ -1253,13 +1267,13 @@ Builds the tool set handed to the agent for a single request.
 
 | Tool | Backing |
 | --- | --- |
-| `get_live_status` | `build_live_snapshot` / live snapshot |
-| `get_engine_health` | `HalogenClient.get_health` |
-| `get_engine_metrics` | `HalogenClient.get_metrics` |
-| `get_cache_stats` | `HalogenClient.get_cache` |
+| `get_live_status` | `build_run_snapshot` for selected run, otherwise default live snapshot |
+| `get_engine_health` | Selected run's Halogen client `get_health` |
+| `get_engine_metrics` | Selected run's Halogen client `get_metrics` |
+| `get_cache_stats` | Selected run's Halogen client `get_cache` |
 | `run_tuning_check` | `tuning_checker.run_all_checks` |
 | `get_system_info` | `tuning_checker.get_system_info` |
-| `count_prompt_tokens` | `HalogenClient.count_tokens` |
+| `count_prompt_tokens` | Selected run's Halogen client `count_tokens` |
 | `list_runner_configs` | `runner_store` via `runner.get_store` |
 | `get_active_run` | `run_registry.registry` |
 
@@ -1268,11 +1282,10 @@ Builds the tool set handed to the agent for a single request.
 | Tool | Backing | Effect |
 | --- | --- | --- |
 | `start_engine` | `runner.launch_config(state, config_id)` | Starts a saved run configuration |
-| `stop_engine` | `registry.stop_active()` | Stops the active run |
+| `stop_engine` | `registry.stop(run_id)` | Stops only the requested run |
 
-`stop_engine` verifies that the `run_id` the model passes matches the run the
-registry believes is active before stopping, so a hallucinated id cannot stop
-something else.
+`stop_engine` looks up the exact `run_id` before stopping; it does not stop
+other concurrent engines.
 
 **Every tool returns a JSON string, clipped.** `_clip()` serialises the payload
 and truncates it. Raw `/metrics` output is several tens of kilobytes; feeding it
@@ -1393,6 +1406,11 @@ site, from both the host venv and inside the built image.
 
 Layout, top to bottom:
 
+When Runner engines are running, a tab strip selects the engine whose
+independent live metrics and history are shown. Host CPU, memory, and GPU
+telemetry is shared because all engines use the same machine. With no managed
+run, this page displays the configured default engine target.
+
 **A. Primary KPI cards (4-up grid).** Each card has an **info button** (top-right
 `ⓘ`) that opens a modal explaining the measure.
 
@@ -1459,10 +1477,18 @@ a controls bar, a scrolling message list, and a composer.
 
 **Controls bar (top).**
 
+* **Engine selector** — lists all running LLM engine runs. Each chat request
+  includes the selected `run_id`; if that run stops during a conversation the
+  backend rejects the stale selection instead of silently sending the request
+  to another engine.
 * **Agent** — checkbox (default on). Off, the tab is the classic one-shot chat
   described below. On, every request goes to `POST /api/v1/agent/chat` and the
   agentic loop takes over (§3.3). The API selector is hidden in Agent mode: the
   SDK owns request routing, so the four-style switch no longer applies.
+* **Engine selector** — lists each running LLM-Runner run. The selected `run_id`
+  is included in plain and agent requests. If that run stops, the backend
+  rejects the stale ID instead of silently switching the request to another
+  engine.
 * **Allow actions** — shown only when Agent is on. Tick it and the agent is
   additionally given `start_engine` and `stop_engine`. Off by default. This is
   enforced by which tools are registered server-side, not by asking the model to
@@ -1487,10 +1513,13 @@ turns as left-aligned bubbles with an avatar. Each assistant bubble contains:
 * In Agent mode, a **collapsible Actions panel** (collapsed by default, styled
   like the reasoning block) listing each tool call and a one-line summary of its
   result, in call order.
-* The **answer text**, streamed in live with a blinking caret while generating.
+* The **answer**, rendered as GitHub-flavoured Markdown (including tables and
+  fenced code blocks) and streamed live with a blinking caret while generating.
+  After generation, a **Source** toggle switches between rendered Markdown and
+  the original text. Raw HTML is not enabled in Markdown replies.
 * A **per-turn stats line** (after completion): input/output token counts,
-  decode speed (tok/s), wall-clock seconds, and `finish_reason`. In Agent mode
-  the tool-call count is appended.
+  prefill and decode speeds when supplied by the engine, wall-clock seconds,
+  and `finish_reason`. In Agent mode the tool-call count is appended.
 
 While a turn is in flight, the composer's Send button becomes a **Stop** button
 that aborts the stream via `AbortController`. Errors surface as a red banner
@@ -1529,7 +1558,9 @@ the tab becomes active again, not only when messages change.
 A docker run manager (`components/RunnerTab.jsx`) backed by the
 `/api/v1/runner/*` endpoints (§3.3). Three functions: **create**, **run** and
 **store** the docker command that launches a containerized LLM inference
-server. A responsive grid — on `lg`+ screens the config list takes one of three
+server. Multiple distinct configurations can run concurrently; each run has an
+independent registry entry, console stream, engine URL, and metrics snapshot.
+A responsive grid — on `lg`+ screens the config list takes one of three
 columns and the form/console take the other two; below `lg` everything stacks to
 a single column:
 
@@ -1583,10 +1614,10 @@ a single column:
     already running rather than launched here. Runtime/stream errors render as
     an inline red banner inside the console.
 
-    **The console attaches on mount**, keyed on the active run id, so a
-    browser that opens onto an already-running engine fills in from that
-    run's backlog instead of showing an empty pane. It does not wait for a
-    Run click in that browser.
+    **Each running engine gets a console tab.** The UI attaches to every run
+    by ID, so a browser that opens onto already-running engines fills each
+    console from its backlog instead of showing an empty pane. It does not
+    wait for a Run click in that browser.
 
     Output chunks are buffered in a ref and flushed on a fixed ~100 ms beat
     rather than per chunk, and the rendered string is capped at ~500 KB.
@@ -1601,17 +1632,17 @@ running container's output stream. The console auto-scrolls to the bottom on new
 output and when the tab is re-shown.
 
 **Run state is read, not held.** The tab polls
-`GET /api/v1/runner/active` every ~3 s and derives the Run/Stop button
-state from it, rather than tracking "did I press Run" in local state. That
-is what makes the buttons correct in a browser that did not start the run,
-and what makes a run that exits on its own — a crash, an OOM — update the
-UI with no stream open.
+`GET /api/v1/runner/runs` every ~3 s and derives each configuration's Run/Stop
+button state from the complete running set, rather than tracking "did I press
+Run" in local state. That makes the buttons correct in a browser that did not
+start the runs.
 
 **Client-side streaming.** A shared `readSSE(res, onEvent)` helper in
 `api.js` splits the byte stream on blank-line frame boundaries and
 dispatches each complete frame; both the runner console and the chat proxy
 use it. Around it: `startRunnerRun(configId, values)` (POST, returns the
-run summary), `fetchRunnerActive()` (GET, the live run or `null`),
+run summary), `fetchRunnerRuns()` (GET, all running runs),
+`fetchRunnerLiveStatus(runId)` (GET, that run's engine snapshot),
 `openRunnerStream(runId, handlers)` (GET SSE, dispatching `onState` /
 `onStdout` / `onExit` / `onError`), and `stopRunnerRun(runId)`.
 `EventSource` is not used anywhere because it cannot POST.
@@ -1673,7 +1704,7 @@ backend/
 frontend/
   src/
     App.jsx                 tabs, theme, polling, 120-sample history buffer
-    api.js                  fetch helpers (fetchLiveStatus, fetchConfig, postConfig, resetStats, countTokens, streamChat, createThinkSplitter, and the runner client: fetchRunnerConfigs, createRunnerConfig, updateRunnerConfig, deleteRunnerConfig, previewRunnerCommand, startRunnerRun, fetchRunnerActive, openRunnerStream, stopRunnerRun) + the shared readSSE frame parser and sendJSON
+    api.js                  fetch helpers (live/config/chat and runner APIs, including fetchRunnerRuns and fetchRunnerLiveStatus) + the shared readSSE frame parser and sendJSON
     theme.js                chart + status color tokens (light/dark)
     format.js               number/percent/time formatters
     params.js               client-side {name} template helpers (placeholders, missing/unused, render, row validation)
@@ -1716,10 +1747,15 @@ several design decisions:
    "since last scrape" gauges.** They report a real rate only in the brief window
    right after a request completes, then **decay to 0** while the engine is idle.
    For a single user, most polls read 0. **Consequence:** the top Throughput card
-   shows the **session average**, not this instantaneous gauge.
+   shows a session average. Prefill statistics use deltas of cumulative
+   `prompt_tokens_total` / `prompt_seconds_total` after each completed request,
+   because sampling the brief prefill gauge misses short requests. These
+   counters are frozen during a request and advance at request completion, so
+   they are not a source of instantaneous in-progress throughput.
 2. **`prompt_tokens_total` / `tokens_predicted_total` counters are frozen during
-   a request** and only advance at request **completion**. Differencing them
-   mid-request reads 0 — do not compute live throughput from them.
+   a request** and only advance at request **completion**. Decode retains its
+   “since last scrape” gauge; cumulative counter differences are not used as an
+   instantaneous decode rate.
 3. **GTT ≠ VRAM.** GTT (`mem_info_gtt`) is the large unified pool (~96 GB here,
    ~29% used as a static baseline). VRAM (rocm-smi) is a small dedicated
    carve-out (~512 MB, ~73% used). They are different memory pools; the
@@ -1775,10 +1811,11 @@ several design decisions:
     access** checkbox in `AIChatTab.jsx`, and the `strixper-agent-ws` volume in
     `strixper.sh`. `full_access` forces `allow_actions` on.
 14. **Tab 4 (LLM-Runner)** — `RunnerStore` (JSON-persisted config CRUD) +
-    `runner.py` router (config CRUD, run with SSE output stream, stop);
-    `RunnerTab.jsx` with the config list, create/edit form, and live run
-    console with stop control. Keep the tab mounted so a run survives tab
-    switches.
+    `runner.py` router (config CRUD, concurrent runs, per-run SSE output,
+    per-run metrics and stop-all); `RunnerTab.jsx` with the config list,
+    create/edit form, and one live console tab per running engine. AI-Chat
+    selects a running engine and sends its run ID for both plain and agent
+    requests. Keep the tabs mounted so runs and streams survive tab switches.
 15. **Packaging and deployment** — multi-stage `Dockerfile`: Node 22 builds
     the frontend, AMD `rocm/dev-ubuntu-24.04:7.2.2` supplies ROCm SMI and the
     Python 3.12 runtime, and FastAPI serves the production frontend. Include
@@ -1788,17 +1825,18 @@ several design decisions:
     configured engine containers. It passes host networking, Docker socket,
     persistent `strixper-data` volume, `/dev/kfd`, `/dev/dri`, and host
     `video`/`render` group IDs. Stop must request engine shutdown through the
-    Runner API before stopping Strixper, including discovery of configured
-    engines after a dashboard restart.
+    Runner stop-all API before stopping Strixper, including discovery of
+    configured engines after an ungraceful dashboard shutdown. Graceful backend
+    shutdown must also stop all registered engine containers.
 17. **Local workflow and docs** — `run.sh` starts backend + Vite for
     development; `stop.sh` stops those local processes. README documents
     prerequisites, local and Docker quick starts, LAN/security behavior,
     configuration, and credits.
-18. **Verify** — `cd frontend && npm run build`; build and run the container;
-    confirm its healthcheck, frontend assets, ROCm SMI and GPU device access;
-    restart backend; confirm
-    live-status, stats reset, tuning checks, all info modals, and the
-    LLM-Runner create/run/stop flow render.
+18. **Verify** — `cd frontend && npm run build`; validate backend syntax and
+    routes; confirm concurrent starts, per-run console/metrics, chat engine
+    routing, individual stop, and stop-all. For Docker acceptance, build and
+    run the container; confirm its healthcheck, frontend assets, ROCm SMI/GPU
+    access, and managed shutdown.
 
 ---
 
@@ -1851,21 +1889,22 @@ The repository-level `strixper.sh` is the supported Docker stack controller:
 | Action | Contract |
 | --- | --- |
 | `start` | Start the existing named container, or create it from `STRIXPER_IMAGE` (default `strixper-dashboard:latest`). Wait for `/api/v1/healthz`. |
-| `stop` | Ensure the backend is available, query the active Runner run, stop it using the Runner API, render saved config commands to discover their `--name` container names, stop any still-running matching containers, then stop Strixper. |
+| `stop` | Ensure the backend is available, stop all Runner runs using the Runner API, render saved config commands to discover their `--name` container names, stop any still-running matching containers, then stop Strixper. |
 | `restart` | Perform managed shutdown followed by start. |
 | `recreate` | Perform managed shutdown, remove the dashboard container, and recreate it while retaining `strixper-data`. |
-| `status` | Report container status and current active-run container name. |
+| `status` | Report container status and every currently running engine. |
 
 If Strixper was already stopped, `stop` starts it temporarily so startup
-discovery can adopt a running container whose name matches a saved
-configuration. Failures to query or stop managed engines are surfaced, and the
-dashboard is left running rather than hiding an incomplete shutdown.
+discovery can adopt running containers whose names match saved configurations.
+Failures to stop managed engines are surfaced, and the dashboard is left
+running rather than hiding an incomplete shutdown.
 
 The wrapper manages configured Runner engine containers, not arbitrary Docker
 containers. A container started manually or through a config that was removed
 before shutdown may not be discoverable from the saved configuration and is
-outside this cleanup contract. Direct `docker stop strixper` also bypasses
-engine cleanup; use `./strixper.sh stop`.
+outside this cleanup contract. A graceful direct Docker stop also triggers
+backend cleanup, but use `./strixper.sh stop` for the explicit API call and
+container-name recovery sweep.
 
 ### 9.4 Local development versus Docker operation
 

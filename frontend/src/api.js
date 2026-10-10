@@ -120,6 +120,9 @@ export const deleteRunnerConfig = (id) =>
   })
 export const stopRunnerRun = (runId) =>
   sendJSON('POST', `/runner/runs/${runId}/stop`, {})
+export const fetchRunnerRuns = () => getJSON('/runner/runs').then((j) => j?.runs || [])
+export const fetchRunnerLiveStatus = (runId) =>
+  getJSON(`/runner/runs/${runId}/live-status`)
 
 // Render a command template against its parameters without running it.
 // Returns { command }; throws with the backend's message on a bad template.
@@ -263,10 +266,11 @@ export function createThinkSplitter() {
 // Stream a chat turn from the backend /api/v1/chat proxy.
 // onReasoning(textChunk), onDelta(textChunk), onDone(donePayload), onError(err)
 export async function streamChat(
-  { messages, api = 'chat', maxTokens, temperature, thinking = true },
+  { messages, api = 'chat', maxTokens, temperature, thinking = true, runId },
   { onReasoning, onDelta, onDone, onError, signal } = {},
 ) {
   const body = { messages, api, stream: true, thinking }
+  if (runId) body.run_id = runId
   if (maxTokens != null) body.max_tokens = maxTokens
   if (temperature != null) body.temperature = temperature
 
@@ -319,6 +323,7 @@ export async function streamAgentChat(
     maxTokens,
     temperature,
     thinking = true,
+    runId,
   },
   { onReasoning, onDelta, onTool, onDone, onError, signal } = {},
 ) {
@@ -329,6 +334,7 @@ export async function streamAgentChat(
     full_access: fullAccess,
     thinking,
   }
+  if (runId) body.run_id = runId
   if (maxTurns != null) body.max_turns = maxTurns
   if (maxTokens != null) body.max_tokens = maxTokens
   if (temperature != null) body.temperature = temperature

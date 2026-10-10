@@ -13,7 +13,15 @@ import KvPoolChart from '../charts/KvPoolChart.jsx'
 import QueueChart from '../charts/QueueChart.jsx'
 import MemoryChart from '../charts/MemoryChart.jsx'
 
-export default function LiveTab({ data, history, theme, onResetStats }) {
+export default function LiveTab({
+  data,
+  history,
+  theme,
+  onResetStats,
+  runs = [],
+  selectedRunId = '',
+  onSelectRun,
+}) {
   const [kvInfo, setKvInfo] = useState(false)
   const colors = CHART[theme] || CHART.dark
   const halogen = data?.halogen || {}
@@ -27,6 +35,25 @@ export default function LiveTab({ data, history, theme, onResetStats }) {
 
   return (
     <div className="space-y-6">
+      {runs.length > 0 && (
+        <div className="flex gap-1 overflow-x-auto rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-card)] p-1">
+          {runs.map((run) => (
+            <button
+              key={run.run_id}
+              type="button"
+              onClick={() => onSelectRun?.(run.run_id)}
+              className={`max-w-64 truncate rounded-md px-3 py-2 text-xs font-medium ${
+                selectedRunId === run.run_id
+                  ? 'bg-[var(--series-1)] text-white'
+                  : 'text-[var(--text-secondary)] hover:bg-[var(--surface-page)]'
+              }`}
+              title={run.container_name || run.config_name}
+            >
+              {run.config_name}
+            </button>
+          ))}
+        </div>
+      )}
       {/* Primary KPI cards */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatTile

@@ -55,6 +55,7 @@ from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
 from ..config import settings
 from ..services.agent_exec_tools import build_exec_tools
 from ..services.agent_tools import build_tools
+from ..services.run_registry import ActiveRun, registry
 
 router = APIRouter(tags=["agent"])
 
@@ -72,7 +73,7 @@ Strix Halo machine running local LLM inference through the Halogen engine.
 You have tools that read the same live data the dashboard's tabs show: the
 live snapshot, the engine's health and Prometheus metrics, the KV cache
 counters, the host tuning audit, the hardware baseline, saved run
-configurations, the active run, and a token counter.
+configurations, running engine runs, and a token counter.
 
 How to work:
 - Prefer checking over guessing. When asked about the machine, call the
@@ -134,6 +135,7 @@ class AgentChatRequest(BaseModel):
     # Exposes web fetch/search, shell, python execution, and file I/O.
     # Strictly more powerful than allow_actions, so it implies it.
     full_access: bool = False
+    run_id: Optional[str] = None
     max_turns: int = Field(default=settings.agent_max_turns, ge=1, le=30)
     max_tokens: Optional[int] = Field(default=None, ge=1, le=32768)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
@@ -175,30 +177,54 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + "… [truncated]"
 
 
+def _remove_unsupported_schema_defaults(value: Any) -> None:
+    """Remove JSON Schema ``default`` annotations unsupported by some engines."""
+    if isinstance(value, dict):
+        value.pop("default", None)
+        for nested in value.values():
+            _remove_unsupported_schema_defaults(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _remove_unsupported_schema_defaults(nested)
+
+
 def _resolve_tools(state: Any, body: AgentChatRequest) -> list[FunctionTool]:
     """Pick the tool tier for this request.
 
     Three tiers, each a superset of the previous:
 
       read-only        status, metrics, tuning, token counting, configs
-      allow_actions   + start_engine / stop_engine
+      allow_actions   + start_engine / stop_engine for individual runs
       full_access     + web, shell, python, file I/O
 
     ``full_access`` implies ``allow_actions``: an agent that can run shell
     commands can already do anything the engine controls can do, so
     withholding them would only be confusing.
     """
-    tools = build_tools(state, body.allow_actions or body.full_access)
+    tools = build_tools(
+        state,
+        body.allow_actions or body.full_access,
+        body.run_id,
+    )
     if body.full_access:
         tools.extend(build_exec_tools(state, settings.agent_workspace))
+    for tool in tools:
+        _remove_unsupported_schema_defaults(tool.params_json_schema)
     return tools
 
 
-def _build_agent(state: Any, body: AgentChatRequest) -> Agent:
-    """Assemble the agent bound to the current engine target."""
-    base_url = state.halogen.base_url
+def _build_agent(
+    state: Any, body: AgentChatRequest, run: Optional[ActiveRun] = None
+) -> Agent:
+    """Assemble the agent bound to the selected engine target."""
+    base_url = run.engine_url if run is not None else state.halogen.base_url
+    model_name = (
+        (run.model_name if run else None)
+        or state.model_name
+        or settings.default_model
+    )
     model = OpenAIChatCompletionsModel(
-        model=state.model_name or settings.default_model,
+        model=model_name,
         openai_client=AsyncOpenAI(base_url=f"{base_url}/v1", api_key="none"),
     )
     # ``reasoning.effort="none"`` is how Halogen disables thinking, and the
@@ -277,6 +303,9 @@ def _sum_usage(responses: list[Any]) -> Optional[dict[str, int]]:
 async def agent_chat(body: AgentChatRequest, request: Request) -> Any:
     """Run an agentic turn over the conversation and stream the result."""
     state = request.app.state.rt
+    run = registry.get_run(body.run_id) if body.run_id else None
+    if body.run_id and (run is None or run.status != "running" or not run.engine_url):
+        raise HTTPException(status_code=404, detail="selected engine is no longer running")
 
     if body.mode == "plain":
         # Hand back to the existing single-shot path rather than
@@ -291,11 +320,12 @@ async def agent_chat(body: AgentChatRequest, request: Request) -> Any:
                 max_tokens=body.max_tokens,
                 temperature=body.temperature,
                 thinking=body.thinking,
+                run_id=body.run_id,
             ),
             request,
         )
 
-    agent = _build_agent(state, body)
+    agent = _build_agent(state, body, run)
 
     async def event_stream() -> AsyncIterator[str]:
         started = time.monotonic()

@@ -6,7 +6,13 @@ import TuningTab from './components/TuningTab.jsx'
 import AIChatTab from './components/AIChatTab.jsx'
 import RunnerTab from './components/RunnerTab.jsx'
 import ErrorBoundary from './components/ErrorBoundary.jsx'
-import { fetchConfig, fetchLiveStatus, postConfig } from './api.js'
+import {
+  fetchConfig,
+  fetchLiveStatus,
+  fetchRunnerLiveStatus,
+  fetchRunnerRuns,
+  postConfig,
+} from './api.js'
 
 const MAX_SAMPLES = 120
 
@@ -26,6 +32,8 @@ export default function App() {
     }
   })
   const [history, setHistory] = useState([])
+  const [runHistories, setRunHistories] = useState({})
+  const [selectedRunId, setSelectedRunId] = useState('')
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark')
@@ -41,6 +49,24 @@ export default function App() {
     queryFn: fetchLiveStatus,
     refetchInterval: intervalMs > 0 ? intervalMs : false,
   })
+
+  const { data: runs = [] } = useQuery({
+    queryKey: ['runner-runs'],
+    queryFn: fetchRunnerRuns,
+    refetchInterval: 3000,
+  })
+  const runningRuns = runs.filter((run) => run.status === 'running')
+  const selectedRun = runningRuns.find((run) => run.run_id === selectedRunId) || runningRuns[0]
+  const { data: selectedRunData } = useQuery({
+    queryKey: ['runner-live-status', selectedRun?.run_id],
+    queryFn: () => fetchRunnerLiveStatus(selectedRun.run_id),
+    enabled: Boolean(selectedRun?.run_id),
+    refetchInterval: intervalMs > 0 ? intervalMs : false,
+  })
+  const displayedData = selectedRun ? (selectedRunData || data) : data
+  const displayedHistory = selectedRun
+    ? runHistories[selectedRun.run_id] || []
+    : history
 
   useEffect(() => {
     if (!data) return
@@ -62,6 +88,33 @@ export default function App() {
       return next.length > MAX_SAMPLES ? next.slice(next.length - MAX_SAMPLES) : next
     })
   }, [data])
+
+  useEffect(() => {
+    if (!selectedRun || !selectedRunData) return
+    setRunHistories((prev) => {
+      const prior = prev[selectedRun.run_id] || []
+      const sample = {
+        time: selectedRunData.timestamp,
+        promptTps: selectedRunData.halogen?.prompt_tokens_per_sec ?? 0,
+        decodeTps: selectedRunData.halogen?.predicted_tokens_per_sec ?? 0,
+        kvPct: (selectedRunData.halogen?.kv_cache_usage_ratio ?? 0) * 100,
+        queued: selectedRunData.halogen?.queued ?? 0,
+        gttPct: selectedRunData.hardware?.gpu?.gtt_usage_pct ?? 0,
+        gttUsedGb: selectedRunData.hardware?.gpu?.gtt_used_gb ?? 0,
+        vramPct: selectedRunData.hardware?.rocm?.vram_usage_pct ?? 0,
+        gpuUtilPct: selectedRunData.hardware?.rocm?.gpu_util_pct ?? 0,
+        ramPct: selectedRunData.hardware?.memory?.ram_usage_pct ?? 0,
+        cpuPct: selectedRunData.hardware?.cpu?.usage_pct ?? 0,
+      }
+      const next = [...prior, sample]
+      return {
+        ...prev,
+        [selectedRun.run_id]: next.length > MAX_SAMPLES
+          ? next.slice(next.length - MAX_SAMPLES)
+          : next,
+      }
+    })
+  }, [selectedRun?.run_id, selectedRunData])
 
   const handleIntervalChange = (ms) => {
     setIntervalMs(ms)
@@ -85,7 +138,14 @@ export default function App() {
     queryClient.invalidateQueries({ queryKey: ['live-status'] })
   }
 
-  const connected = data?.connected ?? false
+  const handleResetStats = () => {
+    setHistory([])
+    setRunHistories({})
+    queryClient.invalidateQueries({ queryKey: ['live-status'] })
+    queryClient.invalidateQueries({ queryKey: ['runner-live-status'] })
+  }
+
+  const connected = displayedData?.connected ?? false
 
   return (
     <div className="min-h-screen bg-[var(--surface-page)]">
@@ -111,10 +171,13 @@ export default function App() {
         {tab === 'live' && (
           <ErrorBoundary>
             <LiveTab
-              data={data}
-              history={history}
+              data={displayedData}
+              history={displayedHistory}
+              runs={runningRuns}
+              selectedRunId={selectedRun?.run_id || ''}
+              onSelectRun={setSelectedRunId}
               theme={theme}
-              onResetStats={() => refetch()}
+              onResetStats={handleResetStats}
             />
           </ErrorBoundary>
         )}

@@ -55,14 +55,19 @@ def build_halogen_state(
         acceptance = round(draft_accepted / draft_total, 4)
 
     context = health.get("context")
+    model = health.get("model")
     if context is None:
         data = models.get("data") or []
         if data:
             context = data[0].get("max_model_len") or data[0].get("context_length")
+    if model is None:
+        data = models.get("data") or []
+        if data:
+            model = data[0].get("id")
 
     return {
         "status": health.get("status", "ok"),
-        "model": health.get("model"),
+        "model": model,
         "busy": health.get("busy"),
         "slots": health.get("slots"),
         "in_flight": health.get("in_flight"),
@@ -73,6 +78,7 @@ def build_halogen_state(
         "prompt_tokens_per_sec": metrics.get("llamacpp:prompt_tokens_seconds"),
         "predicted_tokens_per_sec": metrics.get("llamacpp:predicted_tokens_seconds"),
         "prompt_tokens_total": metrics.get("llamacpp:prompt_tokens_total"),
+        "prompt_seconds_total": metrics.get("llamacpp:prompt_seconds_total"),
         "tokens_predicted_total": metrics.get("llamacpp:tokens_predicted_total"),
         "prompt_tokens_cached_total": metrics.get("halogen:prompt_tokens_cached_total"),
         "draft_acceptance_rate": acceptance,

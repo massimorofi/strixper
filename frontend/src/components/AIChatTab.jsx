@@ -1,15 +1,25 @@
 import { useEffect, useRef, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
   Brain,
   ChevronDown,
+  Code2,
   Eraser,
+  Eye,
   Loader2,
   Send,
   Square,
   User,
   Wrench,
 } from 'lucide-react'
-import { createThinkSplitter, streamAgentChat, streamChat } from '../api.js'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+import {
+  createThinkSplitter,
+  fetchRunnerRuns,
+  streamAgentChat,
+  streamChat,
+} from '../api.js'
 import { fmtInt, fmtNum } from '../format.js'
 
 const API_OPTIONS = [
@@ -201,6 +211,7 @@ function StepsBlock({ steps, streaming }) {
 
 function Bubble({ msg }) {
   const isUser = msg.role === 'user'
+  const [showSource, setShowSource] = useState(false)
   return (
     <div className={`flex gap-2.5 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}>
       <div
@@ -230,10 +241,49 @@ function Bubble({ msg }) {
             <ReasoningBlock text={msg.reasoning} streaming={msg.streaming} />
             <StepsBlock steps={msg.steps} streaming={msg.streaming} />
             {msg.content ? (
-              <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-[var(--text-primary)]">
-                {msg.content}
-                {msg.streaming && <span className="animate-pulse">▍</span>}
-              </p>
+              <div>
+                {!msg.streaming && (
+                  <div className="mb-1 flex justify-end">
+                    <button
+                      type="button"
+                      onClick={() => setShowSource((value) => !value)}
+                      className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-[var(--text-muted)] transition-colors hover:bg-[var(--surface-page)] hover:text-[var(--text-secondary)]"
+                      aria-label={showSource ? 'Render Markdown' : 'View Markdown source'}
+                    >
+                      {showSource ? <Eye size={12} /> : <Code2 size={12} />}
+                      {showSource ? 'Rendered' : 'Source'}
+                    </button>
+                  </div>
+                )}
+                {showSource ? (
+                  <pre className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-[var(--text-primary)]">
+                    {msg.content}
+                  </pre>
+                ) : (
+                  <div className="break-words text-sm leading-relaxed text-[var(--text-primary)] [&_a]:text-[var(--series-1)] [&_a]:underline [&_blockquote]:my-2 [&_blockquote]:border-l-2 [&_blockquote]:border-[var(--border-hairline)] [&_blockquote]:pl-3 [&_blockquote]:text-[var(--text-secondary)] [&_code]:rounded [&_code]:bg-[var(--surface-page)] [&_code]:px-1 [&_code]:font-mono [&_code]:text-xs [&_h1]:mb-2 [&_h1]:mt-3 [&_h1]:text-lg [&_h1]:font-semibold [&_h2]:mb-2 [&_h2]:mt-3 [&_h2]:text-base [&_h2]:font-semibold [&_h3]:mb-1 [&_h3]:mt-2 [&_h3]:font-semibold [&_li]:ml-5 [&_ol]:my-2 [&_ol]:list-decimal [&_p]:my-2 [&_pre]:my-2 [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-[var(--surface-page)] [&_pre]:p-3 [&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_table]:my-2 [&_table]:w-full [&_table]:border-collapse [&_td]:border [&_td]:border-[var(--border-hairline)] [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:border-[var(--border-hairline)] [&_th]:bg-[var(--surface-page)] [&_th]:px-2 [&_th]:py-1 [&_th]:text-left [&_ul]:my-2 [&_ul]:list-disc">
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      components={{
+                        a: ({ href, children, ...props }) => (
+                          <a
+                            href={href}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            {...props}
+                          >
+                            {children}
+                          </a>
+                        ),
+                      }}
+                    >
+                      {msg.content}
+                    </ReactMarkdown>
+                    {msg.streaming && (
+                      <span className="animate-pulse">▍</span>
+                    )}
+                  </div>
+                )}
+              </div>
             ) : msg.streaming ? (
               <p className="flex items-center gap-1.5 text-sm text-[var(--text-muted)]">
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -266,8 +316,11 @@ function formatStats(done) {
     parts.push(`${fmtInt(prompt ?? 0)} in / ${fmtInt(completion ?? 0)} out`)
   }
   const t = done?.timings || {}
+  if (t.prompt_per_second) {
+    parts.push(`${fmtNum(t.prompt_per_second, 1)} prefill tok/s`)
+  }
   if (t.predicted_per_second) {
-    parts.push(`${fmtNum(t.predicted_per_second, 1)} tok/s`)
+    parts.push(`${fmtNum(t.predicted_per_second, 1)} decode tok/s`)
   }
   if (t.predicted_ms) {
     parts.push(`${fmtNum(t.predicted_ms / 1000, 2)}s`)
@@ -314,8 +367,17 @@ export default function AIChatTab({ active = true }) {
   // single upstream call. Actions lets that agent start and stop engines,
   // which reach docker and are disruptive, so it is a separate opt-in.
   const [settings, setSettings] = useState(loadSettings)
+  const [selectedRunId, setSelectedRunId] = useState('')
   const scrollRef = useRef(null)
   const abortRef = useRef(null)
+  const { data: runs = [] } = useQuery({
+    queryKey: ['runner-runs'],
+    queryFn: fetchRunnerRuns,
+    refetchInterval: 3000,
+  })
+  const runningRuns = runs.filter((run) => run.status === 'running')
+  const selectedRun = runningRuns.find((run) => run.run_id === selectedRunId) || runningRuns[0]
+  const selectedEngineId = selectedRun?.run_id || ''
 
   // Persist so the conversation survives reloads, not just tab switches.
   useEffect(() => {
@@ -347,7 +409,7 @@ export default function AIChatTab({ active = true }) {
   // reasoning/delta vocabulary plus a `tool` event per call. Steps are
   // accumulated so the collapsed panel shows what was done and what came
   // back; a result replaces the pending call with the same name.
-  const sendAgent = async (outbound, patch, controller) => {
+  const sendAgent = async (outbound, patch, controller, runId) => {
     let reasoningAcc = ''
     let contentAcc = ''
     let steps = []
@@ -359,6 +421,7 @@ export default function AIChatTab({ active = true }) {
           mode: 'agent',
           allowActions: settings.allowActions,
           fullAccess: settings.fullAccess,
+          runId,
           thinking,
           // max_tokens is deliberately omitted: a long write_file call puts
           // the whole file inside one tool-call JSON object, and a small
@@ -460,7 +523,7 @@ export default function AIChatTab({ active = true }) {
       )
 
     if (settings.agentMode) {
-      await sendAgent(outbound, patch, controller)
+      await sendAgent(outbound, patch, controller, selectedEngineId)
       return
     }
 
@@ -476,6 +539,7 @@ export default function AIChatTab({ active = true }) {
           messages: toOutbound([...messages, userMsg]),
           api,
           thinking,
+          runId: selectedEngineId,
           maxTokens: maxTokens ? Number(maxTokens) : undefined,
         },
         {
@@ -549,6 +613,26 @@ export default function AIChatTab({ active = true }) {
               : `${activeApi?.label} · ${activeApi?.path}`}
           </p>
         </div>
+
+        <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
+          Engine
+          <select
+            value={selectedEngineId}
+            onChange={(e) => setSelectedRunId(e.target.value)}
+            disabled={busy || runningRuns.length === 0}
+            className="max-w-52 rounded-md border border-[var(--border-hairline)] bg-[var(--surface-page)] px-2 py-1 text-xs text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--series-1)] disabled:opacity-50"
+          >
+            {runningRuns.length === 0 ? (
+              <option value="">No running engines</option>
+            ) : (
+              runningRuns.map((run) => (
+                <option key={run.run_id} value={run.run_id}>
+                  {run.config_name}{run.container_name ? ` · ${run.container_name}` : ''}
+                </option>
+              ))
+            )}
+          </select>
+        </label>
 
         <label className="flex cursor-pointer items-center gap-1.5 text-xs text-[var(--text-secondary)]">
           <input
