@@ -22,6 +22,17 @@ def _get_float(name: str, default: float) -> float:
     return value if value > 0 else default
 
 
+def _get_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 class Settings:
     """Startup settings (see .env.example for the documented keys)."""
 
@@ -36,6 +47,14 @@ class Settings:
         self.default_model: str = os.getenv(
             "DEFAULT_MODEL", "halogen-qwen3.8-flash-next"
         ).strip()
+
+        # ---- Agentic chat -------------------------------------------------
+        # The agent talks to the same engine through the OpenAI-compatible
+        # API, so it needs no separate endpoint. These settings bound the
+        # loop; the per-request body can override the turn limit.
+        self.agent_max_turns: int = _get_int("AGENT_MAX_TURNS", 8)
+        # Optional replacement for the built-in system prompt.
+        self.agent_instructions: str = os.getenv("AGENT_INSTRUCTIONS", "").strip()
 
 
 settings = Settings()

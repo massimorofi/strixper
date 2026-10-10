@@ -51,7 +51,7 @@ from ..services.engine_target import (
     engine_url,
     port_from_params,
 )
-from ..services.live_service import set_engine_target
+from ..services.live_service import RuntimeState, set_engine_target
 from ..services.params import (
     MAX_PARAMS,
     ParamError,
@@ -285,31 +285,35 @@ async def preview_command(body: PreviewRequest) -> dict[str, Any]:
     return {"command": command}
 
 
-@router.post("/runner/configs/{config_id}/run")
-async def run_config(
-    config_id: str,
-    request: Request,
-    body: Optional[RunRequest] = None,
-) -> dict[str, Any]:
-    """Start a configuration's engine and return immediately.
+class ConfigNotFound(Exception):
+    """No stored configuration with that id."""
 
-    Starting and watching are separate calls: this launches the run, and
-    ``GET /runner/runs/{run_id}/stream`` delivers its console. Separating
-    them is what lets a browser that arrives later attach to a run it did
-    not start -- the run belongs to the backend, not to the request that
-    launched it.
+
+async def launch_config(
+    state: RuntimeState,
+    config_id: str,
+    values: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+    """Start a configuration's engine and repoint the dashboard at it.
+
+    Shared by ``POST /runner/configs/{id}/run`` and the agent's
+    ``start_engine`` tool so both paths render the template, launch the
+    container, and follow the new engine identically. Raises
+    ``ConfigNotFound`` for an unknown id, ``ValueError`` for a bad
+    template, and ``RuntimeError`` for a launch failure; the HTTP wrapper
+    maps those onto status codes.
     """
     cfg = get_store().get(config_id)
     if cfg is None:
-        raise HTTPException(status_code=404, detail="configuration not found")
+        raise ConfigNotFound(config_id)
 
     # Reconstruct the concrete command from the stored template and the
     # parameter values (request overrides take precedence over stored).
     try:
-        params = merge_values(cfg.get("parameters") or [], body.values if body else None)
+        params = merge_values(cfg.get("parameters") or [], values)
         command = render_command(cfg["docker_command"], params)
     except ParamError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise ValueError(str(exc)) from exc
 
     try:
         run = await registry.start(
@@ -318,15 +322,12 @@ async def run_config(
             config_name=cfg.get("name", ""),
         )
     except Exception as exc:  # noqa: BLE001 -- surface a clean start failure
-        raise HTTPException(
-            status_code=502, detail=f"failed to start command: {exc}"
-        ) from exc
+        raise RuntimeError(f"failed to start command: {exc}") from exc
 
     # A configuration that declares a `port` is a network server, so the
     # dashboard follows it: repoint the live-status client at the engine we
     # just launched. Done *after* the start succeeds, so a run that failed
     # to launch cannot leave the dashboard pointed at nothing.
-    state = request.app.state.rt
     engine_port = port_from_params(params)
     if engine_port is not None:
         try:
@@ -347,6 +348,32 @@ async def run_config(
             run.engine_switch_error = str(exc)
 
     return run.summary()
+
+
+@router.post("/runner/configs/{config_id}/run")
+async def run_config(
+    config_id: str,
+    request: Request,
+    body: Optional[RunRequest] = None,
+) -> dict[str, Any]:
+    """Start a configuration's engine and return immediately.
+
+    Starting and watching are separate calls: this launches the run, and
+    ``GET /runner/runs/{run_id}/stream`` delivers its console. Separating
+    them is what lets a browser that arrives later attach to a run it did
+    not start -- the run belongs to the backend, not to the request that
+    launched it.
+    """
+    try:
+        return await launch_config(
+            request.app.state.rt, config_id, body.values if body else None
+        )
+    except ConfigNotFound:
+        raise HTTPException(status_code=404, detail="configuration not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.get("/runner/active")

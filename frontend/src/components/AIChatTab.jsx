@@ -7,8 +7,9 @@ import {
   Send,
   Square,
   User,
+  Wrench,
 } from 'lucide-react'
-import { createThinkSplitter, streamChat } from '../api.js'
+import { createThinkSplitter, streamAgentChat, streamChat } from '../api.js'
 import { fmtInt, fmtNum } from '../format.js'
 
 const API_OPTIONS = [
@@ -19,7 +20,41 @@ const API_OPTIONS = [
 ]
 
 const STORAGE_KEY = 'strixper-chat'
+const SETTINGS_KEY = 'strixper-chat-settings'
 const MAX_STORED_MESSAGES = 100
+
+// Chat preferences live apart from the transcript: they have to survive a
+// cleared conversation, and a cleared conversation must not lose the mode
+// the user chose.
+const DEFAULT_SETTINGS = { agentMode: true, allowActions: false }
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY)
+    if (!raw) return { ...DEFAULT_SETTINGS }
+    const parsed = JSON.parse(raw)
+    return {
+      agentMode:
+        typeof parsed?.agentMode === 'boolean'
+          ? parsed.agentMode
+          : DEFAULT_SETTINGS.agentMode,
+      allowActions:
+        typeof parsed?.allowActions === 'boolean'
+          ? parsed.allowActions
+          : DEFAULT_SETTINGS.allowActions,
+    }
+  } catch {
+    return { ...DEFAULT_SETTINGS }
+  }
+}
+
+function persistSettings(settings) {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings))
+  } catch {
+    /* storage unavailable -- preferences stay for this session only */
+  }
+}
 
 // Unique per message and independent of any module-level counter, so a hot
 // module reload (which resets module state but preserves component state)
@@ -104,6 +139,58 @@ function ReasoningBlock({ text, streaming }) {
   )
 }
 
+// The agent's tool calls, collapsed. Deliberately styled like ReasoningBlock
+// so an agentic reply looks like any other reply until you open it.
+function StepsBlock({ steps, streaming }) {
+  const [open, setOpen] = useState(false)
+  if (!steps || steps.length === 0) return null
+  return (
+    <div className="mb-2 overflow-hidden rounded-lg border border-[var(--border-hairline)] bg-[var(--surface-page)]">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-[var(--text-muted)] transition-colors hover:text-[var(--text-secondary)]"
+      >
+        <Wrench size={13} className="text-[var(--series-2)]" />
+        <span>Actions</span>
+        <span className="text-[var(--text-muted)]">({steps.length})</span>
+        <ChevronDown
+          size={13}
+          className={`ml-auto transition-transform ${open ? 'rotate-180' : ''}`}
+        />
+      </button>
+      {open && (
+        <ol className="max-h-64 space-y-1.5 overflow-auto px-2.5 py-2">
+          {steps.map((step, i) => (
+            <li key={i} className="text-xs leading-relaxed">
+              <span className="font-medium text-[var(--text-secondary)]">
+                {i + 1}. {step.name}
+              </span>
+              {step.detail ? (
+                <span className="text-[var(--text-muted)]"> ({step.detail})</span>
+              ) : null}
+              {step.output ? (
+                <pre className="mt-0.5 max-h-32 overflow-auto whitespace-pre-wrap break-words rounded bg-[var(--surface-card)] px-2 py-1 font-mono text-[11px] text-[var(--text-muted)]">
+                  {step.output}
+                </pre>
+              ) : step.phase === 'call' ? (
+                <span className="ml-1 inline-flex items-center gap-1 text-[var(--text-muted)]">
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                </span>
+              ) : null}
+            </li>
+          ))}
+          {streaming && (
+            <li className="text-xs italic text-[var(--text-muted)]">
+              Working…
+            </li>
+          )}
+        </ol>
+      )}
+    </div>
+  )
+}
+
 function Bubble({ msg }) {
   const isUser = msg.role === 'user'
   return (
@@ -133,6 +220,7 @@ function Bubble({ msg }) {
         ) : (
           <>
             <ReasoningBlock text={msg.reasoning} streaming={msg.streaming} />
+            <StepsBlock steps={msg.steps} streaming={msg.streaming} />
             {msg.content ? (
               <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-[var(--text-primary)]">
                 {msg.content}
@@ -176,6 +264,7 @@ function formatStats(done) {
   if (t.predicted_ms) {
     parts.push(`${fmtNum(t.predicted_ms / 1000, 2)}s`)
   }
+  if (done?.tool_calls) parts.push(`${fmtInt(done.tool_calls)} tool call${done.tool_calls === 1 ? '' : 's'}`)
   if (done?.finish_reason) parts.push(done.finish_reason)
   return parts.join(' · ')
 }
@@ -195,6 +284,7 @@ function persistMessages(messages) {
         role: m.role,
         content: m.content,
         reasoning: m.reasoning,
+        steps: m.steps,
         stats: m.stats,
         error: m.error,
       }))
@@ -212,6 +302,10 @@ export default function AIChatTab({ active = true }) {
   const [maxTokens, setMaxTokens] = useState('1024')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState(null)
+  // Agent mode hands the request to the tool-using agent instead of a
+  // single upstream call. Actions lets that agent start and stop engines,
+  // which reach docker and are disruptive, so it is a separate opt-in.
+  const [settings, setSettings] = useState(loadSettings)
   const scrollRef = useRef(null)
   const abortRef = useRef(null)
 
@@ -219,6 +313,10 @@ export default function AIChatTab({ active = true }) {
   useEffect(() => {
     persistMessages(messages)
   }, [messages])
+
+  useEffect(() => {
+    persistSettings(settings)
+  }, [settings])
 
   // While hidden the element has no layout, so scrolling only takes effect
   // once the tab is shown again.
@@ -237,6 +335,85 @@ export default function AIChatTab({ active = true }) {
     )
   }
 
+  // Agentic turn: the backend runs tools and iterates, streaming the same
+  // reasoning/delta vocabulary plus a `tool` event per call. Steps are
+  // accumulated so the collapsed panel shows what was done and what came
+  // back; a result replaces the pending call with the same name.
+  const sendAgent = async (outbound, patch, controller) => {
+    let reasoningAcc = ''
+    let contentAcc = ''
+    let steps = []
+
+    try {
+      await streamAgentChat(
+        {
+          messages: outbound,
+          mode: 'agent',
+          allowActions: settings.allowActions,
+          thinking,
+          maxTokens: maxTokens ? Number(maxTokens) : undefined,
+        },
+        {
+          signal: controller.signal,
+          onReasoning: (chunk) => {
+            reasoningAcc += chunk
+            patch({ reasoning: reasoningAcc })
+          },
+          onDelta: (chunk) => {
+            contentAcc += chunk
+            patch({ content: contentAcc })
+          },
+          onTool: (data) => {
+            if (data?.phase === 'call') {
+              steps = [
+                ...steps,
+                { name: data.name || 'tool', detail: data.detail || '' },
+              ]
+            } else {
+              const last = steps[steps.length - 1]
+              if (last && !last.output) {
+                steps = [
+                  ...steps.slice(0, -1),
+                  { ...last, output: data?.output || '', phase: 'result' },
+                ]
+              } else {
+                steps = [
+                  ...steps,
+                  {
+                    name: data?.name || 'tool',
+                    output: data?.output || '',
+                    phase: 'result',
+                  },
+                ]
+              }
+            }
+            patch({ steps })
+          },
+          onDone: (done) => {
+            patch({
+              streaming: false,
+              stats: formatStats(done),
+              reasoning: reasoningAcc || undefined,
+              content: contentAcc,
+              steps,
+            })
+          },
+          onError: (message) => {
+            patch({ streaming: false, error: message, steps })
+            setError(message)
+          },
+        },
+      )
+    } catch (err) {
+      const message = err?.message || 'Request failed'
+      patch({ streaming: false, error: message, steps })
+      setError(message)
+    } finally {
+      setBusy(false)
+      abortRef.current = null
+    }
+  }
+
   const send = async () => {
     const text = draft.trim()
     if (!text || busy) return
@@ -251,6 +428,7 @@ export default function AIChatTab({ active = true }) {
         role: 'assistant',
         content: '',
         reasoning: '',
+        steps: [],
         streaming: true,
         stats: null,
         error: null,
@@ -263,16 +441,22 @@ export default function AIChatTab({ active = true }) {
     const controller = new AbortController()
     abortRef.current = controller
 
+    const outbound = toOutbound([...messages, userMsg])
+    const patch = (changes) =>
+      setMessages((prev) =>
+        prev.map((m) => (m.id === assistantId ? { ...m, ...changes } : m)),
+      )
+
+    if (settings.agentMode) {
+      await sendAgent(outbound, patch, controller)
+      return
+    }
+
     // Completions returns raw text with inline think markers; the other three
     // APIs deliver reasoning on a separate SSE channel.
     const splitter = usesInlineThink(api) ? createThinkSplitter() : null
     let reasoningAcc = ''
     let contentAcc = ''
-
-    const patch = (changes) =>
-      setMessages((prev) =>
-        prev.map((m) => (m.id === assistantId ? { ...m, ...changes } : m)),
-      )
 
     try {
       await streamChat(
@@ -348,25 +532,60 @@ export default function AIChatTab({ active = true }) {
             AI Chat
           </h2>
           <p className="text-xs text-[var(--text-muted)]">
-            {activeApi?.label} · {activeApi?.path}
+            {settings.agentMode
+              ? 'Agent · tool-driven multi-step'
+              : `${activeApi?.label} · ${activeApi?.path}`}
           </p>
         </div>
 
-        <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
-          API
-          <select
-            value={api}
-            onChange={(e) => setApi(e.target.value)}
+        <label className="flex cursor-pointer items-center gap-1.5 text-xs text-[var(--text-secondary)]">
+          <input
+            type="checkbox"
+            checked={settings.agentMode}
+            onChange={(e) =>
+              setSettings((s) => ({ ...s, agentMode: e.target.checked })
+            )}
             disabled={busy}
-            className="rounded-md border border-[var(--border-hairline)] bg-[var(--surface-page)] px-2 py-1 text-xs text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--series-1)] disabled:opacity-50"
-          >
-            {API_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value}>
-                {o.label}
-              </option>
-            ))}
-          </select>
+            className="accent-[var(--series-1)]"
+          />
+          Agent
         </label>
+
+        {settings.agentMode && (
+          <label
+            className="flex cursor-pointer items-center gap-1.5 text-xs text-[var(--text-secondary)]"
+            title="Let the agent start and stop engine containers"
+          >
+            <input
+              type="checkbox"
+              checked={settings.allowActions}
+              onChange={(e) =>
+                setSettings((s) => ({ ...s, allowActions: e.target.checked })
+              )}
+              disabled={busy}
+              className="accent-[var(--status-warning)]"
+            />
+            Allow actions
+          </label>
+        )}
+
+        {!settings.agentMode && (
+          <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
+            API
+            <select
+              value={api}
+              onChange={(e) => setApi(e.target.value)}
+              disabled={busy}
+              className="rounded-md border border-[var(--border-hairline)] bg-[var(--surface-page)] px-2 py-1 text-xs text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--series-1)] disabled:opacity-50"
+            >
+              {API_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
 
         <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
           Max tokens
@@ -412,8 +631,9 @@ export default function AIChatTab({ active = true }) {
               Ask the model anything.
             </p>
             <p className="max-w-sm text-xs text-[var(--text-muted)]">
-              Responses stream live. Chain-of-thought is collapsed under each
-              reply. Switch API style above to compare Halogen endpoints.
+              Responses stream live. Chain-of-thought and any tool calls are
+              collapsed under each reply. Turn Agent off to pick a raw API
+              style and compare Halogen endpoints directly.
             </p>
           </div>
         ) : (

@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .config import settings
-from .routers import chat, config_routes, live, runner, stats_routes, tokens, tuning
+from .routers import agent, chat, config_routes, live, runner, stats_routes, tokens, tuning
 from .services.live_service import RuntimeState, managed_poller, set_engine_target
 from .services.run_registry import registry, reconcile_loop
 
@@ -107,6 +107,7 @@ app.include_router(stats_routes.router, prefix="/api/v1")
 app.include_router(tokens.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
 app.include_router(runner.router, prefix="/api/v1")
+app.include_router(agent.router, prefix="/api/v1")
 
 
 @app.get("/api/v1/healthz")

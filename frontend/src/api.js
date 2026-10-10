@@ -300,3 +300,59 @@ export async function streamChat(
     if (err?.name !== 'AbortError') onError?.(err?.message || 'Stream interrupted')
   }
 }
+
+// Stream an agentic turn from the backend /api/v1/agent/chat endpoint.
+//
+// Same wire vocabulary as streamChat, plus one extra event:
+//   tool  {phase: 'call'|'result', name, detail|output}
+// so a client that ignores it still renders the answer correctly.
+//
+// onReasoning(textChunk), onDelta(textChunk), onTool({phase,name,...}),
+// onDone(donePayload), onError(err)
+export async function streamAgentChat(
+  {
+    messages,
+    mode = 'agent',
+    allowActions = false,
+    maxTurns,
+    maxTokens,
+    temperature,
+    thinking = true,
+  },
+  { onReasoning, onDelta, onTool, onDone, onError, signal } = {},
+) {
+  const body = { messages, mode, allow_actions: allowActions, thinking }
+  if (maxTurns != null) body.max_turns = maxTurns
+  if (maxTokens != null) body.max_tokens = maxTokens
+  if (temperature != null) body.temperature = temperature
+
+  let res
+  try {
+    res = await fetch(`${BASE}/agent/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+      body: JSON.stringify(body),
+      signal,
+    })
+  } catch (err) {
+    onError?.(err?.message || 'Request failed')
+    return
+  }
+
+  if (!res.ok || !res.body) {
+    onError?.(await readError(res, `HTTP ${res.status} on POST /agent/chat`))
+    return
+  }
+
+  try {
+    await readSSE(res, (event, data) => {
+      if (event === 'reasoning') onReasoning?.(data.text || '')
+      else if (event === 'delta') onDelta?.(data.text || '')
+      else if (event === 'tool') onTool?.(data)
+      else if (event === 'done') onDone?.(data)
+      else if (event === 'error') onError?.(textOr('Stream error', data?.message))
+    })
+  } catch (err) {
+    if (err?.name !== 'AbortError') onError?.(err?.message || 'Stream interrupted')
+  }
+}
