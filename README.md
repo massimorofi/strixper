@@ -204,11 +204,9 @@ backend is **not** on the default `8000`.
 **Permanent defaults:** set `BIND_HOST` / `BIND_PORT` in `backend/.env`. For the
 frontend, edit `server.port` and the proxy `target` in `frontend/vite.config.js`.
 
-**Docker:** the *host* side of `-p` is what can conflict — change it freely:
-
-```bash
-docker run -d -p 8010:8000 --name strixper strixper-dashboard   # host 8010 -> container 8000
-```
+**Docker:** the dashboard runs with `--network=host`, so `BIND_PORT` *is*
+the host port — change it with `-e BIND_PORT=8010` (see the Docker quick
+start below).
 
 **Finding a free port:**
 
@@ -258,73 +256,97 @@ mounted in the background, so you can check the metrics mid-chat and come back
 to it. It is also saved locally, so it survives a page reload. Use **Clear
 conversation** (eraser icon) to start over.
 
-## Docker
+## Docker quick start
 
-The image is multi-stage: stage 1 builds the React frontend, stage 2 runs the
-FastAPI backend which serves the built UI and the API on port 8000.
+The dashboard supervises LLM engine containers through the host's Docker
+daemon (the LLM-Runner) and reaches them on `127.0.0.1`, so the container
+needs the **Docker socket mounted** and **host networking** — a plain
+`-p 8000:8000` bridge mapping is not enough.
 
-**Build the image:**
+**Prerequisites:** Docker installed, and your user in the `docker` group
+(`docker ps` works without `sudo`).
 
-```bash
-docker build -t strixper-dashboard .
-```
-
-**Run it (local only):**
-
-```bash
-docker run -p 127.0.0.1:8000:8000 strixper-dashboard
-```
-
-**Run it exposed on the LAN:**
+### Build the image
 
 ```bash
-docker run -d -p 8000:8000 --name strixper strixper-dashboard
+./build_img.sh
 ```
 
-Then open **http://192.168.1.172:8000** (your LAN IP) from any device.
+Produces `strixper-dashboard:latest`. Pass a tag to override
+(`./build_img.sh strixper:v2`), or `NO_CACHE=1 ./build_img.sh` to
+rebuild from scratch.
 
-**With configuration** (point at a remote Halogen, change the port, etc.):
+### Start the container
 
 ```bash
-docker run -d -p 8000:8000 \
-  -e HALOGEN_HOST=http://192.168.1.50:8731 \
-  -e POLL_INTERVAL_SECONDS=5 \
-  strixper-dashboard
+./strixper.sh start
 ```
 
-Or use an env file:
+| Flag | Why it is needed |
+| --- | --- |
+| `--network=host` | The dashboard talks to engine containers on `127.0.0.1`; host networking also serves the UI on the LAN at `http://<this-host>:8000` |
+| `-v /var/run/docker.sock:/var/run/docker.sock` | The LLM-Runner starts/stops engine containers through the host daemon |
+| `-v /etc/group:/etc/group:ro` | Engine commands resolve the host `render` group GID (`getent group render`) |
+| `-v strixper-data:/app/backend/data` | Persists your LLM-Runner configs and the remembered engine target across recreations |
+| `--device=/dev/kfd` and `--device=/dev/dri` | Give ROCm SMI access to the host GPU devices |
+| `--group-add ...` | Allow the container to access GPU devices using the host `video` and `render` group IDs |
+
+Open **http://192.168.1.172:8000** (your LAN IP — `hostname -I`) from
+any device on the network. If a firewall is active, open the port first:
 
 ```bash
-docker run -d -p 8000:8000 --env-file backend/.env strixper-dashboard
+sudo ufw allow 8000/tcp
 ```
 
-**Rebuild after code changes:**
+### Stop the container
 
 ```bash
-docker build -t strixper-dashboard .
-docker rm -f strixper && docker run -d -p 8000:8000 --name strixper strixper-dashboard
+./strixper.sh stop
 ```
 
-**Compose (optional)** — `docker-compose.yml`:
+The script asks the backend to stop its active LLM-Runner engine before
+stopping the dashboard. If the dashboard was already stopped, the script
+starts it briefly so it can adopt and stop a configured engine left running.
+Use this script rather than `docker stop strixper`; a direct Docker stop
+bypasses the script's engine cleanup.
 
-```yaml
-services:
-  dashboard:
-    build: .
-    ports:
-      - "8000:8000"
-    env_file:
-      - backend/.env
-    restart: unless-stopped
-```
+Other useful actions:
 
 ```bash
-docker compose up -d --build
+./strixper.sh status
+./strixper.sh restart
+./build_img.sh && ./strixper.sh recreate
 ```
 
-> Note: `-p 8000:8000` publishes on all interfaces (LAN-exposed); prefix with
-> `127.0.0.1:` to keep it local-only. The container reads `BIND_HOST`/`BIND_PORT`
-> but the host port mapping is what actually controls LAN reachability.
+`recreate` stops the active engine, removes the dashboard container, then
+creates it from the selected image while preserving the `strixper-data` volume.
+Set `STRIXPER_IMAGE` to select a different image tag, or `BIND_PORT` when
+creating the container to use a different listening port.
+
+Remove the container with `docker rm strixper` (add `-v` to also delete
+the data volume).
+
+### Check it
+
+```bash
+docker logs -f strixper                       # backend logs
+curl http://127.0.0.1:8000/api/v1/healthz    # -> {"status":"ok"}
+docker ps                                     # dashboard + engine containers
+```
+
+### Notes
+
+- **ROCm diagnostics and GPU metrics:** the runtime image uses AMD's
+  version-pinned ROCm 7.2.2 Ubuntu base, which includes `rocm-smi`. Pass
+  `/dev/kfd` and `/dev/dri` as shown above for it to read GPU data. The
+  diagnostic's kernel and boot-parameter checks observe the host kernel;
+  package-manager and TuneD checks run inside the container and may not
+  reflect host firmware or TuneD state.
+- **Changing the port:** pass `-e BIND_PORT=8090` (with host networking
+  the container binds that port on the host directly).
+- **Configuration:** pass `-e KEY=value` or `--env-file backend/.env`
+  (see the Configuration table above). Env vars are read from the host at
+  container start; nothing sensitive is baked into the image.
 
 ## Project layout
 

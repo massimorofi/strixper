@@ -1,0 +1,36 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Node / frontend build artifacts (rebuilt inside the image)
+node_modules/
+frontend/node_modules/
+frontend/dist/
+dist/
+build/
+
+# Local env / secrets -- pass at runtime with -e or --env-file instead
+.env
+*.env.local
+backend/.env
+
+# Editor / tooling
+.vscode/
+.idea/
+.kilo/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+
+# Docs and images not needed inside the image
+*.md
+AMD_Strix_Halo_logo.png

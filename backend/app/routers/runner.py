@@ -39,6 +39,7 @@ running until something stops it on purpose.
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
