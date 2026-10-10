@@ -397,4 +397,4 @@ A llama.cpp build (commit `666f8898a`, Aug 2026) benchmarked **+22% faster** but
 6. **terminal-bench-mini** (kyuz0.github.io, 21 models) — agentic coding pass@1 over 19 terminal tasks.
 7. **GitHub issue #66** (Lars Urban / urbanswelt, 2026-05-15) — three-way IOMMU benchmark (off vs Translated vs iommu=pt).
 8. **developer.amd.com/playbooks** (device=halo) — official playbook catalog (mostly "Coming Soon" as of 2026-10-03).
-9. **Reddit r/StrixHalo** — *unreachable (403)*; community perspective drawn indirectly via GitHub issues and project docs instead.
+9. **Reddit r/StrixHalo** — community perspective.
