@@ -19,6 +19,7 @@ contracts and `strix_halo_finetuning.md` for the tuning recommendations.
 - [Configuration](#configuration)
 - [Changing ports](#changing-ports-port-conflicts)
 - [API](#api)
+- [Agentic AI Chat](#agentic-ai-chat)
 - [Docker quick start](#docker-quick-start)
 - [Docker Deployment Details](#docker-deployment-details)
 - [Project layout](#project-layout)
@@ -81,22 +82,43 @@ as `rocm-smi` to be installed.
   development server) must be available. Allow the selected port through the
   host firewall for LAN access.
 
-### Halogen LLM engine
+### LLM inference engine
 
-Halogen is a separate inference server, not included in the Strixper dashboard
-image. It is needed for live inference metrics, token counting, and AI Chat.
-The dashboard can start and stop engine containers through Docker's socket;
-configure a runnable engine in the LLM-Runner tab. See
+The dashboard does not include an inference engine. It monitors and supervises
+one that runs separately, and it is engine-agnostic about which one: Halogen,
+GUFO, or a `llama.cpp` `llama-server` all work, as long as the container
+exposes an HTTP endpoint the dashboard can reach.
+
+What each engine provides differs, and the dashboard degrades gracefully rather
+than failing:
+
+| Engine | Metrics namespace | `/cache` | `/v1/messages/count_tokens` |
+| --- | --- | --- | --- |
+| **Halogen** | `halogen:` + `llamacpp:` | Yes | Yes |
+| **GUFO** | `llamacpp:` only | No | Yes |
+| **llama.cpp** | `llamacpp:` only | No | Not provided |
+
+Throughput, KV-cache usage, and token totals come from the `llamacpp:` metrics
+that all three expose, so those charts work on any engine. The `halogen:`
+counters and the `/cache` endpoint are Halogen-only and read as absent
+(`None` / `{}`) elsewhere — the dashboard degrades to the available fields
+rather than erroring.
+
+One asymmetry worth knowing: GUFO reports `llamacpp:prompt_tokens_cached_total`,
+but the dashboard reads cached-token counts from `halogen:prompt_tokens_cached_total`.
+On GUFO that field therefore shows as unavailable even though the number exists.
+
+Configure a runnable engine in the **LLM-Runner** tab. See
 [strixper_prerequisites.md](./strixper_prerequisites.md) for the host, kernel,
 firmware, GPU driver, and engine/model setup checklist.
 
 ## What it does
 
-- **Live Server Metrics** — polls Halogen's `/health`, `/metrics` and `/v1/models`
-  and reads local sysfs/procfs telemetry, rendering KPI cards and time-series
-  charts (token throughput, KV pool, queue depth, host memory). The top
-  **Throughput** card shows the **session average** prefill/decode rate rather
-  than the instantaneous gauge, because Halogen's per-second throughput gauge
+- **Live Server Metrics** — polls the engine's `/health`, `/metrics` and
+  `/v1/models` and reads local sysfs/procfs telemetry, rendering KPI cards and
+  time-series charts (token throughput, KV pool, queue depth, host memory). The
+  top **Throughput** card shows the **session average** prefill/decode rate
+  rather than the instantaneous gauge, because the per-second throughput gauge
   reads 0 whenever the engine is idle.
 - **GPU Monitoring (rocm-smi)** — reads live GPU compute utilization and VRAM
   usage via `rocm-smi` and plots them alongside GTT and RAM in the memory chart.
@@ -112,11 +134,15 @@ firmware, GPU driver, and engine/model setup checklist.
 - **Prompt Cache & Token Counter** — a card with Halogen's prompt-cache telemetry
   (hit rate, tokens saved, stores/evictions, pool usage) and a widget that counts
   the exact token cost of any prompt before you send it.
-- **AI Chat** — a classic streaming chat tab. Type a request, watch the answer
-  stream in token-by-token, and expand the model's chain-of-thought under each
-  reply. Switch between Halogen's four inference API styles (**Chat
-  Completions**, **Anthropic Messages**, **Responses**, **Text Completions**) to
-  compare them, toggle the model's thinking on/off, and cap the response length.
+- **AI Chat** — a streaming chat tab with two modes. **Plain** is a classic
+  one-shot chat: type a request, watch the answer stream in token-by-token, and
+  expand the model's chain-of-thought under each reply. Switch between
+  Halogen's four inference API styles (**Chat Completions**, **Anthropic
+  Messages**, **Responses**, **Text Completions**) to compare them, toggle the
+  model's thinking on/off, and cap the response length. **Agent** turns the
+  same box into a tool-using assistant: it can inspect live metrics, run the
+  tuning audit, and (only if you explicitly allow it) start and stop engines.
+  See [Agentic AI Chat](#agentic-ai-chat).
 - **In-context Help** — every chart and every top KPI card has an **info button**
   (ⓘ, top-right corner) that opens a detailed explanation of the measures shown
   there.
@@ -245,6 +271,8 @@ Copy `backend/.env.example` to `backend/.env` and adjust:
 | `POLL_INTERVAL_SECONDS` | `5` | Background poll cadence |
 | `BIND_HOST` | `0.0.0.0` | Backend bind host |
 | `BIND_PORT` | `8000` | Backend bind port |
+| `AGENT_MAX_TURNS` | `8` | Max agent turns before the run is aborted |
+| `AGENT_INSTRUCTIONS` | built-in | Optional override of the agent system prompt |
 
 The polling interval can also be changed at runtime from the dashboard's
 auto-refresh selector (synced to the backend via `POST /api/v1/config`).
@@ -337,6 +365,94 @@ Your conversation is **not** cleared when you switch tabs — the chat stays
 mounted in the background, so you can check the metrics mid-chat and come back
 to it. It is also saved locally, so it survives a page reload. Use **Clear
 conversation** (eraser icon) to start over.
+
+## Agentic AI Chat
+
+Toggle **Agent** in the AI Chat toolbar and the tab stops sending one-shot
+completions. Instead, each request runs an
+[OpenAI Agents SDK](https://openai.github.io/openai-agents-python/) loop
+against your local engine: the model decides which dashboard tools to call,
+reads the results, and keeps going until it can answer. Nothing is sent off the
+machine — the SDK talks to the engine's OpenAI-compatible endpoint, and no
+OpenAI account or API key is involved.
+
+The reply streams exactly like Plain mode (text plus optional chain-of-thought),
+with one addition: a collapsible **Actions** panel under the answer lists every
+tool call and a summary of what came back.
+
+### Tools
+
+The agent has nine read-only tools, always available:
+
+| Tool | What it returns |
+| --- | --- |
+| `get_live_status` | Aggregated engine + hardware snapshot |
+| `get_engine_health` | Engine `/health` |
+| `get_engine_metrics` | Engine `/metrics` as parsed key/value pairs |
+| `get_cache_stats` | Prompt-cache telemetry |
+| `run_tuning_check` | Full Strix Halo compliance audit |
+| `get_system_info` | Hardware baseline |
+| `count_prompt_tokens` | Exact token cost of a prompt |
+| `list_runner_configs` | Saved LLM-Runner configurations |
+| `get_active_run` | The engine run currently tracked, if any |
+
+Two more tools are exposed **only** when you tick **Allow actions**:
+
+| Tool | What it does |
+| --- | --- |
+| `start_engine` | Launches a saved run configuration |
+| `stop_engine` | Stops the currently active run |
+
+**Allow actions is destructive.** Starting and stopping engines goes through the
+Docker socket, which is root-equivalent on the host. The toggle is off by
+default, is required per request, and the agent simply cannot see those two
+tools while it is off — this is not a suggestion in the prompt, it is enforced
+by which tools are registered.
+
+### Endpoints
+
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/api/v1/agent/chat` | POST | Streaming agentic chat (SSE) |
+| `/api/v1/agent/tools` | GET | Tool inventory for the current permission set |
+
+Request body:
+
+```json
+{
+  "messages": [{ "role": "user", "content": "Why is throughput low?" }],
+  "mode": "agent",
+  "allow_actions": false,
+  "max_turns": 8,
+  "max_tokens": 2048,
+  "temperature": 0.2,
+  "thinking": true
+}
+```
+
+Set `"mode": "plain"` to have the same endpoint fall through to the normal
+one-shot chat handler.
+
+The SSE stream reuses the Plain-mode vocabulary and adds one event:
+
+| Event | Payload | Meaning |
+| --- | --- | --- |
+| `reasoning` | `{"text": ...}` | Chain-of-thought chunk |
+| `delta` | `{"text": ...}` | Answer chunk |
+| `tool` | `{"phase": "call", "name": ..., "detail": ...}` | Tool invoked |
+| `tool` | `{"phase": "result", "name": ..., "output": ...}` | Tool returned |
+| `done` | `{"finish_reason", "usage", "timings"}` | Turn finished |
+| `error` | `{"message": ...}` | Aborted (max turns, engine down, ...) |
+
+Tool output is clipped before it reaches the model so a chatty endpoint cannot
+blow up the context window. `AGENT_MAX_TURNS` bounds how many model↔tool
+round-trips a single request may take.
+
+### Customising the instructions
+
+`AGENT_INSTRUCTIONS` replaces the built-in system prompt wholesale. The default
+describes the dashboard, the Strix Halo context, and when to reach for each
+tool; override it only if you want a different voice or a narrower remit.
 
 ## Docker quick start
 
@@ -483,16 +599,17 @@ backend/
   app/
     main.py                 FastAPI app + lifespan + static serving
     config.py               env settings
-    routers/                live, tuning, config, tokens, chat endpoints
+    routers/                live, tuning, config, tokens, chat, agent endpoints
     services/
       halogen_client.py     async Halogen HTTP client + Prometheus parser
       system_monitor.py     sysfs/procfs telemetry
       tuning_checker.py     compliance audit + system info
       live_service.py       background poller + shared runtime state
+      agent_tools.py        tool functions exposed to the agent
 frontend/
   src/
     App.jsx                 tabs, theme, polling, history buffer
-    api.js                  fetch helpers + streamChat SSE client
+    api.js                  fetch helpers + streamChat / streamAgentChat SSE clients
     components/             TopBar, StatTile, Meter, StatusBadge, LiveTab,
                             TuningTab, AIChatTab
     charts/                 Throughput, KV pool, Queue, Memory charts
@@ -528,7 +645,8 @@ to run, tune, and monitor AMD Strix Halo systems. Special thanks to:
 - [gufo-org/gufo](https://github.com/gufo-org/gufo)
   for the GUFO project and related Strix Halo work.
 
-Thanks also to the maintainers of React, Vite, FastAPI, Uvicorn, TanStack
-Query, Tailwind CSS, Recharts, lucide-react, Docker, and ROCm, and to the
-authors of the Halogen API and Strix Halo tuning references used in this
-project.
+Thanks also to the [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/)
+team, whose Python SDK powers the agentic chat, and to the maintainers of React,
+Vite, FastAPI, Uvicorn, TanStack Query, Tailwind CSS, Recharts, lucide-react,
+Docker, and ROCm, and to the authors of the Halogen API and Strix Halo tuning
+references used in this project.

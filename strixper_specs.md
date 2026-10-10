@@ -9,6 +9,15 @@ It is written so the application can be **rebuilt from scratch** and match the
 shipped behavior exactly. Where the original draft and the shipped app diverged,
 this document reflects the **shipped app**.
 
+> **On the word "Halogen".** The product is named after the engine it was built
+> for, and the endpoint contracts below are Halogen's. In practice the dashboard
+> is engine-agnostic: it monitors whatever HTTP server the engine target points
+> at, and GUFO and stock `llama.cpp` `llama-server` both work. Where a feature
+> genuinely depends on a Halogen-only endpoint (`/cache`, the `halogen:` metric
+> keys, `/v1/messages/count_tokens`), that is called out at the point of use.
+> Where the dashboard reads the `llamacpp:` namespace, it works on all three.
+> See §4.1 for the namespace breakdown and §4.6 for engine configuration.
+
 ---
 
 ## 1. System Overview & Architecture
@@ -44,6 +53,9 @@ this document reflects the **shipped app**.
 |  RocmMonitor     -> `rocm-smi` subprocess (GPU util %, VRAM)                        |
 |  TuningChecker   -> shell commands (uname, tuned-adm, lspci, ls, ...)               |
 |  StatsTracker    -> running min/avg/max accumulators (session-wide)                 |
+|  AgentOrchestrator (OpenAI Agents SDK) -> same Halogen endpoint, tool loop          |
+|                    -> dashboard tools: live status, metrics, cache, tuning, tokens    |
+|                    -> gated actions: start/stop engine (via docker socket)           |
 +------------------------------------------^----------------------------------------+
 |
 +-----------------------+-----------------------+
@@ -80,7 +92,14 @@ v                                               v
    raw Text Completions) from the UI to compare them, toggle the model's
    thinking on/off, and cap the response length. See §3.3 (`POST /api/v1/chat`)
    and §5.4 (Tab 3).
-8. **LLM-Runner** — a tab to create, run and locally store the docker command
+8. **Agentic AI Chat** — the same chat tab, in **Agent** mode, runs a
+   tool-using loop built on the OpenAI Agents SDK. The model inspects the
+   machine through dashboard tools (live status, metrics, cache, tuning audit,
+   token counting, runner configs) and iterates until it can answer. Destructive
+   tools (start/stop an engine) are registered only when the user explicitly
+   ticks **Allow actions**. See §3.3 (`POST /api/v1/agent/chat`) and §4.11
+   (`agent_tools`).
+9. **LLM-Runner** — a tab to create, run and locally store the docker command
    used to launch a containerized LLM inference server. Configurations are kept
    in a JSON file on disk, listed for selection, editable, and each can be
    started with a button that streams the container's live output; a running
@@ -95,6 +114,8 @@ v                                               v
   3.12, with **FastAPI** and **Uvicorn** (async, non-blocking).
 * **HTTP client:** `httpx` (async) for Halogen endpoints.
 * **Config:** `python-dotenv` (`.env` file).
+* **Agentic chat:** `openai-agents` (OpenAI Agents SDK, Python), driven through
+  Halogen's OpenAI-compatible endpoint — no OpenAI account required.
 * **Frontend:** React 18 + **Vite**.
 * **Styling:** **Tailwind CSS** (utility classes, CSS custom-property theming).
 * **Data fetching:** **TanStack Query** (`@tanstack/react-query`) with `refetchInterval`.
@@ -126,6 +147,8 @@ Read from environment variables / a `.env` file (`backend/app/config.py`):
 | `RUNNER_RECONCILE` | `20` | Seconds between scans for an untracked engine container |
 | `ENGINE_TARGET_PATH` | `backend/data/engine_target.json` | Remembered engine target (see §4.9) |
 | `DEFAULT_MODEL` | `halogen-qwen3.8-flash-next` | Model id assumed before any engine reports one |
+| `AGENT_MAX_TURNS` | `8` | Max model↔tool round-trips per agentic request (see §3.3) |
+| `AGENT_INSTRUCTIONS` | built-in | Optional replacement for the agent system prompt (see §3.3) |
 
 `HALOGEN_HOST` is easy to over-read: it is where the dashboard starts
 looking, not where it keeps looking. As soon as an engine is started through
@@ -150,6 +173,8 @@ All endpoints are mounted under the `/api/v1` prefix.
 | `/api/v1/stats/reset` | `POST` | On-demand (button) | Zero the session statistics and restart the clock |
 | `/api/v1/count-tokens` | `POST` | On-demand (widget) | Count the input tokens of a prompt (proxies Halogen) |
 | `/api/v1/chat` | `POST` | On-demand (AI-Chat tab) | Streaming chat completion (proxies Halogen, 4 API styles) |
+| `/api/v1/agent/chat` | `POST` | On-demand (AI-Chat tab, Agent mode) | Agentic tool-driven chat (SSE) |
+| `/api/v1/agent/tools` | `GET` | On-demand | Tool inventory for the current permission set |
 | `/api/v1/runner/configs` | `GET` | On-demand (LLM-Runner tab) | List stored docker run configurations |
 | `/api/v1/runner/configs/{id}` | `GET` | On-demand | Fetch one stored configuration |
 | `/api/v1/runner/configs` | `POST` | On-demand (LLM-Runner tab) | Create a new run configuration |
@@ -473,6 +498,96 @@ Errors: `422` on invalid body (Pydantic). `502` if Halogen is unreachable or
 returns an error (for `stream: false`; for `stream: true` the failure surfaces as
 an `error` SSE event instead).
 
+#### `POST /api/v1/agent/chat`
+
+Agentic chat. Instead of forwarding one request to Halogen, the backend runs an
+**OpenAI Agents SDK** loop: the model is given dashboard tools, chooses among
+them, reads the results, and continues until it produces a final answer. The
+client sees one streamed turn, exactly like `POST /api/v1/chat`, plus tool
+events.
+
+Request:
+
+```json
+{
+  "messages": [
+    { "role": "user", "content": "Why is my decode throughput low?" }
+  ],
+  "mode": "agent",
+  "allow_actions": false,
+  "max_turns": 8,
+  "max_tokens": 2048,
+  "temperature": 0.2,
+  "thinking": true,
+  "instructions": ""
+}
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `messages` | required | Full conversation history, sent every turn (no server-side session) |
+| `mode` | `agent` | `agent` runs the SDK loop; `plain` delegates to the `POST /api/v1/chat` handler |
+| `allow_actions` | `false` | When true, the destructive tools (`start_engine`, `stop_engine`) are registered |
+| `max_turns` | `AGENT_MAX_TURNS` (8) | Hard cap on model↔tool round-trips |
+| `max_tokens` | `2048` | Per-call response cap |
+| `temperature` | `0.2` | Low by default; a tool-calling loop drifts badly when creative |
+| `thinking` | `true` | `false` sends `reasoning.effort = "none"` so Halogen suppresses chain-of-thought |
+| `instructions` | empty | Per-request system-prompt override; falls back to `AGENT_INSTRUCTIONS`, then the built-in prompt |
+
+Response is `text/event-stream`:
+
+| Event | Payload | Notes |
+| --- | --- | --- |
+| `reasoning` | `{"text": "..."}` | Chain-of-thought delta (only when thinking is on) |
+| `delta` | `{"text": "..."}` | Answer delta |
+| `tool` | `{"phase": "call", "name": "...", "detail": "..."}` | The model invoked a tool |
+| `tool` | `{"phase": "result", "name": "...", "output": "..."}` | The tool returned |
+| `done` | `{"finish_reason", "usage", "timings"}` | Turn finished; `usage` is the sum across all turns |
+| `error` | `{"message": "..."}` | Aborted — max turns exceeded, engine unreachable, ... |
+
+The `reasoning` / `delta` / `done` / `error` vocabulary is identical to
+`POST /api/v1/chat`, so a client that works there works here; `tool` is the one
+addition and unknown events are ignored by the shared SSE reader.
+
+**Two SDK behaviors worth recording.** Both were found empirically and are the
+reason the code looks the way it does:
+
+1. **`include_usage` must be set explicitly.** The SDK only adds
+   `stream_options={"include_usage": true}` when it recognises a genuine OpenAI
+   endpoint. Halogen is not recognised, so without
+   `ModelSettings(include_usage=True)` the usage block never arrives and the
+   token stats render blank.
+2. **Thinking control lives in `reasoning.effort`, not `reasoning_effort`.**
+   `ModelSettings` is a pydantic dataclass; a flat `reasoning_effort=` kwarg is
+   silently discarded and thinking stays on. The nested
+   `Reasoning(effort="none")` shape is what reaches the wire.
+
+`RunResultStreaming` exposes no `final_usage`; the aggregate is computed from
+`result.raw_responses`, each of which carries a `.usage`.
+
+Errors: `422` on invalid body. Mid-stream failures surface as an `error` event
+rather than an HTTP status, because the stream has already started.
+
+#### `GET /api/v1/agent/tools`
+
+Returns the tool inventory for the current permission set:
+
+```json
+{
+  "allow_actions": false,
+  "tools": [
+    {
+      "name": "get_live_status",
+      "description": "Aggregated Halogen + hardware snapshot",
+      "destructive": false
+    }
+  ]
+}
+```
+
+Useful for confirming which tools an agent turn will actually see. `start_engine`
+and `stop_engine` appear only with `?allow_actions=true`.
+
 #### LLM-Runner endpoints
 
 The LLM-Runner tab lets the user **create, run and store** the docker command
@@ -687,6 +802,37 @@ payloads to the `halogen` section:
 | `draft_acceptance_rate` | `halogen:draft_tokens_accepted_total / halogen:draft_tokens_total` (rounded 4dp) |
 | `cache` | `GET /cache` payload passed through verbatim (empty `{}` if unavailable) |
 
+**Metric namespaces are not uniform across engines.** The `llamacpp:` keys come
+from `llama.cpp`'s own Prometheus exporter and are therefore present under
+GUFO and a stock `llama-server` as well; the `halogen:` keys and the `/cache`
+endpoint are Halogen-specific. The mapping above already reflects this: the
+throughput, KV-usage, and token-total fields read from `llamacpp:` and work on
+any engine, while `kv_pool_positions`, `prompt_tokens_cached_total`,
+`draft_acceptance_rate`, and `cache` depend on Halogen and read as absent
+(`None` / `{}`) elsewhere. Nothing in the merge raises on a missing key, so a
+non-Halogen engine yields a partially populated snapshot rather than an
+error.
+
+Verified against the shipped binaries rather than assumed:
+
+| | `halogen:` keys | `llamacpp:` keys | `/cache` | `/v1/messages/count_tokens` |
+| --- | --- | --- | --- | --- |
+| Halogen | Yes | Yes | Yes | Yes |
+| GUFO | No | Yes | No | Yes |
+| `llama-server` | No | Yes | No | No |
+
+(Confirmed by inspecting the shipped binaries: the route strings compiled into
+`gufo` include `/v1/messages/count_tokens`; the `llama-server` build in the
+`rocm-10.0` toolbox does not expose it.)
+
+GUFO's exporter emits `llamacpp:prompt_tokens_cached_total` and
+`llamacpp:spec_decode_num_*` for its speculative decoding. The mapping above
+reads the equivalent figures from `halogen:prompt_tokens_cached_total` and
+`halogen:draft_tokens_*`, so on GUFO those two fields show as unavailable even
+though the underlying counters exist under different names. Adding a fallback to
+the `llamacpp:` names would restore them; until then the dashboard simply omits
+cached-token and draft-acceptance figures for non-Halogen engines.
+
 ### 4.2 `SystemMonitor` (`services/system_monitor.py`)
 
 Cheap filesystem reads, safe to call from the event loop.
@@ -814,6 +960,18 @@ Persists the LLM-Runner docker configurations to a JSON file on disk.
   have no such key; `_load` normalises it to `[]`. A stored `parameters` list
   that no longer validates (a hand-edited file, say) is dropped to `[]` rather
   than making the whole store unreadable.
+* **Read once, at construction.** `_load()` is called from `__init__` and never
+  again; there is no reload, watcher, or mtime check. The in-memory list is the
+  source of truth for the process lifetime, and every mutation `_persist()`s the
+  whole list over the file. Two consequences worth knowing before hand-editing
+  `llm_runner_configs.json`:
+  - Edits made while the backend is running are invisible until restart. The API
+    keeps reporting the set the process booted with.
+  - Worse, the next create/update/delete overwrites the file with the
+    in-memory list, silently discarding whatever was hand-added. A third
+    engine appended to the file by hand disappears the moment a config is saved
+    from the UI.
+  Edit the file with the backend stopped, or use the LLM-Runner UI.
 * `list()`, `get(id)`, `create(...)`, `update(id, ...)`, `delete(id)`.
 
 The router (`routers/runner.py`) holds one lazily-created store instance and a
@@ -1063,6 +1221,52 @@ run does not care. It is stopped only by an explicit stop.
 * **Deleting a running configuration is refused** with `409`. It would
   leave a live container with nothing describing it. Stop the run first.
 
+### 4.11 `agent_tools` (`services/agent_tools.py`)
+
+Builds the tool set handed to the agent for a single request.
+
+* `build_tools(state, allow_actions)` → `list[FunctionTool]`.
+  A **new list is built per request**, not once at import: the SDK binds the
+  enabled/disabled decision and the closure over `state` at decoration time, so
+  a module-level list would freeze the permission set forever.
+
+**Read-only tools (always present):**
+
+| Tool | Backing |
+| --- | --- |
+| `get_live_status` | `build_live_snapshot` / live snapshot |
+| `get_engine_health` | `HalogenClient.get_health` |
+| `get_engine_metrics` | `HalogenClient.get_metrics` |
+| `get_cache_stats` | `HalogenClient.get_cache` |
+| `run_tuning_check` | `tuning_checker.run_all_checks` |
+| `get_system_info` | `tuning_checker.get_system_info` |
+| `count_prompt_tokens` | `HalogenClient.count_tokens` |
+| `list_runner_configs` | `runner_store` via `runner.get_store` |
+| `get_active_run` | `run_registry.registry` |
+
+**Action tools (registered only when `allow_actions` is true):**
+
+| Tool | Backing | Effect |
+| --- | --- | --- |
+| `start_engine` | `runner.launch_config(state, config_id)` | Starts a saved run configuration |
+| `stop_engine` | `registry.stop_active()` | Stops the active run |
+
+`stop_engine` verifies that the `run_id` the model passes matches the run the
+registry believes is active before stopping, so a hallucinated id cannot stop
+something else.
+
+**Every tool returns a JSON string, clipped.** `_clip()` serialises the payload
+and truncates it. Raw `/metrics` output is several tens of kilobytes; feeding it
+to the model unbounded would consume the context window in one call. Clipping
+keeps context growth predictable.
+
+**Why `launch_config` was extracted from `run_config` (§3.3).** The docker-launch
+logic previously lived inside the HTTP handler, which meant the only way to start
+an engine was to make an HTTP request. `launch_config(state, config_id,
+values=None)` is the transport-free core; `run_config` is now a thin wrapper that
+maps `ConfigNotFound` → 404, `ValueError` → 400, `RuntimeError` → 502. The
+agent calls `launch_config` directly. Behavior of the HTTP endpoint is unchanged.
+
 ---
 
 ## 5. Frontend Dashboard Specification
@@ -1160,10 +1364,19 @@ a controls bar, a scrolling message list, and a composer.
 
 **Controls bar (top).**
 
+* **Agent** — checkbox (default off). Off, the tab is the classic one-shot chat
+  described below. On, every request goes to `POST /api/v1/agent/chat` and the
+  agentic loop takes over (§3.3). The API selector is hidden in Agent mode: the
+  SDK owns request routing, so the four-style switch no longer applies.
+* **Allow actions** — shown only when Agent is on. Tick it and the agent is
+  additionally given `start_engine` and `stop_engine`. Off by default. This is
+  enforced by which tools are registered server-side, not by asking the model to
+  behave.
 * **API selector** — `Chat Completions` (default), `Anthropic Messages`,
   `Responses`, `Text Completions`. Changing it switches the upstream Halogen
   endpoint used for subsequent turns (see the mapping in §3.3). The current
-  style and its upstream path are shown in the header subtitle.
+  style and its upstream path are shown in the header subtitle. Hidden in
+  Agent mode.
 * **Max tokens** — numeric input (1–32,768), sent as `max_tokens`.
 * **Thinking** — checkbox (default on). Unchecking sends `thinking: false` so
   the model suppresses its chain-of-thought.
@@ -1174,9 +1387,13 @@ turns as left-aligned bubbles with an avatar. Each assistant bubble contains:
 
 * A **collapsible reasoning block** (collapsed by default) showing the model's
   chain-of-thought with its character count.
+* In Agent mode, a **collapsible Actions panel** (collapsed by default, styled
+  like the reasoning block) listing each tool call and a one-line summary of its
+  result, in call order.
 * The **answer text**, streamed in live with a blinking caret while generating.
 * A **per-turn stats line** (after completion): input/output token counts,
-  decode speed (tok/s), wall-clock seconds, and `finish_reason`.
+  decode speed (tok/s), wall-clock seconds, and `finish_reason`. In Agent mode
+  the tool-call count is appended.
 
 While a turn is in flight, the composer's Send button becomes a **Stop** button
 that aborts the stream via `AbortController`. Errors surface as a red banner
@@ -1188,6 +1405,13 @@ newline**. Empty input disables Send.
 **Client-side streaming.** `streamChat()` in `api.js` uses `fetch` +
 `ReadableStream` (not `EventSource`, which cannot POST) and parses the SSE
 frames, dispatching `onReasoning` / `onDelta` / `onDone` / `onError` callbacks.
+`streamAgentChat()` is the Agent-mode counterpart: same reader, plus an
+`onTool` callback for the `tool` events.
+
+**Chat preferences.** Mode, Allow-actions, max tokens, thinking, and API style
+are persisted under a separate `localStorage` key (`strixper-chat-settings`)
+from the transcript (`strixper-chat`), so **Clear conversation** empties the
+messages without resetting how the tab is configured.
 For the `completions` style, `createThinkSplitter()` incrementally splits the
 raw text on the `<|im_start|>…<|im_end|>` markers so reasoning and
 answer render separately, matching the other three styles.
@@ -1331,6 +1555,7 @@ backend/
       stats_routes.py       POST /stats/reset
       tokens.py             POST /count-tokens (Halogen count_tokens proxy)
       chat.py               POST /chat (streaming chat proxy, 4 API styles)
+      agent.py              POST /agent/chat, GET /agent/tools (agentic chat)
       runner.py             LLM-Runner: config CRUD + start/watch/stop + preview
     services/
       docker_control.py     stop/kill/inspect the container a run owns
@@ -1343,6 +1568,7 @@ backend/
       run_registry.py       the live run: pump, fan-out, adoption, reconcile
       runner_store.py       JSON-persisted store for LLM-Runner docker configs
       params.py             {name} template validation + command rendering
+      agent_tools.py        tool functions exposed to the agent (read-only + gated)
     data/
       llm_runner_configs.json   runtime store (gitignored)
       engine_target.json        remembered engine target (gitignored)
@@ -1363,7 +1589,7 @@ frontend/
       CacheStatsCard.jsx    Halogen prompt-cache telemetry card (GET /cache)
       TokenCounter.jsx      on-demand prompt token counter (POST /count-tokens)
       TuningTab.jsx         Tab 2 (banner + audit table)
-      AIChatTab.jsx         Tab 3 (streaming chat, reasoning, API style switch)
+      AIChatTab.jsx         Tab 3 (streaming chat, reasoning, agent mode, tool steps)
       RunnerTab.jsx         Tab 4 (create/run/store docker run configs)
     charts/
       ChartCard.jsx         chart wrapper with info button
@@ -1423,7 +1649,7 @@ several design decisions:
    `poll_loop`, `managed_poller`.
 6. **TuningChecker** — the 8 checks + `run_all_checks` + `get_system_info`.
 7. **Routers** — `live`, `tuning`, `config_routes`, `stats_routes`, `tokens`,
-    `chat`, `runner`, `healthz`.
+    `chat`, `agent`, `runner`, `healthz`.
 8. **Frontend scaffold** — Vite + React + Tailwind + TanStack Query + Recharts +
    lucide-react; theme tokens; formatters; `api.js`.
 9. **Tab 1** — 4 KPI cards (each with info modal), secondary counters,
@@ -1433,27 +1659,37 @@ several design decisions:
 11. **Tab 3 (AI-Chat)** — `streamChat` SSE client + `createThinkSplitter` in
     `api.js`; `AIChatTab.jsx` with message list, collapsible reasoning, API
     style switch, thinking toggle, max-tokens input, and stop/clear controls.
-12. **Tab 4 (LLM-Runner)** — `RunnerStore` (JSON-persisted config CRUD) +
+12. **Agentic chat** — `agent_tools.py` (read-only tools + `allow_actions`
+    gated actions, JSON-clipped returns), `agent.py` router
+    (`POST /api/v1/agent/chat`, `GET /api/v1/agent/tools`), `AGENT_MAX_TURNS`
+    and `AGENT_INSTRUCTIONS` in `config.py`, `openai-agents` in
+    `requirements.txt`, and `streamAgentChat()` in `api.js`. Extract
+    `launch_config` / `ConfigNotFound` from `run_config` in `runner.py` so the
+    agent and the HTTP route share one launch path. Add the **Agent** and
+    **Allow actions** toggles plus the collapsible Actions panel to
+    `AIChatTab.jsx`, and persist chat preferences under
+    `strixper-chat-settings`.
+13. **Tab 4 (LLM-Runner)** — `RunnerStore` (JSON-persisted config CRUD) +
     `runner.py` router (config CRUD, run with SSE output stream, stop);
     `RunnerTab.jsx` with the config list, create/edit form, and live run
     console with stop control. Keep the tab mounted so a run survives tab
     switches.
-13. **Packaging and deployment** — multi-stage `Dockerfile`: Node 22 builds
+14. **Packaging and deployment** — multi-stage `Dockerfile`: Node 22 builds
     the frontend, AMD `rocm/dev-ubuntu-24.04:7.2.2` supplies ROCm SMI and the
     Python 3.12 runtime, and FastAPI serves the production frontend. Include
     the Docker CLI, healthcheck, and `docker-entrypoint.sh`.
-14. **Container lifecycle wrapper** — `strixper.sh` builds no images itself;
+15. **Container lifecycle wrapper** — `strixper.sh` builds no images itself;
     it starts/stops/restarts/recreates/status-checks the dashboard and manages
     configured engine containers. It passes host networking, Docker socket,
     persistent `strixper-data` volume, `/dev/kfd`, `/dev/dri`, and host
     `video`/`render` group IDs. Stop must request engine shutdown through the
     Runner API before stopping Strixper, including discovery of configured
     engines after a dashboard restart.
-15. **Local workflow and docs** — `run.sh` starts backend + Vite for
+16. **Local workflow and docs** — `run.sh` starts backend + Vite for
     development; `stop.sh` stops those local processes. README documents
     prerequisites, local and Docker quick starts, LAN/security behavior,
     configuration, and credits.
-16. **Verify** — `cd frontend && npm run build`; build and run the container;
+17. **Verify** — `cd frontend && npm run build`; build and run the container;
     confirm its healthcheck, frontend assets, ROCm SMI and GPU device access;
     restart backend; confirm
     live-status, stats reset, tuning checks, all info modals, and the
@@ -1545,7 +1781,8 @@ Special thanks to:
 * [gufo-org/gufo](https://github.com/gufo-org/gufo)
   for the GUFO project and related Strix Halo work.
 
-Additional thanks to the React, Vite, FastAPI, Uvicorn, TanStack Query,
-Tailwind CSS, Recharts, lucide-react, Docker, and ROCm communities, and to the
-authors of the Halogen API and Strix Halo tuning references used by this
-project.
+Additional thanks to the [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/)
+team, whose Python SDK powers the agentic chat, and to the React, Vite,
+FastAPI, Uvicorn, TanStack Query, Tailwind CSS, Recharts, lucide-react,
+Docker, and ROCm communities, and to the authors of the Halogen API and
+Strix Halo tuning references used by this project.
