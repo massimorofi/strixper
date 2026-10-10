@@ -91,7 +91,8 @@ v                                               v
 
 ## 2. Technology Stack
 
-* **Backend:** Python 3.11+, **FastAPI**, **Uvicorn** (async, non-blocking).
+* **Backend:** Python 3.11+ for local development; the Docker runtime is Python
+  3.12, with **FastAPI** and **Uvicorn** (async, non-blocking).
 * **HTTP client:** `httpx` (async) for Halogen endpoints.
 * **Config:** `python-dotenv` (`.env` file).
 * **Frontend:** React 18 + **Vite**.
@@ -1375,6 +1376,9 @@ frontend/
 Dockerfile
 run.sh
 stop.sh
+build_img.sh
+strixper.sh
+docker-entrypoint.sh
 ```
 
 ---
@@ -1434,8 +1438,114 @@ several design decisions:
     `RunnerTab.jsx` with the config list, create/edit form, and live run
     console with stop control. Keep the tab mounted so a run survives tab
     switches.
-13. **Packaging** — `Dockerfile` (multi-stage: build frontend, serve from
-    FastAPI), `run.sh` (dev: backend + Vite concurrently), `stop.sh`.
-14. **Verify** — `cd frontend && npm run build`; restart backend; confirm
+13. **Packaging and deployment** — multi-stage `Dockerfile`: Node 22 builds
+    the frontend, AMD `rocm/dev-ubuntu-24.04:7.2.2` supplies ROCm SMI and the
+    Python 3.12 runtime, and FastAPI serves the production frontend. Include
+    the Docker CLI, healthcheck, and `docker-entrypoint.sh`.
+14. **Container lifecycle wrapper** — `strixper.sh` builds no images itself;
+    it starts/stops/restarts/recreates/status-checks the dashboard and manages
+    configured engine containers. It passes host networking, Docker socket,
+    persistent `strixper-data` volume, `/dev/kfd`, `/dev/dri`, and host
+    `video`/`render` group IDs. Stop must request engine shutdown through the
+    Runner API before stopping Strixper, including discovery of configured
+    engines after a dashboard restart.
+15. **Local workflow and docs** — `run.sh` starts backend + Vite for
+    development; `stop.sh` stops those local processes. README documents
+    prerequisites, local and Docker quick starts, LAN/security behavior,
+    configuration, and credits.
+16. **Verify** — `cd frontend && npm run build`; build and run the container;
+    confirm its healthcheck, frontend assets, ROCm SMI and GPU device access;
+    restart backend; confirm
     live-status, stats reset, tuning checks, all info modals, and the
     LLM-Runner create/run/stop flow render.
+
+---
+
+## 9. Docker Deployment and Lifecycle Contract
+
+### 9.1 Image build and runtime
+
+The root `Dockerfile` is a multi-stage production image:
+
+1. `node:22-alpine` builds the React frontend into `frontend/dist`.
+2. `rocm/dev-ubuntu-24.04:7.2.2` is the runtime base. It provides Ubuntu 24.04,
+   Python 3.12, ROCm userspace including `rocm-smi`, and the utilities needed
+   by the backend. Python dependencies are installed in `/opt/venv`.
+3. The runtime copies the Docker CLI from `docker:cli`, installs
+   `backend/requirements.txt`, copies the backend and frontend build, and uses
+   `docker-entrypoint.sh` to `exec` Uvicorn as PID 1.
+
+The image binds `BIND_HOST=0.0.0.0`, `BIND_PORT=8000` by default. Its Docker
+healthcheck polls `/api/v1/healthz`; this is backend liveness and does not imply
+that a Halogen engine is running or reachable.
+
+### 9.2 Host runtime requirements
+
+The dashboard container relies on host facilities and must be created with:
+
+* `--network=host` so dashboard-managed inference containers published on
+  loopback remain reachable at `127.0.0.1`, and the dashboard is reachable on
+  the host's LAN interfaces.
+* `/var/run/docker.sock` mounted into the container for the LLM-Runner Docker
+  CLI. Access to this socket grants broad control over the host Docker daemon.
+* `/dev/kfd` and `/dev/dri` devices and the host numeric `video` and `render`
+  group IDs so `rocm-smi` can query the GPU.
+* `/etc/group` read-only for engine commands that resolve the host `render`
+  group.
+* The named `strixper-data` volume mounted at `/app/backend/data` to preserve
+  Runner configs and the remembered engine target across container removal.
+
+The provided `strixper.sh` resolves host GPU group IDs and sets these runtime
+options when creating the container. With host networking, Docker port
+publishing (`-p`) is not used; configure the host firewall separately for LAN
+access. The HTTP dashboard has no authentication and should not be exposed to
+untrusted networks.
+
+### 9.3 `strixper.sh` lifecycle actions
+
+The repository-level `strixper.sh` is the supported Docker stack controller:
+
+| Action | Contract |
+| --- | --- |
+| `start` | Start the existing named container, or create it from `STRIXPER_IMAGE` (default `strixper-dashboard:latest`). Wait for `/api/v1/healthz`. |
+| `stop` | Ensure the backend is available, query the active Runner run, stop it using the Runner API, render saved config commands to discover their `--name` container names, stop any still-running matching containers, then stop Strixper. |
+| `restart` | Perform managed shutdown followed by start. |
+| `recreate` | Perform managed shutdown, remove the dashboard container, and recreate it while retaining `strixper-data`. |
+| `status` | Report container status and current active-run container name. |
+
+If Strixper was already stopped, `stop` starts it temporarily so startup
+discovery can adopt a running container whose name matches a saved
+configuration. Failures to query or stop managed engines are surfaced, and the
+dashboard is left running rather than hiding an incomplete shutdown.
+
+The wrapper manages configured Runner engine containers, not arbitrary Docker
+containers. A container started manually or through a config that was removed
+before shutdown may not be discoverable from the saved configuration and is
+outside this cleanup contract. Direct `docker stop strixper` also bypasses
+engine cleanup; use `./strixper.sh stop`.
+
+### 9.4 Local development versus Docker operation
+
+`run.sh` remains the local development workflow: it runs FastAPI and the Vite
+development server concurrently. `stop.sh` stops those local processes only;
+it does not stop Docker-managed inference containers. Use `strixper.sh` for the
+Docker dashboard and its configured engine lifecycle.
+
+---
+
+## 10. Credits
+
+This project builds on open-source software and community documentation.
+Special thanks to:
+
+* [kyuz0/amd-strix-halo-toolboxes](https://github.com/kyuz0/amd-strix-halo-toolboxes)
+  for Strix Halo ROCm tooling and system guidance.
+* [peonist-ai/halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server)
+  for the Halogen inference server.
+* [gufo-org/gufo](https://github.com/gufo-org/gufo)
+  for the GUFO project and related Strix Halo work.
+
+Additional thanks to the React, Vite, FastAPI, Uvicorn, TanStack Query,
+Tailwind CSS, Recharts, lucide-react, Docker, and ROCm communities, and to the
+authors of the Halogen API and Strix Halo tuning references used by this
+project.

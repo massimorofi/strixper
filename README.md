@@ -1,5 +1,6 @@
 # Halogen Strix Halo Operations Dashboard
 ![AMD Strix Halo Logo](AMD_Strix_Halo_logo.png)
+
 A real-time web dashboard for monitoring a running **Halogen LLM Server** alongside
 host and hardware telemetry on an **AMD Strix Halo** (Ryzen AI Max+ 395 / Radeon
 8060S) machine, with an on-demand fine-tuning compliance audit and a built-in
@@ -7,6 +8,87 @@ streaming **AI chat**.
 
 Built from `strixper_specs.md`, using `halogen_api.md` for the Halogen endpoint
 contracts and `strix_halo_finetuning.md` for the tuning recommendations.
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Prerequisites](#prerequisites)
+- [What it does](#what-it-does)
+- [Architecture](#architecture)
+- [Local Development and Run Modes](#local-development-and-run-modes)
+- [Configuration](#configuration)
+- [Changing ports](#changing-ports-port-conflicts)
+- [API](#api)
+- [Docker quick start](#docker-quick-start)
+- [Docker Deployment Details](#docker-deployment-details)
+- [Project layout](#project-layout)
+- [Tuning checks](#notes-on-the-tuning-checks)
+- [Credits](#credits)
+
+## Quick Start
+
+Choose Docker for a self-contained dashboard image, or run the frontend and
+backend directly for development.
+
+### Run with Docker
+
+From the repository root, build the image and start Strixper:
+
+```bash
+./build_img.sh
+./strixper.sh start
+```
+
+Open **http://localhost:8000** on the host. To access it from another device,
+use the host's LAN IP, for example `http://192.168.1.172:8000`. Stop Strixper
+and its configured LLM engine containers together with:
+
+```bash
+./strixper.sh stop
+```
+
+The start script uses host networking, the Docker socket, a persistent
+`strixper-data` volume, and host GPU devices/groups for ROCm telemetry and the
+LLM Runner. See [Docker Deployment Details](#docker-deployment-details) before
+exposing the unauthenticated dashboard to a network.
+
+### Run locally
+
+With Python 3.11+ and Node.js 20+ installed:
+
+```bash
+./run.sh
+```
+
+Open **http://localhost:5173**. The development server runs the API on port
+8000 and the Vite frontend on port 5173. Stop both local processes with
+**Ctrl+C** or `./stop.sh`. Locally, GPU telemetry requires host ROCm tools such
+as `rocm-smi` to be installed.
+
+## Prerequisites
+
+### Dashboard
+
+- **Docker mode:** Linux Docker Engine, permission to use the Docker daemon,
+  and the host's `/dev/kfd` and `/dev/dri` devices. The `video` and `render`
+  host groups must exist; `strixper.sh` resolves their numeric GIDs.
+- **Local mode:** Python 3.11 or newer, Node.js 20 or newer, npm, and the
+  dependencies installed by `run.sh`.
+- **AMD GPU telemetry:** an AMDGPU-enabled Linux host. The Docker image is
+  based on AMD's ROCm 7.2.2 Ubuntu 24.04 image and includes `rocm-smi`; runtime
+  device access is supplied by the Docker start script.
+- **Network:** TCP port 8000 for the backend (and 5173 for the local Vite
+  development server) must be available. Allow the selected port through the
+  host firewall for LAN access.
+
+### Halogen LLM engine
+
+Halogen is a separate inference server, not included in the Strixper dashboard
+image. It is needed for live inference metrics, token counting, and AI Chat.
+The dashboard can start and stop engine containers through Docker's socket;
+configure a runnable engine in the LLM-Runner tab. See
+[strixper_prerequisites.md](./strixper_prerequisites.md) for the host, kernel,
+firmware, GPU driver, and engine/model setup checklist.
 
 ## What it does
 
@@ -57,7 +139,7 @@ FastAPI backend (asyncio)
 Halogen engine + Linux host
 ```
 
-## Running the dashboard
+## Local Development and Run Modes
 
 Pick the mode that matches how you want to use it.
 
@@ -205,8 +287,8 @@ backend is **not** on the default `8000`.
 frontend, edit `server.port` and the proxy `target` in `frontend/vite.config.js`.
 
 **Docker:** the dashboard runs with `--network=host`, so `BIND_PORT` *is*
-the host port — change it with `-e BIND_PORT=8010` (see the Docker quick
-start below).
+the host port. Change it when recreating the container with
+`BIND_PORT=8010 ./strixper.sh recreate` (see the Docker quick start below).
 
 **Finding a free port:**
 
@@ -257,6 +339,9 @@ to it. It is also saved locally, so it survives a page reload. Use **Clear
 conversation** (eraser icon) to start over.
 
 ## Docker quick start
+
+For the shortest path see [Quick Start](#quick-start). This section documents
+the Docker runtime, options, and operational behavior in more detail.
 
 The dashboard supervises LLM engine containers through the host's Docker
 daemon (the LLM-Runner) and reaches them on `127.0.0.1`, so the container
@@ -323,8 +408,10 @@ creates it from the selected image while preserving the `strixper-data` volume.
 Set `STRIXPER_IMAGE` to select a different image tag, or `BIND_PORT` when
 creating the container to use a different listening port.
 
-Remove the container with `docker rm strixper` (add `-v` to also delete
-the data volume).
+After running `./strixper.sh stop`, remove only the dashboard container with
+`docker rm strixper`; the named `strixper-data` volume remains available for
+the next start. To permanently delete the saved Runner configs and engine
+target, remove that volume separately with `docker volume rm strixper-data`.
 
 ### Check it
 
@@ -342,11 +429,52 @@ docker ps                                     # dashboard + engine containers
   diagnostic's kernel and boot-parameter checks observe the host kernel;
   package-manager and TuneD checks run inside the container and may not
   reflect host firmware or TuneD state.
-- **Changing the port:** pass `-e BIND_PORT=8090` (with host networking
-  the container binds that port on the host directly).
-- **Configuration:** pass `-e KEY=value` or `--env-file backend/.env`
-  (see the Configuration table above). Env vars are read from the host at
-  container start; nothing sensitive is baked into the image.
+- **Changing the port:** run `BIND_PORT=8090 ./strixper.sh recreate`. With
+  host networking, the container binds that port directly on the host.
+- **Runtime configuration:** use the dashboard settings to change the
+  Halogen engine address and polling interval. The wrapper passes `BIND_HOST`
+  and `BIND_PORT` when it creates the dashboard container; other startup
+  environment variables are not currently forwarded by `strixper.sh`.
+
+### Docker Deployment Details
+
+The runtime image uses `rocm/dev-ubuntu-24.04:7.2.2` and serves both the
+production React build and the FastAPI API from one process. Its frontend is
+built in a separate Node.js stage. The runtime also includes the Docker CLI,
+Python backend dependencies, and ROCm SMI from AMD's base image.
+
+Use `./build_img.sh` to build `strixper-dashboard:latest`. `./strixper.sh`
+manages the dashboard container with these actions:
+
+| Command | Behavior |
+| --- | --- |
+| `./strixper.sh start` | Start the existing dashboard container or create it from the selected image |
+| `./strixper.sh stop` | Stop the active LLM-Runner run, stop any running containers named by saved Runner configurations, then stop Strixper |
+| `./strixper.sh restart` | Stop the managed stack and start the dashboard again |
+| `./strixper.sh recreate` | Stop managed engines, remove/recreate the dashboard container, and preserve its data volume |
+| `./strixper.sh status` | Show dashboard status and the active Runner engine, if any |
+
+Use this wrapper rather than `docker stop strixper` when stopping the stack:
+a direct Docker stop does not call the Runner API or stop its engine containers.
+The wrapper can also start a stopped dashboard briefly to discover a saved,
+configured engine container that outlived the dashboard.
+
+To select another image tag when creating/recreating the dashboard, set
+`STRIXPER_IMAGE`, for example:
+
+```bash
+STRIXPER_IMAGE=your-dockerhub-user/strixper:latest ./strixper.sh recreate
+```
+
+`BIND_PORT` controls the port when the script creates a new container. The
+script stores Runner configs and the remembered engine target in the
+`strixper-data` Docker volume; deleting that volume removes this saved data.
+
+**Security:** the dashboard has no authentication, and mounting
+`/var/run/docker.sock` grants control over the host Docker daemon (effectively
+root-equivalent access). Use only on a trusted network; do not expose the port
+directly to the public internet. Host networking makes the service reachable
+on the host's interfaces, subject to firewall rules.
 
 ## Project layout
 
@@ -387,3 +515,20 @@ The audit encodes the recommendations from the Strix Halo tuning guide:
 
 Status colors (green PASS / yellow WARN / red FAIL) always ship with an icon and
 label, never color alone.
+
+## Credits
+
+Strixper builds on the work of the open-source projects and documentation used
+to run, tune, and monitor AMD Strix Halo systems. Special thanks to:
+
+- [kyuz0/amd-strix-halo-toolboxes](https://github.com/kyuz0/amd-strix-halo-toolboxes)
+  for Strix Halo ROCm tooling and practical system guidance.
+- [peonist-ai/halogen-flash-server](https://github.com/peonist-ai/halogen-flash-server)
+  for the Halogen inference server.
+- [gufo-org/gufo](https://github.com/gufo-org/gufo)
+  for the GUFO project and related Strix Halo work.
+
+Thanks also to the maintainers of React, Vite, FastAPI, Uvicorn, TanStack
+Query, Tailwind CSS, Recharts, lucide-react, Docker, and ROCm, and to the
+authors of the Halogen API and Strix Halo tuning references used in this
+project.
