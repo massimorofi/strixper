@@ -6,8 +6,8 @@ host and hardware telemetry on an **AMD Strix Halo** (Ryzen AI Max+ 395 / Radeon
 8060S) machine, with an on-demand fine-tuning compliance audit and a built-in
 streaming **AI chat**.
 
-Built from `strixper_specs.md`, using `halogen_api.md` for the Halogen endpoint
-contracts and `strix_halo_finetuning.md` for the tuning recommendations.
+Built from `strixper_specs.md`, using `Halogen_REST_API.md` for the Halogen
+endpoint contracts and `strix_halo_finetuning.md` for the tuning recommendations.
 
 ## Table of Contents
 
@@ -271,8 +271,11 @@ Copy `backend/.env.example` to `backend/.env` and adjust:
 | `POLL_INTERVAL_SECONDS` | `5` | Background poll cadence |
 | `BIND_HOST` | `0.0.0.0` | Backend bind host |
 | `BIND_PORT` | `8000` | Backend bind port |
-| `AGENT_MAX_TURNS` | `8` | Max agent turns before the run is aborted |
+| `AGENT_MAX_TURNS` | `25` | Max agent turns before the run is aborted |
+| `AGENT_MAX_TOKENS` | `8192` | Per-model-call output cap (see the note on tool-call truncation) |
 | `AGENT_INSTRUCTIONS` | built-in | Optional override of the agent system prompt |
+| `AGENT_WORKSPACE` | `backend/agent_workspace` | Where the full-access tier writes files |
+| `AGENT_TLS_VERIFY` | `1` | TLS verification for `fetch_url` / `search_web` |
 
 The polling interval can also be changed at runtime from the dashboard's
 auto-refresh selector (synced to the backend via `POST /api/v1/config`).
@@ -409,6 +412,50 @@ default, is required per request, and the agent simply cannot see those two
 tools while it is off — this is not a suggestion in the prompt, it is enforced
 by which tools are registered.
 
+### Full access: research and execution
+
+Ticking **Full access** adds seven tools that go outside the machine's own
+telemetry — the agent can browse, search, run code, and write files:
+
+| Tool | What it does |
+| --- | --- |
+| `fetch_url` | Fetches any HTTP(S) page and returns readable text (or raw body for APIs) |
+| `search_web` | Web search (Brave, Bing fallback), returns result titles and links |
+| `run_shell` | Runs a bash command, returns exit code, stdout, stderr |
+| `run_python` | Writes the snippet to the workspace and runs it under `python3` |
+| `write_file` | Writes or appends a file in the workspace |
+| `read_file` | Reads a file |
+| `list_directory` | Lists a directory |
+
+This is what turns "I cannot browse that URL" into an actual research run: the
+model fetches a page, notices the RSS feed is short, writes a parser, runs it,
+and reconciles the difference.
+
+**Read the security note before turning this on.** The dashboard container has
+`/var/run/docker.sock` mounted so the LLM-Runner can manage engine containers.
+Anything that can write to that socket can create a privileged container, which
+is **root on your host**. `run_shell` does not add a privilege boundary — it
+removes one. The tool's destructive-command guard (`rm -rf /`, `mkfs`,
+`dd of=/dev/…`, `shutdown`, and friends) is accident insurance against a model
+doing something dumb, not a sandbox against one doing something clever.
+
+Full access implies Allow actions: an agent that can run shell commands can
+already do anything the two engine-control tools can do, so withholding them
+would only be confusing.
+
+Generated files live in a single workspace directory (`AGENT_WORKSPACE`,
+default `/app/backend/agent_workspace`, mounted as the `strixper-agent-ws`
+volume so it survives restarts). Relative paths in the file tools resolve there.
+
+TLS verification is on for `fetch_url` and `search_web`. Set
+`AGENT_TLS_VERIFY=0` only if you sit behind a TLS-terminating proxy whose CA
+is not in the container trust store.
+
+`search_web` scrapes Brave Search first and falls back to Bing. Neither is
+an API: both are undocumented HTML, so a redesign can break the parser or
+trigger a CAPTCHA. `fetch_url` does not depend on it — give the agent a URL
+directly and it is fine.
+
 ### Endpoints
 
 | Endpoint | Method | Description |
@@ -423,6 +470,7 @@ Request body:
   "messages": [{ "role": "user", "content": "Why is throughput low?" }],
   "mode": "agent",
   "allow_actions": false,
+  "full_access": false,
   "max_turns": 8,
   "max_tokens": 2048,
   "temperature": 0.2,
@@ -447,6 +495,12 @@ The SSE stream reuses the Plain-mode vocabulary and adds one event:
 Tool output is clipped before it reaches the model so a chatty endpoint cannot
 blow up the context window. `AGENT_MAX_TURNS` bounds how many model↔tool
 round-trips a single request may take.
+
+Agent mode does not expose the **Max tokens** control. A `write_file` call puts
+the entire file body inside a single tool-call JSON object, so a small output cap
+cuts those arguments off mid-string and the call fails to parse — which is what
+happened at the default 1024. Agent mode uses `AGENT_MAX_TOKENS` (8192) instead,
+which comfortably covers scripts of a few thousand lines.
 
 ### Customising the instructions
 
@@ -489,6 +543,7 @@ rebuild from scratch.
 | `-v /var/run/docker.sock:/var/run/docker.sock` | The LLM-Runner starts/stops engine containers through the host daemon |
 | `-v /etc/group:/etc/group:ro` | Engine commands resolve the host `render` group GID (`getent group render`) |
 | `-v strixper-data:/app/backend/data` | Persists your LLM-Runner configs and the remembered engine target across recreations |
+| `-v strixper-agent-ws:/app/backend/agent_workspace` | Persists files the agent creates when **Full access** is enabled |
 | `--device=/dev/kfd` and `--device=/dev/dri` | Give ROCm SMI access to the host GPU devices |
 | `--group-add ...` | Allow the container to access GPU devices using the host `video` and `render` group IDs |
 

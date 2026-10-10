@@ -95,10 +95,12 @@ v                                               v
 8. **Agentic AI Chat** — the same chat tab, in **Agent** mode, runs a
    tool-using loop built on the OpenAI Agents SDK. The model inspects the
    machine through dashboard tools (live status, metrics, cache, tuning audit,
-   token counting, runner configs) and iterates until it can answer. Destructive
-   tools (start/stop an engine) are registered only when the user explicitly
-   ticks **Allow actions**. See §3.3 (`POST /api/v1/agent/chat`) and §4.11
-   (`agent_tools`).
+   token counting, runner configs) and iterates until it can answer. Capabilities
+   come in three tiers, each ticked explicitly: read-only (always), **Allow
+   actions** (start/stop an engine), and **Full access** (web fetch/search,
+   shell, Python execution, file I/O). See §3.3
+   (`POST /api/v1/agent/chat`), §4.11 (`agent_tools`) and §4.12
+   (`agent_exec_tools`).
 9. **LLM-Runner** — a tab to create, run and locally store the docker command
    used to launch a containerized LLM inference server. Configurations are kept
    in a JSON file on disk, listed for selection, editable, and each can be
@@ -147,8 +149,11 @@ Read from environment variables / a `.env` file (`backend/app/config.py`):
 | `RUNNER_RECONCILE` | `20` | Seconds between scans for an untracked engine container |
 | `ENGINE_TARGET_PATH` | `backend/data/engine_target.json` | Remembered engine target (see §4.9) |
 | `DEFAULT_MODEL` | `halogen-qwen3.8-flash-next` | Model id assumed before any engine reports one |
-| `AGENT_MAX_TURNS` | `8` | Max model↔tool round-trips per agentic request (see §3.3) |
+| `AGENT_MAX_TURNS` | `25` | Max model↔tool round-trips per agentic request (see §3.3) |
+| `AGENT_MAX_TOKENS` | `8192` | Per-model-call output cap for the agent loop (see §3.3) |
 | `AGENT_INSTRUCTIONS` | built-in | Optional replacement for the agent system prompt (see §3.3) |
+| `AGENT_WORKSPACE` | `backend/agent_workspace` | Full-access working directory (see §4.12) |
+| `AGENT_TLS_VERIFY` | `1` | TLS verification for `fetch_url` / `search_web` (see §4.12) |
 
 `HALOGEN_HOST` is easy to over-read: it is where the dashboard starts
 looking, not where it keeps looking. As soon as an engine is started through
@@ -515,6 +520,7 @@ Request:
   ],
   "mode": "agent",
   "allow_actions": false,
+  "full_access": false,
   "max_turns": 8,
   "max_tokens": 2048,
   "temperature": 0.2,
@@ -528,8 +534,9 @@ Request:
 | `messages` | required | Full conversation history, sent every turn (no server-side session) |
 | `mode` | `agent` | `agent` runs the SDK loop; `plain` delegates to the `POST /api/v1/chat` handler |
 | `allow_actions` | `false` | When true, the destructive tools (`start_engine`, `stop_engine`) are registered |
-| `max_turns` | `AGENT_MAX_TURNS` (8) | Hard cap on model↔tool round-trips |
-| `max_tokens` | `2048` | Per-call response cap |
+| `full_access` | `false` | When true, the research/execution tools (§4.12) are registered **and** `allow_actions` is forced on |
+| `max_turns` | `AGENT_MAX_TURNS` (25) | Hard cap on model↔tool round-trips |
+| `max_tokens` | `AGENT_MAX_TOKENS` (8192) | Per-call response cap. Not exposed in the agent UI — see the truncation note below |
 | `temperature` | `0.2` | Low by default; a tool-calling loop drifts badly when creative |
 | `thinking` | `true` | `false` sends `reasoning.effort = "none"` so Halogen suppresses chain-of-thought |
 | `instructions` | empty | Per-request system-prompt override; falls back to `AGENT_INSTRUCTIONS`, then the built-in prompt |
@@ -565,6 +572,15 @@ reason the code looks the way it does:
 `RunResultStreaming` exposes no `final_usage`; the aggregate is computed from
 `result.raw_responses`, each of which carries a `.usage`.
 
+**Output cap and tool-call truncation.** A tool call is itself generated text: the
+model emits the whole JSON object, including the full `content` string of a
+`write_file` call, before the call executes. With a small `max_tokens` that JSON is
+cut off mid-string, the arguments fail to parse, and the model sees an opaque tool
+error. The default is therefore `AGENT_MAX_TOKENS` (8192) rather than the 1024 the
+plain-mode UI defaults to, and the agent UI does not expose the control at all —
+a user lowering it to tune answer length would silently break file writing.
+`max_tokens` remains settable per request for callers that know what they are doing.
+
 Errors: `422` on invalid body. Mid-stream failures surface as an `error` event
 rather than an HTTP status, because the stream has already started.
 
@@ -586,7 +602,10 @@ Returns the tool inventory for the current permission set:
 ```
 
 Useful for confirming which tools an agent turn will actually see. `start_engine`
-and `stop_engine` appear only with `?allow_actions=true`.
+and `stop_engine` appear only with `?allow_actions=true`. With
+`?full_access=true` the seven research/execution tools of §4.12 join them, and the
+response also carries `full_access` and a `tier` label
+(`read-only` / `actions` / `full`).
 
 #### LLM-Runner endpoints
 
@@ -1267,6 +1286,78 @@ values=None)` is the transport-free core; `run_config` is now a thin wrapper tha
 maps `ConfigNotFound` → 404, `ValueError` → 400, `RuntimeError` → 502. The
 agent calls `launch_config` directly. Behavior of the HTTP endpoint is unchanged.
 
+### 4.12 `agent_exec_tools` (`services/agent_exec_tools.py`)
+
+The **full-access** tier: web research, shell, Python execution, and file I/O.
+Registered only when the request sets `full_access`, which also forces
+`allow_actions` on.
+
+* `build_exec_tools(state, workspace)` → `list[FunctionTool]`. Same per-request
+  construction rule as §4.11 — the workspace is closed over at decoration time.
+
+| Tool | What it does | Bounds |
+| --- | --- | --- |
+| `fetch_url(url, as_text=True)` | HTTP(S) GET, follows redirects, returns `{status, final_url, content_type, body}` | 20 s timeout, 400 KB cap, HTML→text by default |
+| `search_web(query, max_results=8)` | Web search via Brave, Bing as fallback; returns `{query, count, results:[{title,url}]}` | 20 s per engine, 1–20 results |
+| `run_shell(command, timeout_seconds=120)` | `bash -c` via `asyncio.create_subprocess_exec`, returns `{exit_code, stdout, stderr}` | 120 s default, 900 s max |
+| `run_python(code, timeout_seconds=120)` | Writes `{workspace}/agent_{sha256[:12]}.py`, runs it under `python3` | same timeouts, `stdin=DEVNULL` |
+| `write_file(path, content, append=False)` | Writes/appends in the workspace | — |
+| `read_file(path, max_bytes=60000)` | Reads a file | 60 KB |
+| `list_directory(path=".")` | Lists entries with type and size | — |
+
+**The guard is not a sandbox.** `_DENIED_PATTERNS` rejects `rm -rf /`, `mkfs`,
+`dd … of=/dev/…`, `shutdown`/`reboot`/`halt`/`poweroff`, `> /dev/sdX`, and
+`chmod -R 777 /`. It catches a model doing something catastrophic by accident.
+It does nothing about the fact that the container holds `docker.sock`, and it is
+deliberately not sold to the user as protection. The real control is the checkbox.
+
+**Why the deny-list is not worth extending.** Every pattern added is a false sense
+of security proportional to how complete it looks, and it is not complete:
+`python -c "import os; os.system(...)"` bypasses it entirely, and the model has
+`run_python`. The guard exists because `rm -rf /` is the one thing a model will
+occasionally do unprompted while chasing a permissions error.
+
+**`html_to_text()`** strips comments, `script`/`style`/`noscript`/`svg`/`iframe`,
+turns closing block tags into newlines, removes the remaining tags, unescapes
+entities, and collapses whitespace line by line. Crude, and adequate for an LLM
+reading a page. Comment stripping runs *after* the script/style removal: a JS
+block containing `-->` would otherwise break the `</script>` boundary and leak
+code into the text.
+
+**`_resolve(path, workspace)`** resolves relative paths inside the workspace and
+returns `os.path.realpath`. It is not a jail — an absolute path goes wherever the
+process can go. It exists so relative paths behave sensibly, not to confine.
+
+**Output clipping.** Every tool result passes through `_clip()` at 12 KB. A
+`cat` of a large file or a verbose build must not blow out the context window.
+
+**Workspace persistence.** `AGENT_WORKSPACE` (default
+`/app/backend/agent_workspace`) is mounted as the `strixper-agent-ws` named
+volume in `strixper.sh`, so generated scripts and downloads survive a container
+recreate. It is gitignored and `.dockerignore`d.
+
+**`search_web` is fragile by construction.** It scrapes search-engine HTML with
+a regex; there is no API involved. It tries **Brave** first and falls back to
+**Bing**, deduplicating by URL, and reports which engines failed. The ordering is
+empirical, not arbitrary:
+
+| Engine | Result on this setup |
+| --- | --- |
+| Brave | Relevant organic results; plain external anchors |
+| Bing | Returned generic "Strix" matches (security tools, Wikipedia) regardless of the technical query |
+| DuckDuckGo (`html`, `lite`) | HTTP 202 with a region-selector page, no results |
+| Startpage | "privacy please" interstitial |
+| Searx (`format=json`) | Empty |
+
+Brave's markup is undocumented and can change without notice, which is the whole
+reason for the fallback chain rather than a single parser. `fetch_url` does not
+depend on any of it — give the agent a URL directly and it is fine.
+
+**TLS is verified by default.** `AGENT_TLS_VERIFY=0` disables it for deployments
+behind a TLS-terminating proxy whose CA is absent from the container trust store.
+Verified working with verification on against Bing, example.com, and a self-hosted
+site, from both the host venv and inside the built image.
+
 ---
 
 ## 5. Frontend Dashboard Specification
@@ -1364,7 +1455,7 @@ a controls bar, a scrolling message list, and a composer.
 
 **Controls bar (top).**
 
-* **Agent** — checkbox (default off). Off, the tab is the classic one-shot chat
+* **Agent** — checkbox (default on). Off, the tab is the classic one-shot chat
   described below. On, every request goes to `POST /api/v1/agent/chat` and the
   agentic loop takes over (§3.3). The API selector is hidden in Agent mode: the
   SDK owns request routing, so the four-style switch no longer applies.
@@ -1377,7 +1468,9 @@ a controls bar, a scrolling message list, and a composer.
   endpoint used for subsequent turns (see the mapping in §3.3). The current
   style and its upstream path are shown in the header subtitle. Hidden in
   Agent mode.
-* **Max tokens** — numeric input (1–32,768), sent as `max_tokens`.
+* **Max tokens** — numeric input (1–32,768), sent as `max_tokens`. Hidden in
+  Agent mode: the agentic loop uses `AGENT_MAX_TOKENS` instead, because a low
+  value truncates `write_file` arguments (§3.3).
 * **Thinking** — checkbox (default on). Unchecking sends `thinking: false` so
   the model suppresses its chain-of-thought.
 * **Clear conversation** — erases the message list and any error banner.
@@ -1569,6 +1662,7 @@ backend/
       runner_store.py       JSON-persisted store for LLM-Runner docker configs
       params.py             {name} template validation + command rendering
       agent_tools.py        tool functions exposed to the agent (read-only + gated)
+      agent_exec_tools.py   full-access tier: web, shell, python, file I/O
     data/
       llm_runner_configs.json   runtime store (gitignored)
       engine_target.json        remembered engine target (gitignored)
@@ -1669,27 +1763,34 @@ several design decisions:
     **Allow actions** toggles plus the collapsible Actions panel to
     `AIChatTab.jsx`, and persist chat preferences under
     `strixper-chat-settings`.
-13. **Tab 4 (LLM-Runner)** — `RunnerStore` (JSON-persisted config CRUD) +
+13. **Full-access tier** — `agent_exec_tools.py` (`fetch_url`, `search_web`,
+    `run_shell`, `run_python`, `write_file`, `read_file`, `list_directory`),
+    `AGENT_WORKSPACE` and `AGENT_TLS_VERIFY` in `config.py`, the `full_access`
+    request field and `_resolve_tools()` tier selection in `agent.py`, the
+    `FULL_ACCESS_ADDENDUM` appended to the system prompt, the third **Full
+    access** checkbox in `AIChatTab.jsx`, and the `strixper-agent-ws` volume in
+    `strixper.sh`. `full_access` forces `allow_actions` on.
+14. **Tab 4 (LLM-Runner)** — `RunnerStore` (JSON-persisted config CRUD) +
     `runner.py` router (config CRUD, run with SSE output stream, stop);
     `RunnerTab.jsx` with the config list, create/edit form, and live run
     console with stop control. Keep the tab mounted so a run survives tab
     switches.
-14. **Packaging and deployment** — multi-stage `Dockerfile`: Node 22 builds
+15. **Packaging and deployment** — multi-stage `Dockerfile`: Node 22 builds
     the frontend, AMD `rocm/dev-ubuntu-24.04:7.2.2` supplies ROCm SMI and the
     Python 3.12 runtime, and FastAPI serves the production frontend. Include
     the Docker CLI, healthcheck, and `docker-entrypoint.sh`.
-15. **Container lifecycle wrapper** — `strixper.sh` builds no images itself;
+16. **Container lifecycle wrapper** — `strixper.sh` builds no images itself;
     it starts/stops/restarts/recreates/status-checks the dashboard and manages
     configured engine containers. It passes host networking, Docker socket,
     persistent `strixper-data` volume, `/dev/kfd`, `/dev/dri`, and host
     `video`/`render` group IDs. Stop must request engine shutdown through the
     Runner API before stopping Strixper, including discovery of configured
     engines after a dashboard restart.
-16. **Local workflow and docs** — `run.sh` starts backend + Vite for
+17. **Local workflow and docs** — `run.sh` starts backend + Vite for
     development; `stop.sh` stops those local processes. README documents
     prerequisites, local and Docker quick starts, LAN/security behavior,
     configuration, and credits.
-17. **Verify** — `cd frontend && npm run build`; build and run the container;
+18. **Verify** — `cd frontend && npm run build`; build and run the container;
     confirm its healthcheck, frontend assets, ROCm SMI and GPU device access;
     restart backend; confirm
     live-status, stats reset, tuning checks, all info modals, and the
@@ -1728,6 +1829,8 @@ The dashboard container relies on host facilities and must be created with:
   group IDs so `rocm-smi` can query the GPU.
 * `/etc/group` read-only for engine commands that resolve the host `render`
   group.
+* The named `strixper-agent-ws` volume mounted at `/app/backend/agent_workspace`
+  so the full-access tier's downloads and generated scripts survive a recreate.
 * The named `strixper-data` volume mounted at `/app/backend/data` to preserve
   Runner configs and the remembered engine target across container removal.
 

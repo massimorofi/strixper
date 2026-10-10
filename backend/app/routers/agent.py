@@ -43,6 +43,7 @@ from openai import AsyncOpenAI
 from openai.types.shared import Reasoning
 from agents import (
     Agent,
+    FunctionTool,
     ModelSettings,
     OpenAIChatCompletionsModel,
     Runner,
@@ -52,6 +53,7 @@ from agents.exceptions import MaxTurnsExceeded
 from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
 
 from ..config import settings
+from ..services.agent_exec_tools import build_exec_tools
 from ..services.agent_tools import build_tools
 
 router = APIRouter(tags=["agent"])
@@ -88,6 +90,35 @@ How to work:
   recommended value is, drawn from the tuning check's own impact text.
 """
 
+# Appended (not replaced) when the full-access tier is on, so the base
+# persona survives and the extra guidance travels with the extra tools.
+FULL_ACCESS_ADDENDUM = """
+You also have execution tools: fetch_url, search_web, run_shell, run_python,
+write_file, read_file, and list_directory. Use them to actually do the work
+instead of asking the user to do it.
+
+How to work with them:
+- Plan first, then act. Decide the steps, then run them. Do not ask
+  permission for each step you were already asked to do.
+- Browse with fetch_url. It returns readable text, not raw HTML. If a page
+  is empty or blocked, try search_web to find another source rather than
+  giving up.
+- search_web is for finding sources; fetch_url is for reading them. A normal
+  research task is: search, pick results, fetch each, then summarise.
+- Prefer run_python over run_shell for anything that computes, parses, or
+  transforms. Use run_shell for system commands, file operations, and
+  package tools.
+- Write scripts with write_file, then run them with run_python or run_shell.
+  Working files live in a single workspace directory; relative paths resolve
+  there.
+- Check what you actually got. After a fetch, read the content before
+  summarising it. After a script, read its output before reporting success.
+- A non-zero exit code is a result, not a failure of your attempt. Read the
+  stderr, work out the cause, and fix it or report it.
+- Do not delete, overwrite, or modify anything outside the workspace unless
+  explicitly asked.
+"""
+
 
 class AgentChatMessage(BaseModel):
     role: str = Field(..., pattern="^(user|assistant|system)$")
@@ -100,6 +131,9 @@ class AgentChatRequest(BaseModel):
     mode: str = Field(default="agent")
     # Exposes start_engine/stop_engine. Off unless explicitly turned on.
     allow_actions: bool = False
+    # Exposes web fetch/search, shell, python execution, and file I/O.
+    # Strictly more powerful than allow_actions, so it implies it.
+    full_access: bool = False
     max_turns: int = Field(default=settings.agent_max_turns, ge=1, le=30)
     max_tokens: Optional[int] = Field(default=None, ge=1, le=32768)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
@@ -141,6 +175,25 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + "… [truncated]"
 
 
+def _resolve_tools(state: Any, body: AgentChatRequest) -> list[FunctionTool]:
+    """Pick the tool tier for this request.
+
+    Three tiers, each a superset of the previous:
+
+      read-only        status, metrics, tuning, token counting, configs
+      allow_actions   + start_engine / stop_engine
+      full_access     + web, shell, python, file I/O
+
+    ``full_access`` implies ``allow_actions``: an agent that can run shell
+    commands can already do anything the engine controls can do, so
+    withholding them would only be confusing.
+    """
+    tools = build_tools(state, body.allow_actions or body.full_access)
+    if body.full_access:
+        tools.extend(build_exec_tools(state, settings.agent_workspace))
+    return tools
+
+
 def _build_agent(state: Any, body: AgentChatRequest) -> Agent:
     """Assemble the agent bound to the current engine target."""
     base_url = state.halogen.base_url
@@ -155,7 +208,7 @@ def _build_agent(state: Any, body: AgentChatRequest) -> Agent:
     # calling on this engine.
     model_settings = ModelSettings(
         temperature=body.temperature if body.temperature is not None else 0.2,
-        max_tokens=body.max_tokens if body.max_tokens is not None else 2048,
+        max_tokens=body.max_tokens if body.max_tokens is not None else settings.agent_max_tokens,
         reasoning=None if body.thinking else Reasoning(effort="none"),
         # The SDK only asks for usage on streaming when it recognises a real
         # OpenAI endpoint. Halogen is not one, so ask explicitly -- without
@@ -164,18 +217,22 @@ def _build_agent(state: Any, body: AgentChatRequest) -> Agent:
         include_usage=True,
     )
     # Per-request override wins over the AGENT_INSTRUCTIONS env var, which in
-    # turn wins over the built-in prompt.
+    # turn wins over the built-in prompt. The full-access guidance is appended
+    # to whichever of those is used -- it describes tools the model would
+    # otherwise not know it has.
     instructions = (
         (body.instructions or "").strip()
         or settings.agent_instructions
         or BASE_INSTRUCTIONS
     )
+    if body.full_access and FULL_ACCESS_ADDENDUM.strip() not in instructions:
+        instructions = instructions.rstrip() + "\n" + FULL_ACCESS_ADDENDUM
     return Agent(
         name="strixper-assistant",
         instructions=instructions,
         model=model,
         model_settings=model_settings,
-        tools=build_tools(state, body.allow_actions),
+        tools=_resolve_tools(state, body),
     )
 
 
@@ -333,26 +390,37 @@ async def agent_chat(body: AgentChatRequest, request: Request) -> Any:
     )
 
 
+# Tools that can change state outside the model's own reasoning. Surfaced so
+# the UI can warn rather than let the user discover it later.
+_DESTRUCTIVE = {"start_engine", "stop_engine", "run_shell", "run_python", "write_file"}
+
+
 @router.get("/agent/tools")
 async def agent_tools_list(
-    request: Request, allow_actions: bool = Query(False)
+    request: Request,
+    allow_actions: bool = Query(False),
+    full_access: bool = Query(False),
 ) -> dict[str, Any]:
     """The tools available to the agent right now.
 
     Reflects the same state the agent sees, so the UI can show which
     capabilities are live -- and whether actions are enabled -- without
-    running a turn. ``allow_actions`` must match what a chat request will
-    send, otherwise this reports a capability set the agent does not have.
+    running a turn. Both flags must match what a chat request will send,
+    otherwise this reports a capability set the agent does not have.
     """
     state = request.app.state.rt
-    tools = build_tools(state, allow_actions=allow_actions)
+    tools = build_tools(state, allow_actions=allow_actions or full_access)
+    if full_access:
+        tools = tools + build_exec_tools(state, settings.agent_workspace)
     return {
-        "allow_actions": allow_actions,
+        "allow_actions": allow_actions or full_access,
+        "full_access": full_access,
+        "tier": "full" if full_access else ("actions" if allow_actions else "read-only"),
         "tools": [
             {
                 "name": getattr(t, "name", "?"),
                 "description": (getattr(t, "description", "") or "").strip(),
-                "destructive": getattr(t, "name", "") in ("start_engine", "stop_engine"),
+                "destructive": getattr(t, "name", "") in _DESTRUCTIVE,
             }
             for t in tools
         ]

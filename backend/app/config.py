@@ -52,9 +52,25 @@ class Settings:
         # The agent talks to the same engine through the OpenAI-compatible
         # API, so it needs no separate endpoint. These settings bound the
         # loop; the per-request body can override the turn limit.
-        self.agent_max_turns: int = _get_int("AGENT_MAX_TURNS", 8)
+        # Research tasks need headroom: a single "find and summarise X" job
+        # can easily spend 15+ steps (search, fetch, write script, run it,
+        # read output, refine). 8 cuts the agent off mid-task.
+        self.agent_max_turns: int = _get_int("AGENT_MAX_TURNS", 25)
+        # Output cap per model response. A long ``write_file`` call puts the
+        # whole file body inside one tool-call JSON object, so a small cap
+        # truncates the arguments and the call fails to parse. 2048 was too
+        # small in practice; 8192 covers scripts of a few thousand lines.
+        self.agent_max_tokens: int = _get_int("AGENT_MAX_TOKENS", 8192)
         # Optional replacement for the built-in system prompt.
         self.agent_instructions: str = os.getenv("AGENT_INSTRUCTIONS", "").strip()
+        # Working directory for the full-access tier: downloads, generated
+        # scripts, and any files the agent writes. Defaults to a directory
+        # next to the backend package so it resolves the same way inside the
+        # container (/app/backend/...) and in a local checkout.
+        _backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.agent_workspace: str = os.getenv(
+            "AGENT_WORKSPACE", os.path.join(_backend_dir, "agent_workspace")
+        ).strip()
 
 
 settings = Settings()

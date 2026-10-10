@@ -98,6 +98,7 @@ start_container() {
     -v /var/run/docker.sock:/var/run/docker.sock \
     -v /etc/group:/etc/group:ro \
     -v strixper-data:/app/backend/data \
+    -v strixper-agent-ws:/app/backend/agent_workspace \
     --device=/dev/kfd \
     --device=/dev/dri \
     --group-add "$video_gid" \

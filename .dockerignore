@@ -31,6 +31,9 @@ backend/.env
 # Logs
 *.log
 
+# Agent full-access workspace (runtime artifacts, mounted as a volume)
+backend/agent_workspace/
+
 # Docs and images not needed inside the image
 *.md
 AMD_Strix_Halo_logo.png

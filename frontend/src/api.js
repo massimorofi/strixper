@@ -314,6 +314,7 @@ export async function streamAgentChat(
     messages,
     mode = 'agent',
     allowActions = false,
+    fullAccess = false,
     maxTurns,
     maxTokens,
     temperature,
@@ -321,7 +322,13 @@ export async function streamAgentChat(
   },
   { onReasoning, onDelta, onTool, onDone, onError, signal } = {},
 ) {
-  const body = { messages, mode, allow_actions: allowActions, thinking }
+  const body = {
+    messages,
+    mode,
+    allow_actions: allowActions,
+    full_access: fullAccess,
+    thinking,
+  }
   if (maxTurns != null) body.max_turns = maxTurns
   if (maxTokens != null) body.max_tokens = maxTokens
   if (temperature != null) body.temperature = temperature

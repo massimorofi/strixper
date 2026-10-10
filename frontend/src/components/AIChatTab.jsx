@@ -26,7 +26,11 @@ const MAX_STORED_MESSAGES = 100
 // Chat preferences live apart from the transcript: they have to survive a
 // cleared conversation, and a cleared conversation must not lose the mode
 // the user chose.
-const DEFAULT_SETTINGS = { agentMode: true, allowActions: false }
+const DEFAULT_SETTINGS = {
+  agentMode: true,
+  allowActions: false,
+  fullAccess: false,
+}
 
 function loadSettings() {
   try {
@@ -42,6 +46,10 @@ function loadSettings() {
         typeof parsed?.allowActions === 'boolean'
           ? parsed.allowActions
           : DEFAULT_SETTINGS.allowActions,
+      fullAccess:
+        typeof parsed?.fullAccess === 'boolean'
+          ? parsed.fullAccess
+          : DEFAULT_SETTINGS.fullAccess,
     }
   } catch {
     return { ...DEFAULT_SETTINGS }
@@ -350,8 +358,12 @@ export default function AIChatTab({ active = true }) {
           messages: outbound,
           mode: 'agent',
           allowActions: settings.allowActions,
+          fullAccess: settings.fullAccess,
           thinking,
-          maxTokens: maxTokens ? Number(maxTokens) : undefined,
+          // max_tokens is deliberately omitted: a long write_file call puts
+          // the whole file inside one tool-call JSON object, and a small
+          // cap truncates those arguments mid-string. AGENT_MAX_TOKENS on
+          // the backend sets a safe ceiling instead.
         },
         {
           signal: controller.signal,
@@ -569,6 +581,30 @@ export default function AIChatTab({ active = true }) {
           </label>
         )}
 
+        {settings.agentMode && (
+          <label
+            className="flex cursor-pointer items-center gap-1.5 text-xs text-[var(--text-secondary)]"
+            title="Let the agent browse the web, run shell commands, execute Python, and write files. The container has docker.sock mounted, so this is effectively root on the host."
+          >
+            <input
+              type="checkbox"
+              checked={settings.fullAccess}
+              onChange={(e) =>
+                setSettings((s) => ({
+                  ...s,
+                  fullAccess: e.target.checked,
+                  // The backend treats full access as a superset; keep the
+                  // checkboxes honest about what is actually enabled.
+                  allowActions: e.target.checked ? true : s.allowActions,
+                }))
+              }
+              disabled={busy}
+              className="accent-[var(--status-critical)]"
+            />
+            Full access
+          </label>
+        )}
+
         {!settings.agentMode && (
           <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
             API
@@ -587,18 +623,20 @@ export default function AIChatTab({ active = true }) {
           </label>
         )}
 
-        <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
-          Max tokens
-          <input
-            type="number"
-            min="1"
-            max="32768"
-            value={maxTokens}
-            onChange={(e) => setMaxTokens(e.target.value)}
-            disabled={busy}
-            className="w-24 rounded-md border border-[var(--border-hairline)] bg-[var(--surface-page)] px-2 py-1 text-xs text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--series-1)] disabled:opacity-50"
-          />
-        </label>
+        {!settings.agentMode && (
+          <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
+            Max tokens
+            <input
+              type="number"
+              min="1"
+              max="32768"
+              value={maxTokens}
+              onChange={(e) => setMaxTokens(e.target.value)}
+              disabled={busy}
+              className="w-24 rounded-md border border-[var(--border-hairline)] bg-[var(--surface-page)] px-2 py-1 text-xs text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[var(--series-1)] disabled:opacity-50"
+            />
+          </label>
+        )}
 
         <label className="flex cursor-pointer items-center gap-1.5 text-xs text-[var(--text-secondary)]">
           <input

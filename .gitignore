@@ -32,3 +32,7 @@ build/
 
 # LLM-Runner local config store
 backend/data/
+
+# Agent full-access workspace (runtime artifacts, mounted as a volume)
+backend/agent_workspace/
+
