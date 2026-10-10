@@ -127,6 +127,7 @@ export default function TopBar({
     <header className="sticky top-0 z-20 border-b border-[var(--border-hairline)] bg-[var(--surface-card)]">
       <div className="mx-auto flex max-w-7xl flex-wrap items-center gap-x-6 gap-y-3 px-4 py-3">
         <div className="flex items-center gap-2">
+          <img src="/icon-192.png" alt="Strix Halo" className="h-8 w-8" />
           <Activity size={20} className="text-[var(--series-1)]" />
           <h1 className="text-base font-semibold tracking-tight text-[var(--text-primary)]">
              Strix Halo LLM Operations Dashboard
