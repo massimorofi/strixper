@@ -107,10 +107,17 @@ v                                               v
    and engine URL; stopping one does not stop the others. The stack stop script
    stops all registered runs before stopping Strixper.
 10. **LLM-Runner** — a tab to create, run and locally store the docker command
-   used to launch a containerized LLM inference server. Configurations are kept
-   in a JSON file on disk, listed for selection, editable, and started with
-   per-engine console tabs; each run can be stopped on demand. See §3.3
-   (runner endpoints), §4.6 (`RunnerStore`) and §5.5 (Tab 4).
+    used to launch a containerized LLM inference server. Configurations are kept
+    in a JSON file on disk, listed for selection, editable, and started with
+    per-engine console tabs; each run can be stopped on demand. See §3.3
+    (runner endpoints), §4.6 (`RunnerStore`) and §5.5 (Tab 4).
+11. **Pluggable extensions** — agent capabilities are not hard-coded. Skills are
+    drop-in folders (`SKILL.md` + resources) discovered from `SKILLS_DIR` with no
+    rebuild, and MCP servers are registered, tested and enabled from the AI Chat
+    **Extensions** panel, with their configuration persisted in the data volume.
+    Both are granted one of the three access tiers and only become visible to the
+    agent when the request satisfies that tier. See §3.3 (Agent extension APIs),
+    §4.13 (`skill_loader`) and §4.14 (`mcp_manager`).
 
 ---
 
@@ -630,12 +637,45 @@ minimum access level is met by the current request.
 
 #### Agent extension APIs
 
+Agent capabilities are resolved per request from three sources — built-in
+dashboard tools, skills, and MCP tools — and each source is gated by one of the
+three access tiers. The tier is a property of the *request* (`allow_actions`,
+`full_access`) and of each *extension* (`minimum_access`); an extension is only
+registered when the request meets or exceeds what the extension needs.
+
+| Capability source | `read-only` | `actions` | `full_access` |
+| --- | --- | --- | --- |
+| Built-in dashboard tools (§4.11) | ✔ | ✔ | ✔ |
+| `start_engine` / `stop_engine` | ✘ | ✔ | ✔ |
+| Research + execution tools (§4.12) | ✘ | ✘ | ✔ |
+| Skill tools (`list_skills`, `load_skill`, `read_skill_resource`) | ✔ | ✔ | ✔ |
+| MCP tools | Only if `minimum_access = read-only` | `read-only` or `actions` | Any tier |
+
+`full_access` implies `allow_actions`; requesting it forces the action tier on.
+A skill therefore never widens what the request already allows — skills read files
+from disk but cannot execute anything, and an MCP server's reach is whatever its
+own process can do, which is why `minimum_access` is mandatory rather than a hint.
+
 `GET /api/v1/agent/skills` rescans `SKILLS_DIR` and returns each valid skill's
 name/description plus manifest or validation errors. Skill directories contain a
 standard `SKILL.md`; they are not imported as Python. The agent receives only
 the skill index initially and loads full instructions or bounded, path-confined
 resources on demand with `list_skills`, `load_skill`, and
 `read_skill_resource`.
+
+**`SKILL.md` validation.** The loader is deliberately strict so a malformed
+folder surfaces as a reported error instead of a half-loaded skill. Frontmatter
+must open with `---` on the first line and be terminated; it is parsed as YAML and
+only these keys are accepted: `name`, `description`, `license`, `compatibility`,
+`metadata`, `allowed-tools`. Unknown keys are rejected. `license`,
+`compatibility` and `allowed-tools` must be strings and `metadata` must be a
+mapping. `name` must match `^[a-z0-9]+(?:-[a-z0-9]+)*$` and must equal the
+containing directory name, and `description` is required. Size ceilings: 8 KiB
+of frontmatter (`MAX_FRONTMATTER_BYTES`), 100 KB per `SKILL.md`
+(`MAX_SKILL_FILE_BYTES`), 64 KB per resource returned through
+`read_skill_resource` (`MAX_RESOURCE_BYTES`), and 1024 characters for the
+description. Resource paths are resolved against the skill folder and rejected if
+they escape it.
 
 MCP management (`GET/POST /api/v1/agent/mcp-servers`,
 `PUT/DELETE /api/v1/agent/mcp-servers/{id}`, and
@@ -647,7 +687,56 @@ written with restrictive file permissions, and contains secret references
 rather than credential values. Each server is connected lazily when an
 eligible agent request first needs it; failed servers are reported in status
 without preventing unrelated tools from working. Application shutdown closes
-all MCP sessions and subprocesses.
+all MCP sessions and subprocesses. Because the connection is lazy, a freshly
+recreated container reports every server `disconnected` with zero tools until the
+first chat request or a **Test connection** opens it; the next status call shows
+it `connected`. That is expected, not a failure.
+
+**Operational limits.** The manager refuses runaway configurations rather than
+degrading silently:
+
+| Constant | Value | Applies to |
+| --- | --- | --- |
+| `MCP_START_TIMEOUT_SECONDS` | 20 s | stdio open, session create, `initialize`, `list_tools` |
+| `MCP_CALL_TIMEOUT_SECONDS` | 30 s (configurable) | one tool call |
+| `MCP_MAX_SERVERS` | 32 | registered servers |
+| `MCP_MAX_TOOLS_PER_SERVER` | 64 | tools advertised by one server |
+| `MCP_MAX_TOOLS_TOTAL` | 256 | MCP tools registered across all servers |
+| `MCP_MAX_TOOL_INPUT_BYTES` | 100 000 | serialized tool arguments |
+| `MCP_MAX_TOOL_OUTPUT_BYTES` | 32 000 | tool result text (byte-truncated with a `\n[truncated]` marker) |
+| — | 32 000 | converted JSON schema per tool |
+| — | 1 024 | tool description shown to the model |
+
+**Tool naming.** Each MCP tool is registered as `mcp_{server_id}_{tool_name}`
+with every character outside `[A-Za-z0-9_-]` replaced by `_`. If the result is
+longer than 64 characters it is truncated to 55 characters plus `_` plus the
+first 8 hex characters of the SHA-256 of the full name, so names stay valid for
+the OpenAI tool schema and collisions remain distinguishable. A normalized
+collision inside one server is rejected with an explicit error rather than
+shadowing a tool.
+
+**MCP SDK field compatibility.** The installed `mcp` Python SDK exposes
+snake_case attributes (`input_schema`, `structured_content`, `is_error`,
+`mime_type`) while the protocol itself uses camelCase. The adapter reads the
+snake_case name first and falls back to camelCase, so it works with either
+generation of the SDK. A missing `is_error` is treated as an error and raised
+rather than assumed success. Non-text content blocks are replaced with
+`[Non-text MCP content omitted: <mime|type>]` instead of being passed to the
+model as raw data.
+
+**Locking.** A per-server `call_lock` serializes tool calls against one server so
+a slow or stateful server never sees concurrent requests. Configuration edits use
+`_server_update_lock()`, which takes the global lock and then the per-server
+lock, so editing one server does not churn the others. If a configuration change
+is detected while a call is in flight, the call fails with "MCP server
+configuration changed; retry this tool call" rather than executing against a
+stale session.
+
+**Child-process environment.** The stdio child does **not** inherit the backend
+environment. Only `PATH`, `HOME`, `TMPDIR`, `TMP`, `TEMP`, `LANG`, `LC_ALL`,
+`TZ`, `SSL_CERT_FILE` and `SSL_CERT_DIR` are passed through; `MCP_ADMIN_TOKEN`
+and every other backend variable (including inference credentials) is withheld.
+Values declared through `secretRef` are layered on top of that minimal set.
 
 `MCP_SERVERS_DIR` is the single install root for stdio MCP packages. Each
 server is installed under a child directory matching its Strixper server ID;
@@ -676,6 +765,18 @@ do not trust. `MCP_ADMIN_TOKEN` protects management operations only, not the
 rest of the dashboard API. The token is sent over HTTP by the browser; use
 localhost, an SSH tunnel, or HTTPS for MCP administration. Do not expose the
 dashboard to untrusted networks.
+
+**Risk summary.**
+
+| Risk | Mitigation in the implementation |
+| --- | --- |
+| Prompt injection via skill content | Skill text is data, not system policy. It cannot grant permissions, and executable capability always comes from a separately gated tool. Keep the skills directory under your control. |
+| Arbitrary code execution through MCP | Explicit admin-token-gated enablement, an explicit trust warning in the UI, and the `minimum_access` tier. Not sandboxed; not covered by the shell deny-list. |
+| Secret leakage | Only environment-variable *references* are stored. Config, status, and error payloads are redacted; resolved values are never logged. |
+| Malformed or hostile MCP schemas | Schemas are validated and recursively sanitized (unsupported keywords such as `default` removed), input and output are byte-bounded, and failures are reported explicitly. |
+| Tool-name collisions | MCP tools are namespaced `mcp_{server}_{tool}` with normalized names and explicit collision detection. Skills add no callable tools. |
+| Hangs and resource exhaustion | Connect and call timeouts, per-server call serialization, caps on servers/tools/total tools, size ceilings, and orderly shutdown of every child process. |
+| Management API exposure | Standard dashboard network limits apply. Administer over localhost/tunnel/HTTPS only. |
 
 #### LLM-Runner endpoints
 
@@ -1773,6 +1874,11 @@ backend/
     data/
       llm_runner_configs.json   runtime store (gitignored)
       engine_target.json        remembered engine target (gitignored)
+      mcp_servers.json          persisted MCP server store (gitignored)
+  tests/
+    test_agent_extensions.py  skill + MCP contract tests (discovery, path escape,
+                            secret redaction, PATH resolution, legacy migration,
+                            access enforcement, SDK field compatibility)
 frontend/
   src/
     App.jsx                 tabs, theme, polling, 120-sample history buffer
@@ -1802,8 +1908,13 @@ frontend/
       KvPoolChart.jsx       Chart C
       QueueChart.jsx        Chart D
 Dockerfile
+mcp-servers/
+  README.md                   install-root convention (one dir per server)
+  tieline/                    pinned Node MCP server + default Strixper config
 skills/
   research-review/SKILL.md example drop-in research workflow
+.mcp.json                     repo-root MCP registration for dev agents
+.tieline/                     Tieline code-context workspace (compiled topology)
 run.sh
 stop.sh
 build_img.sh
@@ -1912,6 +2023,75 @@ several design decisions:
     routing, individual stop, and stop-all. For Docker acceptance, build and
     run the container; confirm its healthcheck, frontend assets, ROCm SMI/GPU
     access, and managed shutdown.
+19. **Skills** — `skill_loader.py` (strict `SKILL.md` validation, size ceilings,
+    path-confined resource reads, `list_skills` / `load_skill` /
+    `read_skill_resource`), `SKILLS_DIR` in `config.py`, `GET /api/v1/agent/skills`,
+    the skill tools registered in every tier, and the example
+    `skills/research-review/SKILL.md`. Skills are discovered at request time, so
+    adding a folder requires no rebuild — only a rescan from the UI.
+20. **MCP extensions** — `mcp_manager.py` (versioned atomic store, secret
+    references, lazy connect, per-server call/update locks, install-root `PATH`
+    composition, schema sanitization, SDK field compatibility, caps and
+    timeouts), the admin-token-guarded CRUD/test endpoints in `agent.py`,
+    `MCP_ADMIN_TOKEN` / `MCP_SERVERS_DIR` / `MCP_CALL_TIMEOUT_SECONDS` in
+    `config.py`, the `mcp-server-runtime` Docker stage plus the
+    `strixper-mcp-servers` volume, the `mcp-servers/` install root with its
+    README, and the **Extensions** sub-nav in AI Chat.
+21. **Extension tests** — `backend/tests/test_agent_extensions.py` covers skill
+    discovery, path-escape rejection, manifest loading, secret persistence and
+    redaction, non-inheritance of `MCP_ADMIN_TOKEN` by the child process,
+    install-root `PATH` resolution, legacy `npx` migration, disable/delete,
+    access-tier enforcement, duplicate and invalid IDs, recursive `default`
+    removal from schemas, tool wrapping, snake_case SDK fields, and the
+    management-disabled / token-header paths.
+
+---
+
+### 8.1 Testing strategy for extensions
+
+Extension code is untrusted-input handling, so the tests assert the *contract*
+rather than the happy path:
+
+* **Discovery is total.** Every valid folder is listed and every invalid folder
+  produces a specific error naming the file and the reason. A single bad skill
+  must not hide the good ones.
+* **Path confinement is tested with an actual escape attempt**, not by inspection.
+* **Secrets never round-trip through the API.** Write a `secretRef`, read the
+  store back, assert the value is present in the file and absent from the
+  response body.
+* **Environment isolation is asserted from the child's point of view**: a tool
+  that echoes `PATH` proves the install-root prefix arrived, and a probe for
+  `MCP_ADMIN_TOKEN` proves it did not.
+* **Migration is tested against the pre-migration shape** so an upgrade cannot
+  silently drop a working server.
+* **Tier enforcement is tested per tier**, including the negative case: a tool at
+  `actions` must be absent from a `read-only` request.
+* **Schema sanitization** is tested with a schema containing `default` — the
+  keyword that a real engine (GUFO) rejects — and asserts the converted schema
+  is accepted recursively.
+
+Run them with `cd backend && .venv/bin/python -m pytest -q`. They need no
+network, no GPU, and no running engine.
+
+---
+
+### 8.2 Deferred / future extensions
+
+Recorded so they are not rediscovered as "missing":
+
+* **Hot reload of `skills/`.** Skills are rescanned per request today; a file
+  watcher would remove even the rescan step. Not implemented because the rescan
+  is cheap and explicit refresh is easier to reason about.
+* **Skill marketplace / git install.** Pulling skills from a remote repository
+  with signature verification. Requires a trust story that does not exist yet.
+* **MCP Streamable HTTP transport.** The manager is stdio-only. Remote servers
+  need authentication, TLS, and reconnect semantics that stdio inherits from the
+  process boundary and HTTP does not.
+* **Per-tool allow/deny lists.** `minimum_access` is per server today; a
+  fine-grained per-tool policy is the natural next step once there is demand.
+* **Skill-declared tools.** Skills currently carry instructions only. Letting a
+  skill declare an executable tool would turn it into a plugin and would need
+  the same trust model as MCP.
 
 ---
 
@@ -1922,17 +2102,30 @@ several design decisions:
 The root `Dockerfile` is a multi-stage production image:
 
 1. `node:22-alpine` builds the React frontend into `frontend/dist`.
-2. `rocm/dev-ubuntu-24.04:7.2.2` is the runtime base. It provides Ubuntu 24.04,
+2. `node:22-bookworm-slim` (`mcp-server-runtime`) installs each bundled Node.js
+   MCP server under `/mcp-servers` with `npm ci --omit=dev`. Keeping this in its
+   own stage means the Node toolchain and its build-time cache never reach the
+   runtime image; only the resulting `/mcp-servers` tree and the Node runtime
+   under `/usr/local` are copied out.
+3. `rocm/dev-ubuntu-24.04:7.2.2` is the runtime base. It provides Ubuntu 24.04,
    Python 3.12, ROCm userspace including `rocm-smi`, and the utilities needed
    by the backend. Python dependencies are installed in `/opt/venv`.
-3. The runtime copies the Docker CLI from `docker:cli`, installs
-   the pinned Tieline Node.js MCP server and `backend/requirements.txt`, copies
-   the backend and frontend build, and uses `docker-entrypoint.sh` to seed the
-   initial MCP config if needed and `exec` Uvicorn as PID 1.
+4. The runtime copies the Docker CLI from `docker:cli` and the two
+   `mcp-server-runtime` outputs (`/usr/local`, `/mcp-servers`), installs
+   `backend/requirements.txt`, copies the backend and frontend build, and uses
+   `docker-entrypoint.sh` to seed the initial MCP config if needed and `exec`
+   Uvicorn as PID 1.
 
 The image binds `BIND_HOST=0.0.0.0`, `BIND_PORT=8000` by default. Its Docker
 healthcheck polls `/api/v1/healthz`; this is backend liveness and does not imply
 that a Halogen engine is running or reachable.
+
+**Volume seeding caveat.** `/mcp-servers` is backed by the named volume
+`strixper-mcp-servers`. Docker populates a *fresh* volume from the image
+content, but a volume that already contains data is never refreshed by a newer
+image. After changing a bundled MCP package, remove the volume
+(`docker volume rm strixper-mcp-servers`) or the container will keep running the
+old tree.
 
 ### 9.2 Host runtime requirements
 
