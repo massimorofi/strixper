@@ -2,7 +2,7 @@
 set -euo pipefail
 
 CONTAINER_NAME="${STRIXPER_CONTAINER_NAME:-strixper}"
-IMAGE="${STRIXPER_IMAGE:-strixper-dashboard:latest}"
+IMAGE="${STRIXPER_IMAGE:-briggen/strixper-dashboard:latest}"
 BIND_PORT="${BIND_PORT:-8000}"
 ACTION="${1:-start}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

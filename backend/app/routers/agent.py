@@ -31,8 +31,10 @@ Two switches control behaviour, both per request:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import hmac
+import logging
 import time
 from typing import Any, AsyncIterator, Optional
 
@@ -48,12 +50,18 @@ from agents import (
     ModelSettings,
     OpenAIChatCompletionsModel,
     Runner,
+    RunConfig,
     set_tracing_disabled,
 )
 from agents.exceptions import MaxTurnsExceeded
 from agents.stream_events import RawResponsesStreamEvent, RunItemStreamEvent
 
 from ..config import settings
+from ..services.agent_recovery import (
+    format_tool_error,
+    max_turns_handler,
+    sanitize_model_input,
+)
 from ..services.agent_exec_tools import build_exec_tools
 from ..services.agent_tools import build_tools
 from ..services.mcp_manager import MCPManager, MCPServerConfig
@@ -61,6 +69,7 @@ from ..services.run_registry import ActiveRun, registry
 from ..services.skill_loader import SkillScan, build_skill_tools, scan_skills
 
 router = APIRouter(tags=["agent"])
+logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_CHARS = 100_000
 MAX_MESSAGES = 200
@@ -92,6 +101,11 @@ How to work:
   the supporting numbers. Use short lists over prose paragraphs.
 - If the machine looks misconfigured, say what is wrong and what the
   recommended value is, drawn from the tuning check's own impact text.
+
+Keep going. A tool that errors, a command that fails, or a result that is
+not what you expected is information, not a stopping point. Adjust and
+carry on until the request is answered. Do not stop halfway to ask whether
+you should continue with the rest of what you were asked to do.
 """
 
 # Appended (not replaced) when the full-access tier is on, so the base
@@ -101,9 +115,21 @@ You also have execution tools: fetch_url, search_web, run_shell, run_python,
 write_file, read_file, and list_directory. Use them to actually do the work
 instead of asking the user to do it.
 
-How to work with them:
-- Plan first, then act. Decide the steps, then run them. Do not ask
-  permission for each step you were already asked to do.
+You are on autopilot. The user asked for an outcome, not for check-ins:
+- Finish the task. Do not stop to ask permission for a step that is part of
+  what you were already asked to do. Ask only if the request is genuinely
+  ambiguous or the action is irreversible and was not requested.
+- A failed step is not the end of the task. Read the error, work out the
+  cause, change the approach, and continue.
+- If a package, library, or CLI is missing, install it (pip install ... or
+  the relevant package manager) and carry on. Do not stop and tell the user
+  it is missing.
+- Verify after each step. Do not assume a write, install, or script worked
+  because the call returned; read the file, check the exit code, look at
+  the output.
+
+How to work with the tools:
+- Plan first, then act. Decide the steps, then run them.
 - Browse with fetch_url. It returns readable text, not raw HTML. If a page
   is empty or blocked, try search_web to find another source rather than
   giving up.
@@ -115,6 +141,11 @@ How to work with them:
 - Write scripts with write_file, then run them with run_python or run_shell.
   Working files live in a single workspace directory; relative paths resolve
   there.
+- Keep every write_file body under {max_write_chars} characters. For a
+  longer file, write the first chunk, then continue with append=True, one
+  chunk per call, and read the file back when it is complete. Never try to
+  write a large file in one call -- the response gets cut off and the write
+  never happens.
 - Check what you actually got. After a fetch, read the content before
   summarising it. After a script, read its output before reporting success.
 - A non-zero exit code is a result, not a failure of your attempt. Read the
@@ -139,7 +170,10 @@ class AgentChatRequest(BaseModel):
     # Strictly more powerful than allow_actions, so it implies it.
     full_access: bool = False
     run_id: Optional[str] = None
-    max_turns: int = Field(default=settings.agent_max_turns, ge=1, le=30)
+    # The ceiling is generous on purpose: a self-recovering agent spends turns
+    # on retries, verification, and package installs. AGENT_MAX_TURNS sets the
+    # default; this only bounds what a client may ask for.
+    max_turns: int = Field(default=settings.agent_max_turns, ge=1, le=1000)
     max_tokens: Optional[int] = Field(default=None, ge=1, le=32768)
     temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
     thinking: bool = True
@@ -281,7 +315,9 @@ def _build_agent(
             "the user's access permissions."
         )
     if body.full_access and FULL_ACCESS_ADDENDUM.strip() not in instructions:
-        instructions = instructions.rstrip() + "\n" + FULL_ACCESS_ADDENDUM
+        instructions = instructions.rstrip() + "\n" + FULL_ACCESS_ADDENDUM.replace(
+            "{max_write_chars}", str(settings.agent_max_write_chars)
+        )
     return Agent(
         name="strixper-assistant",
         instructions=instructions,
@@ -328,6 +364,52 @@ def _sum_usage(responses: list[Any]) -> Optional[dict[str, int]]:
     return {"input_tokens": input_tokens, "output_tokens": output_tokens}
 
 
+def _recovery_config() -> RunConfig:
+    """Run-level recovery settings shared by every agent run.
+
+    ``tool_not_found_behavior`` is the important one. The SDK default raises,
+    which kills the whole run because the model called ``write`` instead of
+    ``write_file``. Sending the failure back to the model instead lets it
+    correct itself on the next turn, and ``format_tool_error`` makes sure it
+    is told the real tool names while it is at it.
+    """
+    return RunConfig(
+        workflow_name="strixper-chat",
+        tracing_disabled=True,
+        call_model_input_filter=sanitize_model_input,
+        tool_error_formatter=format_tool_error,
+        tool_not_found_behavior="return_error_to_model",
+    )
+
+
+# A run that dies partway is usually recoverable: the cause is a bad item in
+# the history, a transient engine error, or a model hiccup. Retrying the
+# same request with a freshly sanitised history gets past all three.
+MAX_RUN_ATTEMPTS = 3
+
+
+def _next_input(result: Any, fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The conversation as it stood when a run stopped, for the retry."""
+    try:
+        items = result.to_input_list()
+        if items:
+            return list(items)
+    except Exception:  # noqa: BLE001 - fall back to the original request
+        pass
+    return fallback
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Retry anything that is not a hard policy or validation stop.
+
+    ``MaxTurnsExceeded`` is excluded -- it means the agent ran out of
+    budget, and re-running it just burns the same budget again.
+    """
+    if isinstance(exc, MaxTurnsExceeded):
+        return False
+    return True
+
+
 @router.post("/agent/chat")
 async def agent_chat(body: AgentChatRequest, request: Request) -> Any:
     """Run an agentic turn over the conversation and stream the result."""
@@ -370,81 +452,132 @@ async def agent_chat(body: AgentChatRequest, request: Request) -> Any:
         # call_id -> tool name, so the output event can name the tool that
         # produced it: function_call_output carries only the call id.
         names: dict[str, str] = {}
-        try:
-            result = Runner.run_streamed(
-                agent,
-                input=[m.model_dump() for m in body.messages],
-                max_turns=body.max_turns,
-            )
-            async for event in result.stream_events():
-                if isinstance(event, RawResponsesStreamEvent):
-                    data = event.data
-                    etype = data.type
-                    if etype == "response.output_text.delta" and data.delta:
-                        yield _sse("delta", {"text": data.delta})
-                    elif etype == "response.reasoning_summary_text.delta" and data.delta:
-                        yield _sse("reasoning", {"text": data.delta})
-                    continue
+        original_input = [m.model_dump() for m in body.messages]
+        next_input = original_input
+        result: Any = None
+        attempts = 0
 
-                if not isinstance(event, RunItemStreamEvent):
-                    continue
+        while True:
+            attempts += 1
+            # Whether this attempt got far enough to be worth resuming from.
+            # A failure before any output (a dead connection, say) should
+            # retry quietly rather than narrating a recovery of nothing.
+            produced = False
+            try:
+                result = Runner.run_streamed(
+                    agent,
+                    input=next_input,
+                    max_turns=body.max_turns,
+                    run_config=_recovery_config(),
+                    error_handlers={"max_turns": max_turns_handler},
+                )
+                async for event in result.stream_events():
+                    if isinstance(event, RawResponsesStreamEvent):
+                        data = event.data
+                        etype = data.type
+                        if etype == "response.output_text.delta" and data.delta:
+                            produced = True
+                            yield _sse("delta", {"text": data.delta})
+                        elif etype == "response.reasoning_summary_text.delta" and data.delta:
+                            yield _sse("reasoning", {"text": data.delta})
+                        continue
 
-                if event.name == "tool_called":
-                    item = event.item
-                    raw = item.raw_item
-                    name = _raw_get(raw, "name", "tool")
-                    call_id = _raw_get(raw, "call_id", "")
-                    if call_id:
-                        names[call_id] = name
-                    tool_count += 1
+                    if not isinstance(event, RunItemStreamEvent):
+                        continue
+
+                    if event.name == "tool_called":
+                        item = event.item
+                        raw = item.raw_item
+                        name = _raw_get(raw, "name", "tool")
+                        call_id = _raw_get(raw, "call_id", "")
+                        if call_id:
+                            names[call_id] = name
+                        tool_count += 1
+                        yield _sse(
+                            "tool",
+                            {
+                                "phase": "call",
+                                "name": name,
+                                "detail": _tool_detail(raw),
+                            },
+                        )
+
+                    elif event.name == "tool_output":
+                        item = event.item
+                        raw = item.raw_item
+                        call_id = _raw_get(raw, "call_id", "")
+                        out = item.output
+                        if not isinstance(out, str):
+                            out = json.dumps(out, ensure_ascii=False)
+                        yield _sse(
+                            "tool",
+                            {
+                                "phase": "result",
+                                "name": names.get(call_id, "tool"),
+                                "output": _truncate(out, 1200),
+                            },
+                        )
+
+                elapsed = time.monotonic() - started
+                yield _sse(
+                    "done",
+                    {
+                        "finish_reason": "completed",
+                        "usage": _sum_usage(getattr(result, "raw_responses", [])),
+                        "timings": {"total_ms": round(elapsed * 1000)},
+                        "tool_calls": tool_count,
+                    },
+                )
+                return
+
+            except MaxTurnsExceeded:
+                # The error handler above normally turns this into a normal
+                # completion; reaching here means there was no handler result,
+                # so report it rather than retrying into the same wall.
+                elapsed = time.monotonic() - started
+                yield _sse(
+                    "error",
+                    {
+                        "message": (
+                            f"The agent reached its {body.max_turns}-turn limit "
+                            "without finishing."
+                        ),
+                        "reason": "max_turns",
+                        "timings": {"total_ms": round(elapsed * 1000)},
+                    },
+                )
+                return
+
+            except Exception as exc:  # noqa: BLE001 - stream must end cleanly
+                if attempts >= MAX_RUN_ATTEMPTS or not _is_retryable(exc):
+                    elapsed = time.monotonic() - started
                     yield _sse(
-                        "tool",
+                        "error",
                         {
-                            "phase": "call",
-                            "name": name,
-                            "detail": _tool_detail(raw),
+                            "message": f"Agent run failed: {exc}",
+                            "attempts": attempts,
+                            "timings": {"total_ms": round(elapsed * 1000)},
                         },
                     )
-
-                elif event.name == "tool_output":
-                    item = event.item
-                    raw = item.raw_item
-                    call_id = _raw_get(raw, "call_id", "")
-                    out = item.output
-                    if not isinstance(out, str):
-                        out = json.dumps(out, ensure_ascii=False)
+                    return
+                logger.warning(
+                    "Agent run failed on attempt %d (%s); recovering and continuing",
+                    attempts,
+                    exc,
+                )
+                # Only narrate a recovery when the attempt actually got
+                # somewhere. If it died before emitting anything, retrying
+                # the same input silently is less confusing than telling
+                # the user about a recovery from nothing.
+                if produced:
                     yield _sse(
-                        "tool",
-                        {
-                            "phase": "result",
-                            "name": names.get(call_id, "tool"),
-                            "output": _truncate(out, 1200),
-                        },
+                        "delta",
+                        {"text": f"\n\n_(recovered from {type(exc).__name__}, continuing)_\n\n"},
                     )
-
-            elapsed = time.monotonic() - started
-            yield _sse(
-                "done",
-                {
-                    "finish_reason": "completed",
-                    "usage": _sum_usage(getattr(result, "raw_responses", [])),
-                    "timings": {"total_ms": round(elapsed * 1000)},
-                    "tool_calls": tool_count,
-                },
-            )
-
-        except MaxTurnsExceeded as exc:
-            yield _sse(
-                "error",
-                {
-                    "message": (
-                        f"The agent reached its {body.max_turns}-turn limit "
-                        f"without finishing: {exc}"
-                    )
-                },
-            )
-        except Exception as exc:  # noqa: BLE001 - stream must end cleanly
-            yield _sse("error", {"message": f"Agent run failed: {exc}"})
+                    next_input = _next_input(result, original_input)
+                # Brief backoff so a transient engine outage gets a chance
+                # to clear before the next request.
+                await asyncio.sleep(min(2 * attempts, 5))
 
     return StreamingResponse(
         event_stream(),

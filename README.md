@@ -284,8 +284,9 @@ Copy `backend/.env.example` to `backend/.env` and adjust:
 | `POLL_INTERVAL_SECONDS` | `5` | Background poll cadence |
 | `BIND_HOST` | `0.0.0.0` | Backend bind host |
 | `BIND_PORT` | `8000` | Backend bind port |
-| `AGENT_MAX_TURNS` | `25` | Max agent turns before the run is aborted |
-| `AGENT_MAX_TOKENS` | `8192` | Per-model-call output cap (see the note on tool-call truncation) |
+| `AGENT_MAX_TURNS` | `150` | Max agent turns before the run is stopped |
+| `AGENT_MAX_TOKENS` | `16384` | Per-model-call output cap (see the note on tool-call truncation) |
+| `AGENT_MAX_WRITE_CHARS` | `12000` | Largest file body accepted in one `write_file` call |
 | `AGENT_INSTRUCTIONS` | built-in | Optional override of the agent system prompt |
 | `AGENT_WORKSPACE` | `backend/agent_workspace` | Where the full-access tier writes files |
 | `AGENT_TLS_VERIFY` | `1` | TLS verification for `fetch_url` / `search_web` |
@@ -525,8 +526,30 @@ round-trips a single request may take.
 Agent mode does not expose the **Max tokens** control. A `write_file` call puts
 the entire file body inside a single tool-call JSON object, so a small output cap
 cuts those arguments off mid-string and the call fails to parse — which is what
-happened at the default 1024. Agent mode uses `AGENT_MAX_TOKENS` (8192) instead,
-which comfortably covers scripts of a few thousand lines.
+happened at the default 1024. Agent mode uses `AGENT_MAX_TOKENS` (16384) instead,
+and `AGENT_MAX_WRITE_CHARS` (12000) caps a single write so the body always fits
+inside one response. A larger file is written in chunks: the first `write_file`
+call, then `append=true` for each following chunk.
+
+### Self-recovery
+
+The agent is expected to hit errors and keep going rather than end the run:
+
+- **Truncated tool calls** are repaired before the request leaves the backend. A
+  cut-off `write_file` is replaced with an empty call plus a tool output that tells
+  the model the write never landed and to continue in chunks. Without this, one
+  truncated call makes the engine reject every subsequent request with
+  `400 tool_calls[].function.arguments ... is not valid JSON`.
+- **Unknown tool names** are returned to the model as an error naming the tools
+  that do exist, instead of aborting the run.
+- **Failed runs** are retried up to 3 times from the point they stopped, with the
+  history sanitised again each time.
+- **Turn-limit exhaustion** ends with the last thing the agent produced as the
+  answer, not a bare error banner.
+
+The instructions pushed the same way: finish the job, install missing packages,
+verify each step, and treat a non-zero exit code as information rather than a
+stopping point.
 
 ### Customising the instructions
 

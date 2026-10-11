@@ -37,11 +37,19 @@ from typing import Any, Optional
 import httpx
 from agents import FunctionTool, function_tool
 
+from ..config import settings
+
 DEFAULT_COMMAND_TIMEOUT = 120.0
 MAX_COMMAND_TIMEOUT = 900.0
 WEB_TIMEOUT = 20.0
 MAX_FETCH_BYTES = 400_000
 MAX_OUTPUT_CHARS = 12_000
+
+# Largest body accepted by one write_file call. A long file body lives
+# inside a single tool-call JSON object, so a body big enough to be cut off
+# mid-string produces a truncated tool call, and that poisons every
+# subsequent request. Configured with AGENT_MAX_WRITE_CHARS.
+MAX_WRITE_CHARS = settings.agent_max_write_chars
 
 # TLS verification for fetch_url/search_web. On by default. Set
 # AGENT_TLS_VERIFY=0 only if a deployment sits behind a TLS-terminating
@@ -406,12 +414,35 @@ def build_exec_tools(state: Any, workspace: str) -> list[FunctionTool]:
 
         Args:
             path: File path. Relative paths resolve inside the workspace.
-            content: The text to write.
+            content: The text to write. Keep each call under
+                MAX_WRITE_CHARS; write longer files in several calls with
+                append=True.
             append: Append instead of overwriting.
 
         Returns the resolved absolute path and the bytes written.
         """
         target = _resolve(path, workspace)
+        if len(content) > MAX_WRITE_CHARS:
+            # A body this large is the one thing that reliably blows the
+            # output cap mid-call, and a truncated tool call poisons the
+            # whole conversation. Refuse it and say exactly what to do.
+            return json.dumps(
+                {
+                    "error": (
+                        f"content is {len(content)} characters, over the "
+                        f"{MAX_WRITE_CHARS}-character limit for a single "
+                        "write_file call."
+                    ),
+                    "how_to_fix": (
+                        "Write this file in chunks: call write_file with the "
+                        f"first {MAX_WRITE_CHARS} characters, then call it "
+                        "again with append=True for the next chunk, and so "
+                        "on until the file is complete. Then read it back "
+                        "to confirm it is intact."
+                    ),
+                    "path": target,
+                }
+            )
         parent = os.path.dirname(target)
         if parent:
             os.makedirs(parent, exist_ok=True)

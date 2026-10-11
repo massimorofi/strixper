@@ -56,12 +56,18 @@ class Settings:
         # Research tasks need headroom: a single "find and summarise X" job
         # can easily spend 15+ steps (search, fetch, write script, run it,
         # read output, refine). 8 cuts the agent off mid-task.
-        self.agent_max_turns: int = _get_int("AGENT_MAX_TURNS", 25)
+        self.agent_max_turns: int = _get_int("AGENT_MAX_TURNS", 150)
         # Output cap per model response. A long ``write_file`` call puts the
         # whole file body inside one tool-call JSON object, so a small cap
         # truncates the arguments and the call fails to parse. 2048 was too
-        # small in practice; 8192 covers scripts of a few thousand lines.
-        self.agent_max_tokens: int = _get_int("AGENT_MAX_TOKENS", 8192)
+        # small in practice, and 8192 still cut large HTML/CSS bodies off
+        # mid-string; 16384 leaves room for a substantial file in one call.
+        self.agent_max_tokens: int = _get_int("AGENT_MAX_TOKENS", 16384)
+        # Largest single file body the agent may write in one ``write_file``
+        # call. Beyond this the tool refuses with instructions to continue in
+        # ``append=True`` chunks, so an over-long generation cannot leave a
+        # half-written file behind and call it a success.
+        self.agent_max_write_chars: int = _get_int("AGENT_MAX_WRITE_CHARS", 12_000)
         # Optional replacement for the built-in system prompt.
         self.agent_instructions: str = os.getenv("AGENT_INSTRUCTIONS", "").strip()
         # Working directory for the full-access tier: downloads, generated

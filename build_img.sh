@@ -12,7 +12,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE="${1:-strixper-dashboard:latest}"
+IMAGE="${1:-briggen/strixper-dashboard:latest}"
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "[build_img] ERROR: docker not found on PATH" >&2

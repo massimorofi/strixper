@@ -162,8 +162,9 @@ Read from environment variables / a `.env` file (`backend/app/config.py`):
 | `RUNNER_RECONCILE` | `20` | Seconds between scans for an untracked engine container |
 | `ENGINE_TARGET_PATH` | `backend/data/engine_target.json` | Remembered engine target (see §4.9) |
 | `DEFAULT_MODEL` | `halogen-qwen3.8-flash-next` | Model id assumed before any engine reports one |
-| `AGENT_MAX_TURNS` | `25` | Max model↔tool round-trips per agentic request (see §3.3) |
-| `AGENT_MAX_TOKENS` | `8192` | Per-model-call output cap for the agent loop (see §3.3) |
+| `AGENT_MAX_TURNS` | `150` | Max model↔tool round-trips per agentic request (see §3.3) |
+| `AGENT_MAX_TOKENS` | `16384` | Per-model-call output cap for the agent loop (see §3.3) |
+| `AGENT_MAX_WRITE_CHARS` | `12000` | Largest file body accepted in one `write_file` call (see §4.12) |
 | `AGENT_INSTRUCTIONS` | built-in | Optional replacement for the agent system prompt (see §3.3) |
 | `AGENT_WORKSPACE` | `backend/agent_workspace` | Full-access working directory (see §4.12) |
 | `AGENT_TLS_VERIFY` | `1` | TLS verification for `fetch_url` / `search_web` (see §4.12) |
@@ -561,8 +562,8 @@ Request:
 | `mode` | `agent` | `agent` runs the SDK loop; `plain` delegates to the `POST /api/v1/chat` handler |
 | `allow_actions` | `false` | When true, the destructive tools (`start_engine`, `stop_engine`) are registered |
 | `full_access` | `false` | When true, the research/execution tools (§4.12) are registered **and** `allow_actions` is forced on |
-| `max_turns` | `AGENT_MAX_TURNS` (25) | Hard cap on model↔tool round-trips |
-| `max_tokens` | `AGENT_MAX_TOKENS` (8192) | Per-call response cap. Not exposed in the agent UI — see the truncation note below |
+| `max_turns` | `AGENT_MAX_TURNS` (150) | Hard cap on model↔tool round-trips; a client may request 1–1000 |
+| `max_tokens` | `AGENT_MAX_TOKENS` (16384) | Per-call response cap. Not exposed in the agent UI — see the truncation note below |
 | `temperature` | `0.2` | Low by default; a tool-calling loop drifts badly when creative |
 | `thinking` | `true` | `false` sends `reasoning.effort = "none"` so Halogen suppresses chain-of-thought |
 | `instructions` | empty | Per-request system-prompt override; falls back to `AGENT_INSTRUCTIONS`, then the built-in prompt |
@@ -602,10 +603,24 @@ reason the code looks the way it does:
 model emits the whole JSON object, including the full `content` string of a
 `write_file` call, before the call executes. With a small `max_tokens` that JSON is
 cut off mid-string, the arguments fail to parse, and the model sees an opaque tool
-error. The default is therefore `AGENT_MAX_TOKENS` (8192) rather than the 1024 the
+error. The default is therefore `AGENT_MAX_TOKENS` (16384) rather than the 1024 the
 plain-mode UI defaults to, and the agent UI does not expose the control at all —
 a user lowering it to tune answer length would silently break file writing.
 `max_tokens` remains settable per request for callers that know what they are doing.
+
+**Self-recovery.** Truncation is not fully preventable — a long enough file outruns
+any cap — so the run also repairs the damage. Three hooks are configured on every
+run (`app/services/agent_recovery.py`):
+
+| Hook | Failure it handles | Effect |
+| --- | --- | --- |
+| `call_model_input_filter` | A truncated `function_call` in the history, which makes Halogen reject the whole request with `400 tool_calls[].function.arguments ... is not valid JSON` | Invalid arguments are replaced with `{}` and a tool output is added telling the model the call never ran and to continue in chunks. Unanswered calls get a synthetic output too. |
+| `tool_error_formatter` + `tool_not_found_behavior="return_error_to_model"` | The model calls a tool that does not exist (`write` instead of `write_file`), which otherwise aborts the run | The error is returned to the model with the list of real tool names and the closest match |
+| `error_handlers={"max_turns": ...}` | The turn ceiling is hit | The run ends with the last assistant text as the final output instead of an error event |
+
+On top of that the SSE handler retries a failed run up to 3 times from the point it
+stopped, with the history sanitised again before each attempt. `MaxTurnsExceeded`
+is deliberately not retried.
 
 Errors: `422` on invalid body. Mid-stream failures surface as an `error` event
 rather than an HTTP status, because the stream has already started.
