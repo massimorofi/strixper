@@ -193,6 +193,20 @@ class DeleteTests(unittest.TestCase):
         self.store.delete_path("emptydir")
         self.assertFalse(os.path.exists(os.path.join(self.store.root, "emptydir")))
 
+    def test_delete_path_removes_directory_with_only_leftover_tmp_files(self):
+        """A dir that *looks* empty may still hold the store's own .tmp-* files.
+
+        Those are invisible to the user, so the emptiness check passes but
+        ``os.rmdir`` would fail with ENOTEMPTY unless they are cleared first.
+        """
+        d = os.path.join(self.store.root, "ghostdir")
+        os.makedirs(d, exist_ok=True)
+        for name in (".tmp-aaa", ".tmp-bbb", INDEX_FILENAME):
+            with open(os.path.join(d, name), "w") as fh:
+                fh.write("x")
+        self.store.delete_path("ghostdir")
+        self.assertFalse(os.path.exists(d))
+
     def test_delete_path_refuses_workspace_root(self):
         with self.assertRaises(FileStoreError):
             self.store.delete_path(".")
@@ -200,6 +214,51 @@ class DeleteTests(unittest.TestCase):
     def test_delete_path_outside_workspace_rejected(self):
         with self.assertRaises(FileStoreError):
             self.store.delete_path("../outside.txt")
+
+    def test_delete_path_recursive_removes_nonempty_directory(self):
+        self.store.save(PNG, "doomed.png")
+        os.makedirs(os.path.join(self.store.root, "tree", "branch"), exist_ok=True)
+        with open(os.path.join(self.store.root, "tree", "branch", "leaf.txt"), "w") as fh:
+            fh.write("leaf")
+        action = self.store.delete_path("tree", recursive=True)
+        self.assertEqual(action, "directory")
+        self.assertFalse(os.path.exists(os.path.join(self.store.root, "tree")))
+
+    def test_delete_path_recursive_purges_index_records(self):
+        rec = self.store.save(b"data", "dropme.txt")
+        self.store.delete_path(rec.path, recursive=True)
+        self.assertNotIn(rec.id, self.store._records)
+        self.assertFalse(os.path.exists(os.path.join(self.store.root, rec.path)))
+
+    def test_delete_paths_reports_successes_and_failures(self):
+        rec = self.store.save(b"one", "one.txt")
+        os.makedirs(os.path.join(self.store.root, "emptydir"), exist_ok=True)
+        result = self.store.delete_paths(
+            [rec.path, "emptydir", "missing.txt"], recursive=True
+        )
+        self.assertEqual(result["deleted_count"], 2)
+        self.assertEqual(result["failed_count"], 1)
+        self.assertEqual(result["failed"][0]["path"], "missing.txt")
+        self.assertFalse(os.path.exists(os.path.join(self.store.root, rec.path)))
+        self.assertFalse(os.path.exists(os.path.join(self.store.root, "emptydir")))
+
+    def test_delete_paths_children_listed_with_parent(self):
+        # Selecting a directory and its (visible) children must not report
+        # the children as failures once the parent is gone.
+        os.makedirs(os.path.join(self.store.root, "a", "b"), exist_ok=True)
+        with open(os.path.join(self.store.root, "a", "b", "c.txt"), "w") as fh:
+            fh.write("c")
+        result = self.store.delete_paths(
+            ["a", "a/b", "a/b/c.txt"], recursive=True
+        )
+        self.assertEqual(result["failed_count"], 0)
+        self.assertEqual(result["deleted_count"], 3)
+        self.assertFalse(os.path.exists(os.path.join(self.store.root, "a")))
+
+    def test_delete_paths_rejects_empty_selection(self):
+        result = self.store.delete_paths(["", "   "])
+        self.assertEqual(result["deleted_count"], 0)
+        self.assertEqual(result["failed_count"], 0)
 
 
 class BrowseTests(unittest.TestCase):

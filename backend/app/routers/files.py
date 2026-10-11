@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 from ..config import settings
 from ..services.file_store import (
@@ -268,13 +269,39 @@ async def workspace_download(path: str = Query(...)) -> FileResponse:
 
 
 @router.delete("/workspace")
-async def workspace_delete(path: str = Query(...)) -> dict[str, Any]:
-    """Delete a file, or an empty directory, inside the workspace."""
+async def workspace_delete(
+    path: str = Query(...),
+    recursive: bool = Query(False),
+) -> dict[str, Any]:
+    """Delete a file, or a directory, inside the workspace."""
     try:
-        action = _store().delete_path(path)
+        action = _store().delete_path(path, recursive=recursive)
     except FileStoreError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"deleted": True, "path": path, "kind": action}
+
+
+class BulkDeleteRequest(BaseModel):
+    paths: list[str] = Field(default_factory=list)
+    recursive: bool = False
+
+
+@router.post("/workspace/delete")
+async def workspace_delete_bulk(payload: BulkDeleteRequest) -> dict[str, Any]:
+    """Delete several files/directories in one call.
+
+    Recursive by default here: the UI only offers bulk delete behind a
+    confirmation dialog that names the selection, so the intent is explicit.
+    """
+    if not payload.paths:
+        raise HTTPException(status_code=400, detail="no paths supplied")
+    result = _store().delete_paths(payload.paths, recursive=payload.recursive)
+    if not result["deleted"] and result["failed"]:
+        raise HTTPException(
+            status_code=400,
+            detail="; ".join(f["error"] for f in result["failed"][:3]),
+        )
+    return result
 
 
 _EXT_FOR_MIME = {

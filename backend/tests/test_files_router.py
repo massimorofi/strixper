@@ -230,6 +230,52 @@ class WorkspaceRouteTests(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
         self.assertIn("not empty", r.json()["detail"])
 
+    def test_delete_nonempty_directory_recursive(self):
+        self.client.post(
+            "/api/v1/files/upload",
+            files={"file": ("gone.txt", io.BytesIO(b"x"), "text/plain")},
+        )
+        r = self.client.delete(
+            "/api/v1/workspace", params={"path": "uploads", "recursive": "true"}
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["kind"], "directory")
+        listing = self.client.get("/api/v1/workspace/list", params={"path": "."})
+        names = [e["name"] for e in listing.json()["entries"]]
+        self.assertNotIn("uploads", names)
+
+    def test_bulk_delete_removes_mixed_paths(self):
+        import os
+
+        os.makedirs(os.path.join(self.tmp.name, "dir"), exist_ok=True)
+        up = self.client.post(
+            "/api/v1/files/upload",
+            files={"file": ("bulk.txt", io.BytesIO(b"x"), "text/plain")},
+        )
+        self.assertEqual(up.status_code, 200)
+        stored = up.json()["path"]
+        r = self.client.post(
+            "/api/v1/workspace/delete",
+            json={"paths": [stored, "dir", "nope.txt"], "recursive": True},
+        )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["deleted_count"], 2)
+        self.assertEqual(body["failed_count"], 1)
+        self.assertEqual(body["failed"][0]["path"], "nope.txt")
+
+    def test_bulk_delete_rejects_empty_list(self):
+        r = self.client.post("/api/v1/workspace/delete", json={"paths": []})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("no paths", r.json()["detail"])
+
+    def test_bulk_delete_all_failed_is_400(self):
+        r = self.client.post(
+            "/api/v1/workspace/delete",
+            json={"paths": ["missing-a", "missing-b"], "recursive": True},
+        )
+        self.assertEqual(r.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

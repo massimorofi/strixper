@@ -383,31 +383,117 @@ class FileStore:
             raise FileStoreError(f"could not update the file index: {exc}") from exc
         return True
 
-    def delete_path(self, rel_path: str) -> str:
-        """Delete a file, or an empty directory, inside the workspace."""
+    def delete_path(self, rel_path: str, recursive: bool = False) -> str:
+        """Delete a file, or a directory, inside the workspace.
+
+        Directories are refused unless ``recursive`` is set, because silently
+        removing a subtree is the one operation in this API that cannot be
+        undone by the user.
+        """
         target = self.resolve(rel_path)
         if target == self.root:
             raise FileStoreError("refusing to delete the workspace root")
         if os.path.isdir(target):
-            if os.listdir(target):
-                raise FileStoreError(
-                    f"{rel_path} is not empty; delete its contents first"
-                )
-            os.rmdir(target)
+            if not recursive:
+                if self._visible_entries(target):
+                    raise FileStoreError(
+                        f"{rel_path} is not empty; delete its contents first"
+                    )
+                # The directory looks empty to the user but may still hold the
+                # store's own bookkeeping leftovers, which would make rmdir fail.
+                for leftover in self._bookkeeping_entries(target):
+                    try:
+                        os.unlink(os.path.join(target, leftover))
+                    except OSError as exc:
+                        raise FileStoreError(
+                            f"could not delete {rel_path}: {exc}"
+                        ) from exc
+                os.rmdir(target)
+            else:
+                shutil.rmtree(target)
             action = "directory"
         elif os.path.isfile(target) or os.path.islink(target):
             os.unlink(target)
             action = "file"
         else:
             raise FileStoreError(f"not found: {rel_path}")
-        stale = [fid for fid, rec in self._records.items() if rec.path == rel_path]
-        for fid in stale:
-            self._records.pop(fid, None)
+        self._drop_records_under(rel_path)
         try:
             self._persist()
         except OSError as exc:
             raise FileStoreError(f"could not update the file index: {exc}") from exc
         return action
+
+    def delete_paths(self, rel_paths: list[str], recursive: bool = False) -> dict[str, Any]:
+        """Delete several paths in one call.
+
+        Each path is attempted independently and reported separately, so one
+        protected or missing entry does not discard the rest of the batch.
+        """
+        deleted: list[str] = []
+        failed: list[dict[str, str]] = []
+        # Deepest paths first: removing a directory's contents before the
+        # directory itself means a selection that names both does not report
+        # the children as "not found" after the parent already took them.
+        ordered = sorted(
+            (p for p in (x or "" for x in rel_paths) if p.strip()),
+            key=lambda p: (p.count("/"), len(p)),
+            reverse=True,
+        )
+        for path in ordered:
+            try:
+                self.delete_path(path, recursive=recursive)
+                deleted.append(path)
+            except FileStoreError as exc:
+                failed.append({"path": path, "error": str(exc)})
+        return {
+            "deleted": deleted,
+            "deleted_count": len(deleted),
+            "failed": failed,
+            "failed_count": len(failed),
+        }
+
+    @staticmethod
+    def _visible_entries(target: str) -> list[str]:
+        """Directory contents excluding the store's own bookkeeping files."""
+        try:
+            names = os.listdir(target)
+        except OSError:
+            return []
+        return [
+            n
+            for n in names
+            if n != INDEX_FILENAME and not n.startswith(".tmp-")
+        ]
+
+    @staticmethod
+    def _bookkeeping_entries(target: str) -> list[str]:
+        """The store's own bookkeeping files inside ``target``.
+
+        These are invisible to the user, so an "empty" directory can still
+        contain them; they must be removed before ``os.rmdir`` can succeed.
+        """
+        try:
+            names = os.listdir(target)
+        except OSError:
+            return []
+        return [
+            n
+            for n in names
+            if n == INDEX_FILENAME or n.startswith(".tmp-")
+        ]
+
+    def _drop_records_under(self, rel_path: str) -> None:
+        """Forget indexed files at ``rel_path`` or beneath it."""
+        norm = rel_path.rstrip("/")
+        doomed = [
+            fid
+            for fid, rec in self._records.items()
+            if rec.path == rel_path
+            or (norm and rec.path.startswith(norm + "/"))
+        ]
+        for fid in doomed:
+            self._records.pop(fid, None)
 
     # ---------------------------------------------------------- retention
 

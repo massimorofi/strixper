@@ -440,12 +440,30 @@ export const listWorkspace = (path = '') =>
 export const readWorkspaceFile = (path) =>
   getJSON(`/workspace/read?path=${encodeURIComponent(path)}`)
 
-export async function deleteWorkspacePath(path) {
-  const res = await fetch(`${BASE}/workspace?path=${encodeURIComponent(path)}`, {
+export async function deleteWorkspacePath(path, { recursive = false } = {}) {
+  const params = new URLSearchParams({ path, recursive: String(recursive) })
+  const res = await fetch(`${BASE}/workspace?${params.toString()}`, {
     method: 'DELETE',
   })
   if (!res.ok) {
     throw new Error(await readError(res, `HTTP ${res.status} on DELETE /workspace`))
+  }
+  return res.json()
+}
+
+// Bulk delete. Recursive by default: the UI asks for confirmation before
+// calling this, and a directory selection that silently skipped its
+// contents would be worse than one that removes them.
+export async function deleteWorkspacePaths(paths, { recursive = true } = {}) {
+  const res = await fetch(`${BASE}/workspace/delete`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paths, recursive }),
+  })
+  if (!res.ok) {
+    throw new Error(
+      await readError(res, `HTTP ${res.status} on POST /workspace/delete`),
+    )
   }
   return res.json()
 }
