@@ -23,6 +23,10 @@ if the model is told what happened instead of the run being torn down:
    ``RunErrorHandlers(max_turns=...)`` so the run ends with a usable summary
    rather than a bare error event.
 
+4. **Context overflow.** Total conversation history exceeds the model's
+   context window. Handled by truncating older history before each model call,
+   keeping the system prompt and recent exchanges.
+
 Everything here is deliberately conservative: it repairs what is provably
 broken and leaves everything else untouched.
 """
@@ -38,6 +42,20 @@ from agents.run_config import CallModelData, ModelInputData
 from ..config import settings
 
 logger = logging.getLogger(__name__)
+
+# Context management: leave headroom for response tokens and tool schemas
+# Halogen context = 262144, leave ~60k for response + schemas
+MAX_CONTEXT_TOKENS = 180_000
+# Rough token estimate: 1 token ≈ 4 chars for JSON/text
+CHARS_PER_TOKEN = 4
+# A base64 image is not text and must not be costed as if it were. A 5 MB
+# screenshot is ~6.7 MB of base64, which at 4 chars/token reads as 1.7 M
+# tokens and would truncate the whole conversation on the first picture.
+# Vision towers charge per tile instead; this is a deliberately generous
+# per-image allowance so images are neither free nor catastrophic.
+IMAGE_TOKEN_ESTIMATE = 1_500
+# Minimum items to keep (system prompt + at least this many recent items)
+MIN_HISTORY_ITEMS = 20
 
 # A tool call whose arguments are not valid JSON is replaced with this. It is
 # valid JSON for any schema (an empty object satisfies "type": "object"), so
@@ -67,6 +85,60 @@ def _arguments_are_valid(raw: Any) -> bool:
     return isinstance(parsed, dict)
 
 
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate for JSON/text content."""
+    return max(1, len(text) // CHARS_PER_TOKEN)
+
+
+def _item_weight(item: Any) -> str:
+    """Serialise one history item for costing, with image payloads removed.
+
+    Image parts carry megabytes of base64 that is not text, so they are
+    stripped here and costed separately by ``_estimate_items_tokens``.
+    """
+    if isinstance(item, dict):
+        content = item.get("content")
+        if isinstance(content, list):
+            scrubbed = [
+                part
+                for part in content
+                if not (
+                    isinstance(part, dict)
+                    and part.get("type") in ("input_image", "image_url", "image")
+                )
+            ]
+            item = {**item, "content": scrubbed}
+    return json.dumps(item, ensure_ascii=False) if isinstance(item, (dict, list)) else str(item)
+
+
+def _count_images(item: Any) -> int:
+    """How many image parts one history item carries, if any."""
+    if not isinstance(item, dict):
+        return 0
+    content = item.get("content")
+    if not isinstance(content, list):
+        return 0
+    return sum(
+        1
+        for part in content
+        if isinstance(part, dict)
+        and part.get("type") in ("input_image", "image_url", "image")
+    )
+
+
+def _estimate_items_tokens(items: list[Any]) -> int:
+    """Estimate total tokens for a list of history items.
+
+    Text is costed at ``CHARS_PER_TOKEN`` per character; each image is
+    charged a flat ``IMAGE_TOKEN_ESTIMATE`` instead of its base64 length.
+    """
+    total = 0
+    for item in items:
+        total += _estimate_tokens(_item_weight(item))
+        total += _count_images(item) * IMAGE_TOKEN_ESTIMATE
+    return total
+
+
 def sanitize_model_input(data: CallModelData[Any]) -> ModelInputData:
     """Drop or repair history items that would make the engine reject the request.
 
@@ -77,6 +149,24 @@ def sanitize_model_input(data: CallModelData[Any]) -> ModelInputData:
     items = list(data.model_data.input or [])
     if not items:
         return ModelInputData(input=items, instructions=data.model_data.instructions)
+
+    # --- Context overflow protection: truncate old history ---
+    estimated_tokens = _estimate_items_tokens(items)
+    if estimated_tokens > MAX_CONTEXT_TOKENS:
+        # Separate system prompt from conversation
+        system_items = [i for i in items if isinstance(i, dict) and i.get("role") == "system"]
+        other_items = [i for i in items if not (isinstance(i, dict) and i.get("role") == "system")]
+
+        # Keep system prompt + last N items
+        keep_count = MIN_HISTORY_ITEMS
+        kept = other_items[-keep_count:] if len(other_items) > keep_count else other_items
+        items = system_items + kept
+
+        logger.warning(
+            "Truncated agent history from %d to %d items (est. %d -> %d tokens)",
+            len(other_items), len(kept), estimated_tokens,
+            _estimate_items_tokens(items)
+        )
 
     answered = {
         item.get("call_id")

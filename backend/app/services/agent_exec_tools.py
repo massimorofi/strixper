@@ -42,8 +42,8 @@ from ..config import settings
 DEFAULT_COMMAND_TIMEOUT = 120.0
 MAX_COMMAND_TIMEOUT = 900.0
 WEB_TIMEOUT = 20.0
-MAX_FETCH_BYTES = 400_000
-MAX_OUTPUT_CHARS = 12_000
+MAX_FETCH_BYTES = 80_000
+MAX_OUTPUT_CHARS = 4_000
 
 # Largest body accepted by one write_file call. A long file body lives
 # inside a single tool-call JSON object, so a body big enough to be cut off
@@ -499,4 +499,63 @@ def build_exec_tools(state: Any, workspace: str) -> list[FunctionTool]:
             entries.append({"name": name, "type": kind, "bytes": st.st_size})
         return _clip({"path": target, "count": len(entries), "entries": entries})
 
-    return [fetch_url, search_web, run_shell, run_python, write_file, read_file, list_directory]
+    @function_tool
+    async def delete_path(path: str) -> str:
+        """Delete a file, or an empty directory, inside the workspace.
+
+        Args:
+            path: File or directory path. Relative paths resolve inside
+                the workspace.
+
+        Returns the deleted path. Non-empty directories are refused --
+        delete their contents first, so one call cannot take out a tree
+        by accident.
+        """
+        target = _resolve(path, workspace)
+        root = os.path.realpath(workspace)
+        try:
+            common = os.path.commonpath([root, target])
+        except ValueError:
+            return json.dumps({"error": "path is outside the workspace"})
+        if common != root:
+            return json.dumps({"error": f"{path} resolves outside the workspace"})
+        if target == root:
+            return json.dumps({"error": "refusing to delete the workspace root"})
+        if os.path.isdir(target):
+            try:
+                remaining = os.listdir(target)
+            except OSError as exc:
+                return json.dumps({"error": f"could not inspect {target}: {exc}"})
+            if remaining:
+                return json.dumps(
+                    {
+                        "error": (
+                            f"{target} is not empty "
+                            f"({len(remaining)} entr{'y' if len(remaining) == 1 else 'ies'}); "
+                            "delete its contents first"
+                        )
+                    }
+                )
+            try:
+                os.rmdir(target)
+            except OSError as exc:
+                return json.dumps({"error": f"could not delete {target}: {exc}"})
+            return json.dumps({"deleted": target, "kind": "empty_directory"})
+        if os.path.isfile(target) or os.path.islink(target):
+            try:
+                os.unlink(target)
+            except OSError as exc:
+                return json.dumps({"error": f"could not delete {target}: {exc}"})
+            return json.dumps({"deleted": target, "kind": "file"})
+        return json.dumps({"error": f"not found: {target}"})
+
+    return [
+        fetch_url,
+        search_web,
+        run_shell,
+        run_python,
+        write_file,
+        read_file,
+        list_directory,
+        delete_path,
+    ]

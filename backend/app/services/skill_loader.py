@@ -12,7 +12,9 @@ import yaml
 from agents import FunctionTool
 
 MAX_SKILL_FILE_BYTES = 100_000
-MAX_RESOURCE_BYTES = 64_000
+# Same ceiling as skill files: reference docs inside a skill are read whole, and the
+# bundled guides (migration guides, probe scripts) are larger than 64 KB.
+MAX_RESOURCE_BYTES = 100_000
 MAX_FRONTMATTER_BYTES = 8_192
 _SKILL_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _ALLOWED_METADATA = {

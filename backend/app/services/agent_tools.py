@@ -89,7 +89,7 @@ def build_tools(
             if run is not None and run.engine_url
             else await build_live_snapshot(state)
         )
-        return _clip(snapshot, 6000)
+        return _clip(snapshot, 3000)
 
     @function_tool
     async def get_engine_health() -> str:
@@ -100,7 +100,7 @@ def build_tools(
         check whether the engine is reachable and what it actually serves,
         as opposed to what the dashboard was configured to expect.
         """
-        return _clip(await engine_call("get_health"), 4000)
+        return _clip(await engine_call("get_health"), 2000)
 
     @function_tool
     async def get_engine_metrics() -> str:
@@ -111,7 +111,7 @@ def build_tools(
         aggregated snapshot is missing a number, or when asked about one
         specific metric.
         """
-        return _clip(await engine_call("get_metrics"), 6000)
+        return _clip(await engine_call("get_metrics"), 3000)
 
     @function_tool
     async def get_cache_stats() -> str:
@@ -134,7 +134,7 @@ def build_tools(
         """
         from .tuning_checker import run_all_checks
 
-        return _clip(await run_all_checks(), 8000)
+        return _clip(await run_all_checks(), 4000)
 
     @function_tool
     async def get_system_info() -> str:
@@ -182,7 +182,7 @@ def build_tools(
             }
             for cfg in configs
         ]
-        return _clip({"count": len(summary), "configs": summary}, 6000)
+        return _clip({"count": len(summary), "configs": summary}, 3000)
 
     @function_tool
     async def get_active_run() -> str:

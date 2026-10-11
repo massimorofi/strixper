@@ -34,6 +34,16 @@ def _get_int(name: str, default: int) -> int:
     return value if value > 0 else default
 
 
+def _get_list(name: str, default: list[str]) -> list[str]:
+    """Comma-separated list setting; blank or unset falls back to *default*."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return list(default)
+    items = [item.strip() for item in raw.split(",")]
+    items = [item for item in items if item]
+    return items if items else list(default)
+
+
 class Settings:
     """Startup settings (see .env.example for the documented keys)."""
 
@@ -78,6 +88,33 @@ class Settings:
         self.agent_workspace: str = os.getenv(
             "AGENT_WORKSPACE", os.path.join(_backend_dir, "agent_workspace")
         ).strip()
+        # Root for user uploads and the workspace browser. Defaults to the
+        # agent workspace so the agent sees exactly what the user uploads;
+        # a separate value is only useful when the two must be isolated.
+        self.workspace_root: str = os.getenv(
+            "STRIXPER_WORKSPACE", self.agent_workspace
+        ).strip()
+        # ---- Upload / vision limits --------------------------------------
+        self.max_image_size_mb: int = _get_int("MAX_IMAGE_SIZE_MB", 10)
+        self.max_file_size_mb: int = _get_int("MAX_FILE_SIZE_MB", 50)
+        self.max_images_per_message: int = _get_int("MAX_IMAGES_PER_MESSAGE", 5)
+        # Pixel budget enforced at upload time. The chat path uses the
+        # engine's own advertised limits; these are the fallback for when
+        # no engine has reported yet, and the hard ceiling for uploads.
+        self.image_max_pixels: int = _get_int("IMAGE_MAX_PIXELS", 3_686_400)
+        self.image_size_multiple: int = _get_int("IMAGE_SIZE_MULTIPLE", 32)
+        # Uploaded/generated files older than this are removed at startup.
+        self.workspace_ttl_days: int = _get_int("WORKSPACE_TTL_DAYS", 7)
+        self.allowed_image_types: list[str] = _get_list(
+            "ALLOWED_IMAGE_TYPES",
+            ["image/png", "image/jpeg", "image/webp", "image/gif"],
+        )
+        # ``["*"]`` means any file type is accepted.
+        self.allowed_file_types: list[str] = _get_list("ALLOWED_FILE_TYPES", ["*"])
+        # Largest number of text characters ``workspace_read`` returns.
+        self.max_workspace_read_bytes: int = _get_int(
+            "MAX_WORKSPACE_READ_BYTES", 1_000_000
+        )
         self.skills_dir: str = os.getenv(
             "SKILLS_DIR",
             str(Path(__file__).resolve().parents[2] / "skills"),

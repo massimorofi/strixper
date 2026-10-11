@@ -6,6 +6,7 @@ import {
   Code2,
   Eraser,
   Eye,
+  FolderTree,
   Loader2,
   MessageSquareText,
   Send,
@@ -17,8 +18,14 @@ import {
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import AgentExtensions from './AgentExtensions.jsx'
+import FileUploadZone from './FileUploadZone.jsx'
+import MessageAttachments from './MessageAttachments.jsx'
+import WorkspaceFileTree from './WorkspaceFileTree.jsx'
+import { useFileUpload } from '../hooks/useFileUpload.js'
+import { resolveLimits, toAttachment } from '../utils/fileUtils.js'
 import {
   createThinkSplitter,
+  fetchConfig,
   fetchRunnerRuns,
   streamAgentChat,
   streamChat,
@@ -96,15 +103,26 @@ function usesInlineThink(api) {
 // so empty turns are dropped here rather than at the far end.
 const ROLES = ['user', 'assistant', 'system']
 
+// A turn is sendable when it carries text or at least one stored file.
+// Requiring text would break the common gesture of sending a picture with
+// no caption, which the backend explicitly accepts.
+function isSendable(m) {
+  if (!m || !ROLES.includes(m.role)) return false
+  const hasText = typeof m.content === 'string' && m.content.trim().length > 0
+  const hasFiles = Array.isArray(m.attachments) && m.attachments.length > 0
+  return hasText || hasFiles
+}
+
 function toOutbound(messages) {
   return messages
-    .filter(
-      (m) =>
-        ROLES.includes(m?.role) &&
-        typeof m?.content === 'string' &&
-        m.content.trim().length > 0,
-    )
-    .map(({ role, content }) => ({ role, content }))
+    .filter(isSendable)
+    .map((m) => {
+      const out = { role: m.role, content: m.content || '' }
+      if (Array.isArray(m.attachments) && m.attachments.length > 0) {
+        out.attachments = m.attachments
+      }
+      return out
+    })
 }
 
 function loadStoredMessages() {
@@ -236,9 +254,14 @@ function Bubble({ msg }) {
         }`}
       >
         {isUser ? (
-          <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-[var(--text-primary)]">
-            {msg.content}
-          </p>
+          <>
+            {msg.content ? (
+              <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-[var(--text-primary)]">
+                {msg.content}
+              </p>
+            ) : null}
+            <MessageAttachments attachments={msg.attachments} />
+          </>
         ) : (
           <>
             <ReasoningBlock text={msg.reasoning} streaming={msg.streaming} />
@@ -351,6 +374,7 @@ function persistMessages(messages) {
         steps: m.steps,
         stats: m.stats,
         error: m.error,
+        attachments: m.attachments,
       }))
     localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed))
   } catch {
@@ -374,6 +398,15 @@ export default function AIChatTab({ active = true }) {
   const [selectedRunId, setSelectedRunId] = useState('')
   const scrollRef = useRef(null)
   const abortRef = useRef(null)
+  // Upload limits come from the backend so the client never enforces a
+  // different rule than the one that will actually reject the file.
+  const { data: serverConfig } = useQuery({
+    queryKey: ['config'],
+    queryFn: fetchConfig,
+    staleTime: 60_000,
+  })
+  const limits = resolveLimits(serverConfig)
+  const upload = useFileUpload({ limits })
   const { data: runs = [] } = useQuery({
     queryKey: ['runner-runs'],
     queryFn: fetchRunnerRuns,
@@ -495,9 +528,14 @@ export default function AIChatTab({ active = true }) {
 
   const send = async () => {
     const text = draft.trim()
-    if (!text || busy) return
+    if ((!text && upload.ready.length === 0) || busy) return
+    if (upload.uploading) {
+      setError('Wait for the upload to finish before sending.')
+      return
+    }
 
-    const userMsg = { id: makeId(), role: 'user', content: text }
+    const attachments = upload.ready.map((it) => toAttachment(it))
+    const userMsg = { id: makeId(), role: 'user', content: text, attachments }
     const assistantId = makeId()
     setMessages((prev) => [
       ...prev,
@@ -516,6 +554,9 @@ export default function AIChatTab({ active = true }) {
     setDraft('')
     setError(null)
     setBusy(true)
+    // The bytes are stored server-side and captured in `attachments`; the
+    // pending-queue state (with its blob URLs) is no longer needed.
+    upload.clear()
 
     const controller = new AbortController()
     abortRef.current = controller
@@ -599,6 +640,7 @@ export default function AIChatTab({ active = true }) {
     stop()
     setMessages([])
     setError(null)
+    upload.clear()
   }
 
   const activeApi = API_OPTIONS.find((o) => o.value === api)
@@ -608,6 +650,7 @@ export default function AIChatTab({ active = true }) {
       <nav className="flex shrink-0 gap-1 border-b border-[var(--border-hairline)]" aria-label="AI Chat sections">
         {[
           { id: 'conversation', label: 'Conversation', Icon: MessageSquareText },
+          { id: 'workspace', label: 'Workspace', Icon: FolderTree },
           { id: 'extensions', label: 'Extensions', Icon: Settings2 },
         ].map(({ id, label, Icon }) => (
           <button
@@ -628,6 +671,11 @@ export default function AIChatTab({ active = true }) {
       <div className={view === 'extensions' ? 'flex min-h-0 flex-1' : 'hidden'}>
         <AgentExtensions active={active && view === 'extensions'} />
       </div>
+      {view === 'workspace' && (
+        <div className="min-h-0 flex-1 overflow-hidden rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-3">
+          <WorkspaceFileTree active={active && view === 'workspace'} />
+        </div>
+      )}
       {view === 'conversation' && (
     <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)]">
       {/* Controls */}
@@ -799,6 +847,13 @@ export default function AIChatTab({ active = true }) {
             {error}
           </div>
         )}
+        <FileUploadZone
+          items={upload.items}
+          onAdd={upload.addFiles}
+          onRemove={upload.remove}
+          onRetry={upload.retry}
+          disabled={busy}
+        />
         <div className="flex items-end gap-2">
           <textarea
             value={draft}
@@ -811,7 +866,9 @@ export default function AIChatTab({ active = true }) {
           <button
             type="button"
             onClick={busy ? stop : send}
-            disabled={!busy && !draft.trim()}
+            disabled={
+              !busy && !draft.trim() && upload.ready.length === 0
+            }
             className={`inline-flex h-9 items-center gap-1.5 rounded-lg px-4 text-sm font-medium transition-colors ${
               busy
                 ? 'border border-[var(--status-critical)] text-[var(--status-critical)] hover:bg-[var(--surface-page)]'

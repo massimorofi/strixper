@@ -244,3 +244,56 @@ class WriteFileSizeGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ImageTokenEstimateTests(unittest.TestCase):
+    """Base64 images must not be costed as if they were prose."""
+
+    def test_image_payload_does_not_inflate_estimate(self):
+        from app.services.agent_recovery import (
+            IMAGE_TOKEN_ESTIMATE,
+            MAX_CONTEXT_TOKENS,
+            _estimate_items_tokens,
+        )
+
+        big_b64 = "A" * (5 * 1024 * 1024)
+        items = [
+            {"role": "system", "content": "sys"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "look"},
+                    {"type": "input_image", "image_url": f"data:image/png;base64,{big_b64}"},
+                ],
+            },
+        ]
+        est = _estimate_items_tokens(items)
+        self.assertLess(est, MAX_CONTEXT_TOKENS)
+        self.assertGreater(est, IMAGE_TOKEN_ESTIMATE)
+
+    def test_plain_history_estimate_unchanged(self):
+        from app.services.agent_recovery import CHARS_PER_TOKEN, _estimate_items_tokens
+
+        items = [{"role": "user", "content": "x" * 400}]
+        expected = len(json.dumps(items[0], ensure_ascii=False)) // CHARS_PER_TOKEN
+        self.assertEqual(_estimate_items_tokens(items), expected)
+
+    def test_many_images_still_eventually_truncate(self):
+        from app.services.agent_recovery import (
+            IMAGE_TOKEN_ESTIMATE,
+            MAX_CONTEXT_TOKENS,
+            _estimate_items_tokens,
+        )
+
+        per_image = MAX_CONTEXT_TOKENS // IMAGE_TOKEN_ESTIMATE + 1
+        items = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "t"},
+                    {"type": "input_image", "image_url": "data:image/png;base64," + "A" * 100},
+                ],
+            }
+            for _ in range(per_image)
+        ]
+        self.assertGreater(_estimate_items_tokens(items), MAX_CONTEXT_TOKENS)

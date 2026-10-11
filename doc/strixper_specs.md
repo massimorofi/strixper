@@ -116,8 +116,12 @@ v                                               v
     rebuild, and MCP servers are registered, tested and enabled from the AI Chat
     **Extensions** panel, with their configuration persisted in the data volume.
     Both are granted one of the three access tiers and only become visible to the
-    agent when the request satisfies that tier. See §3.3 (Agent extension APIs),
-    §4.13 (`skill_loader`) and §4.14 (`mcp_manager`).
+    agent when the request satisfies that tier. See §3.3 (Agent extension APIs).
+12. **File upload, vision and workspace** — drag-and-drop images and files into
+    the AI-Chat composer, vision analysis on capable engines, and a workspace
+    file browser. Uploads are stored once and referenced by id; the agent sees
+    exactly what the user uploads. See §3.3 (`/files/*`, `/workspace/*`),
+    §4.13 (`file_store`) and §4.14 (`vision_helper`).
 
 ---
 
@@ -168,6 +172,16 @@ Read from environment variables / a `.env` file (`backend/app/config.py`):
 | `AGENT_INSTRUCTIONS` | built-in | Optional replacement for the agent system prompt (see §3.3) |
 | `AGENT_WORKSPACE` | `backend/agent_workspace` | Full-access working directory (see §4.12) |
 | `AGENT_TLS_VERIFY` | `1` | TLS verification for `fetch_url` / `search_web` (see §4.12) |
+| `STRIXPER_WORKSPACE` | value of `AGENT_WORKSPACE` | Root for user uploads and the workspace browser (see §4.13). Defaults to the agent workspace so the agent sees exactly what the user uploads |
+| `MAX_IMAGE_SIZE_MB` | `10` | Largest accepted image upload (see §4.13) |
+| `MAX_FILE_SIZE_MB` | `50` | Largest accepted non-image upload (see §4.13) |
+| `MAX_IMAGES_PER_MESSAGE` | `5` | Images allowed in a single chat turn (see §3.3) |
+| `IMAGE_MAX_PIXELS` | `3686400` | Fallback pixel budget (~1920×1920) used when no engine has reported its own (see §4.14) |
+| `IMAGE_SIZE_MULTIPLE` | `32` | Fallback width/height alignment requirement (see §4.14) |
+| `WORKSPACE_TTL_DAYS` | `7` | Age after which workspace files are deleted at startup (see §4.13) |
+| `ALLOWED_IMAGE_TYPES` | `image/png,image/jpeg,image/webp,image/gif` | Accepted image MIME types, validated from magic bytes (see §4.14) |
+| `ALLOWED_FILE_TYPES` | `*` | Accepted non-image extensions; `*` accepts everything (see §4.13) |
+| `MAX_WORKSPACE_READ_BYTES` | `1000000` | Largest text body `workspace_read` returns before reporting `truncated` |
 | `SKILLS_DIR` | `<repository>/skills` (Docker: `/app/skills`) | Read-only root containing drop-in Agent Skill folders |
 | `STRIXPER_DATA_DIR` | `backend/data` | Persistent runtime data root; MCP config is stored here |
 | `MCP_SERVERS_DIR` | `<repository>/mcp-servers` (Docker: `/mcp-servers`) | Per-server MCP package root; server-ID subdirectories and shared `bin/` are added to child process `PATH` |
@@ -204,6 +218,16 @@ All endpoints are mounted under the `/api/v1` prefix.
 | `/api/v1/agent/mcp-servers` | `POST` | AI-Chat Extensions | Protected create; enabling launches the configured stdio command |
 | `/api/v1/agent/mcp-servers/{id}` | `PUT` / `DELETE` | AI-Chat Extensions | Protected update/delete; closes the previous process/session |
 | `/api/v1/agent/mcp-servers/test` | `POST` | AI-Chat Extensions | Protected temporary connection/tool-list test; always closes the session |
+| `/api/v1/files/upload` | `POST` | AI-Chat composer | Multipart upload → stored file record (images validated at upload) |
+| `/api/v1/files` | `GET` | On-demand | List every indexed file |
+| `/api/v1/files/{file_id}` | `GET` | On-demand | Download a stored file (attachment) |
+| `/api/v1/files/{file_id}/preview` | `GET` | On-demand | Serve a stored file inline (images / text) |
+| `/api/v1/files/{file_id}` | `DELETE` | On-demand | Delete a stored file by id |
+| `/api/v1/workspace/list` | `GET` | Workspace browser | List one directory of the workspace tree |
+| `/api/v1/workspace/read` | `GET` | Workspace browser | Read a text file (capped, reports `truncated`) |
+| `/api/v1/workspace/preview` | `GET` | Workspace browser | Serve a workspace file inline |
+| `/api/v1/workspace/download` | `GET` | Workspace browser | Download a workspace file by path |
+| `/api/v1/workspace` | `DELETE` | Workspace browser | Delete a file, or an empty directory, by path |
 | `/api/v1/runner/configs` | `GET` | On-demand (LLM-Runner tab) | List stored docker run configurations |
 | `/api/v1/runner/configs/{id}` | `GET` | On-demand | Fetch one stored configuration |
 | `/api/v1/runner/configs` | `POST` | On-demand (LLM-Runner tab) | Create a new run configuration |
@@ -460,12 +484,35 @@ matter which upstream API style is chosen.
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `messages` | array | required | 1–200 turns; each `{role, content}`, `role ∈ {user, assistant, system}`, `content` 1–100,000 chars, non-blank |
+| `messages` | array | required | 1–200 turns; each `{role, content}`, `role ∈ {user, assistant, system}`, `content` 0–100,000 chars. A turn may carry `attachments` instead of text (see below) |
 | `api` | string | `"chat"` | Upstream style: `chat` \| `messages` \| `responses` \| `completions` |
 | `stream` | bool | `true` | `true` = SSE stream, `false` = single JSON object |
 | `thinking` | bool | `true` | `false` suppresses the model's chain-of-thought |
 | `max_tokens` | int | `null` | 1–32,768; omitted = server default |
 | `temperature` | float | `null` | 0.0–2.0; omitted = server default |
+
+**Attachments.** A message may include an `attachments` array. Each entry is
+`{type, file_id, name, size, mime_type, workspace_path}`, where `type` is
+`"image"` or `"file"` and `file_id` refers to a file previously stored through
+`POST /api/v1/files/upload` (§3.3, Files & workspace endpoints). The backend
+expands image attachments into native content parts for the chosen upstream
+style and inlines non-image files as text, because no upstream style has a file
+concept:
+
+| `api` | Image content part |
+| --- | --- |
+| `chat` | `{"type": "image_url", "image_url": {"url": "data:<mime>;base64,…"}}` |
+| `messages` | `{"type": "image", "source": {"type": "base64", "media_type": "<mime>", "data": "…"}}` |
+| `responses` | `{"type": "input_image", "image_url": "data:<mime>;base64,…"}` |
+| `completions` | **unsupported** — rejected with `422` rather than silently dropped |
+
+Text-only turns keep sending a plain string, so nothing changes on the wire for
+existing traffic. Before images go upstream the backend checks the engine's
+`/health → vision.enabled`; when the loaded engine has no vision tower the
+request fails fast with `400` and an actionable message rather than a
+downstream error. Per-turn image count is capped at `MAX_IMAGES_PER_MESSAGE`.
+Because the bytes are on disk in the workspace, the agent can open the same
+files the user uploaded.
 
 **Upstream API mapping.** The `api` field selects which Halogen endpoint is called
 and how the payload is shaped:
@@ -558,7 +605,7 @@ Request:
 
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `messages` | required | Full conversation history, sent every turn (no server-side session) |
+| `messages` | required | Full conversation history, sent every turn (no server-side session). Turns may carry `attachments` exactly as in `POST /api/v1/chat`; image parts are passed to the SDK and non-image files are announced to the model by workspace path |
 | `mode` | `agent` | `agent` runs the SDK loop; `plain` delegates to the `POST /api/v1/chat` handler |
 | `allow_actions` | `false` | When true, the destructive tools (`start_engine`, `stop_engine`) are registered |
 | `full_access` | `false` | When true, the research/execution tools (§4.12) are registered **and** `allow_actions` is forced on |
@@ -644,7 +691,7 @@ Returns the tool inventory for the current permission set:
 
 Useful for confirming which tools an agent turn will actually see. `start_engine`
 and `stop_engine` appear only with `?allow_actions=true`. With
-`?full_access=true` the seven research/execution tools of §4.12 join them, and the
+`?full_access=true` the eight research/execution tools of §4.12 join them, and the
 response also carries `full_access` and a `tier` label
 (`read-only` / `actions` / `full`). The bounded skill tools are also listed.
 MCP tools appear only when their server is enabled, connected, and its configured
@@ -953,6 +1000,91 @@ container's PID 1 and escalates to SIGKILL after `N` seconds
 (`RUNNER_STOP_TIMEOUT`, default 5). A command with no `--name` gives no
 handle to stop by, so it falls back to killing the client only — include
 `--name` for a reliable stop.
+
+#### Files & workspace endpoints
+
+These back the AI-Chat upload zone and the workspace browser. Uploads are stored
+under `<workspace>/uploads` and addressed by an opaque `file_id` thereafter, so
+the browser never supplies a path to fetch a stored file. The workspace routes
+are the deliberate exception and are confined by `FileStore.resolve` (§4.13).
+
+##### `POST /api/v1/files/upload`
+
+`multipart/form-data` with `file` (required) and `subdir` (optional, defaults to
+`uploads`). Images are validated against the engine's real constraints at upload
+time rather than at send time, so a bad image is rejected where the user can see
+which file it was.
+
+Response `200`:
+
+```json
+{
+  "id": "a1b2c3d4…",
+  "name": "chart.png",
+  "size": 123456,
+  "mime_type": "image/png",
+  "path": "uploads/<chat>/chart.png",
+  "created_at": 1770000000.0,
+  "kind": "upload",
+  "download_url": "/api/v1/files/a1b2c3d4…",
+  "preview_url": "/api/v1/files/a1b2c3d4…/preview"
+}
+```
+
+Errors: `400` empty file or store failure; `413` over `MAX_FILE_SIZE_MB`; `415`
+image MIME not in `ALLOWED_IMAGE_TYPES` (or a non-image whose extension is not in
+`ALLOWED_FILE_TYPES`); `422` image fails the pixel-budget / multiple / size
+validation.
+
+##### `GET /api/v1/files`
+
+Returns `{ "files": [ {id, name, size, mime_type, path, created_at, kind}, … ] }`
+for every file the index knows about.
+
+##### `GET /api/v1/files/{file_id}`
+
+Streams the stored file as an attachment (`Content-Disposition: attachment`).
+`404` if the id is unknown.
+
+##### `GET /api/v1/files/{file_id}/preview`
+
+Serves the file inline when its MIME type is genuinely inline-safe (images,
+plain text, markdown, csv, json); anything else is forced to download. `413` if
+larger than 10 MB (previewing a huge file inline is a DoS with extra steps);
+`404` if unknown.
+
+##### `DELETE /api/v1/files/{file_id}`
+
+Deletes the stored file and its index entry. Returns `{ "deleted": true,
+"file_id": … }`. `404` if unknown, `500` on a store failure.
+
+##### `GET /api/v1/workspace/list?path=.`
+
+Lists one directory of the workspace tree. Returns `{ "path": …, "entries":
+[ {name, path, is_dir, size, mtime}, … ] }`. `400` if the path escapes the
+workspace root.
+
+##### `GET /api/v1/workspace/read?path=`
+
+Reads a UTF-8 text file. Returns `{ "content": …, "encoding": "utf-8",
+"truncated": bool }`, capped at `MAX_WORKSPACE_READ_BYTES`. Non-UTF-8 (binary)
+content is refused with `415` and an explanation. `404` if missing, `400` if the
+path escapes the workspace.
+
+##### `GET /api/v1/workspace/preview?path=`
+
+Serves a workspace file inline (same inline-safety rules as the file preview).
+
+##### `GET /api/v1/workspace/download?path=`
+
+Downloads a workspace file by path as an attachment.
+
+##### `DELETE /api/v1/workspace?path=`
+
+Deletes a file, or an **empty** directory, inside the workspace. Returns
+`{ "deleted": true, "path": …, "kind": "file"|"directory" }`. Refuses the
+workspace root and any non-empty directory (`400`), and any path that escapes the
+workspace.
 
 #### `GET /api/v1/healthz`
 
@@ -1496,6 +1628,15 @@ Registered only when the request sets `full_access`, which also forces
 | `write_file(path, content, append=False)` | Writes/appends in the workspace | — |
 | `read_file(path, max_bytes=60000)` | Reads a file | 60 KB |
 | `list_directory(path=".")` | Lists entries with type and size | — |
+| `delete_path(path)` | Deletes a file, or an empty directory, inside the workspace | Refuses the workspace root and non-empty directories |
+
+**Workspace binding.** `build_exec_tools` is called with `settings.workspace_root`
+(`STRIXPER_WORKSPACE`, defaulting to `AGENT_WORKSPACE`), **not** with
+`settings.agent_workspace` directly. Uploads, the `FileStore`, and the workspace
+browser all operate on `workspace_root`; binding the exec tools to a different
+value would make the agent blind to the files the user just uploaded whenever the
+two environment variables diverge. The two are equal by default, so the
+distinction only surfaces when `STRIXPER_WORKSPACE` is set explicitly.
 
 **The guard is not a sandbox.** `_DENIED_PATTERNS` rejects `rm -rf /`, `mkfs`,
 `dd … of=/dev/…`, `shutdown`/`reboot`/`halt`/`poweroff`, `> /dev/sdX`, and
@@ -1553,6 +1694,106 @@ directly and it is fine.
 behind a TLS-terminating proxy whose CA is absent from the container trust store.
 Verified working with verification on against Bing, example.com, and a self-hosted
 site, from both the host venv and inside the built image.
+
+---
+
+### 4.13 `file_store` (`services/file_store.py`)
+
+Index-backed file storage confined to a single workspace root
+(`STRIXPER_WORKSPACE`, default `AGENT_WORKSPACE`). Everything the user uploads and
+everything the agent writes lives under that root, so the agent's `read_file`
+sees exactly what the browser uploaded — two roots would put user files out of
+the agent's reach.
+
+**Workspace layout**
+
+```
+<workspace>/
+├── .strixper-index.json    # file_id → metadata (owned by file_store)
+├── uploads/<chat_id>/      # user uploads
+└── outputs/<chat_id>/      # agent-generated artifacts
+```
+
+**`FileRecord`** — `id` (uuid4 hex), `name`, `size`, `mime_type`, `path`
+(workspace-relative), `created_at`, `kind` (`"upload"` | `"output"`).
+
+**Index handling.** The index is a JSON file inside the workspace so it travels
+with the same Docker volume. Writes are atomic (temp file + `os.replace`). On
+load, a missing index is treated as empty; a **corrupt** index is rebuilt by
+scanning the tree rather than crashing the backend.
+
+**Confinement.** Every client-supplied path is resolved with `os.path.realpath`
+*before* it is compared with the root, so a planted symlink resolves to its
+target and is rejected if that target escapes. `os.path.commonpath` is used
+rather than a string prefix check because `/ws-evil` startswith `/ws`.
+
+**Filename sanitisation.** `sanitize_filename()` reduces the client-supplied name
+to a basename (twice, so `a/../../b` cannot survive one split), strips control
+characters and shell-hostile characters, removes leading dots so nothing lands as
+a hidden file, and caps the result at 180 characters. Collisions are resolved by
+appending a counter (`name (1).png`).
+
+**Retention.** `sweep(ttl_seconds)` deletes files older than `WORKSPACE_TTL_DAYS`
+(default 7). It runs once at backend startup (`main.py` lifespan) and is not
+scheduled periodically; a long-lived process does not expire files mid-session.
+A sweep failure is logged and does not block startup.
+
+**Public API**
+
+| Method | Purpose |
+| --- | --- |
+| `save(raw, filename, subdir, declared_mime)` | Store bytes, return `FileRecord` |
+| `get(file_id)` / `require(file_id)` | Look up a record (`require` raises) |
+| `read_bytes(file_id)` | Read stored bytes |
+| `list()` | All indexed records |
+| `browse(rel_path)` | Directory listing for the workspace browser |
+| `read_text(rel_path)` | Text read capped at `MAX_WORKSPACE_READ_BYTES`, reports `truncated` |
+| `delete(file_id)` | Delete by id |
+| `delete_path(rel_path)` | Delete a file or empty directory by path |
+| `sweep(ttl_seconds=None)` | Drop expired files, return count |
+| `adopt_existing()` | Index files already on disk that the index lost |
+| `resolve(rel_path)` | Confined `realpath` resolution |
+| `get_store()` / `set_store(store)` | Singleton accessor (built on `settings.workspace_root`) |
+
+`FileStoreError` carries an HTTP-friendly message and is translated to `400`/`404`
+by the router.
+
+---
+
+### 4.14 `vision_helper` (`services/vision_helper.py`)
+
+Pure-stdlib image inspection — no Pillow, no network. Used by the upload route
+(validate at upload time) and by the chat path (build content parts).
+
+| Function | Purpose |
+| --- | --- |
+| `sniff_mime(data)` | Magic-byte MIME detection for PNG, JPEG, WebP, GIF. Returns `None` if unrecognised |
+| `is_image(data)` | Boolean convenience over `sniff_mime` |
+| `read_image_size(data, mime)` | Header parse: PNG `IHDR`, JPEG `SOF0/1/2`, GIF logical screen descriptor, WebP `VP8`/`VP8L`/`VP8X` |
+| `validate_image(data, allowed_types, max_pixels, size_multiple, max_bytes)` | Enforces every engine constraint; returns `(mime, width, height)` |
+| `to_data_url(data, mime)` | `data:<mime>;base64,…` |
+| `openai_image_part(data, mime)` | `{"type": "image_url", …}` |
+| `anthropic_image_part(data, mime)` | `{"type": "image", "source": {…}}` |
+| `responses_image_part(data, mime)` | `{"type": "input_image", …}` |
+| `vision_enabled(health)` | Reads `vision.enabled` out of an engine `/health` payload |
+| `vision_constraints(health)` | Reads `(max_pixels, size_multiple)` advertised by the engine |
+
+**Magic bytes are authoritative.** A browser will happily label an `.html` file
+`image/png`. The client-supplied `Content-Type` is treated as a hint; the bytes
+are the truth. An image whose sniffed type is outside `ALLOWED_IMAGE_TYPES` is
+rejected with `415`.
+
+**Validation is pixel-count based, not hard-coded.** The live Halogen build
+advertises `max_pixels: 3686400` (~1920×1920) and `size_multiple: 32` in its
+`/health` response. The chat path reads those values so a different engine build
+gets its own limits; `IMAGE_MAX_PIXELS` / `IMAGE_SIZE_MULTIPLE` are the fallback
+used when no engine has reported yet, and the hard ceiling enforced at upload
+time. `ImageValidationError` messages name the actual measured dimensions so the
+user knows what to fix.
+
+**Halogen refuses `http(s)` image URLs.** Verified live: only `data:` URLs or
+bare base64 are accepted. The implementation therefore never forwards a remote
+URL and always inlines bytes it already holds.
 
 ---
 
@@ -1712,7 +1953,40 @@ that aborts the stream via `AbortController`. Errors surface as a red banner
 above the composer.
 
 **Composer (bottom).** A textarea with **Enter to send** / **Shift+Enter for a
-newline**. Empty input disables Send.
+newline**. Empty input disables Send — unless the turn carries attachments, in
+which case an empty-text turn is allowed (drag a picture in with no text, the
+common Copilot gesture).
+
+**File upload zone.** The composer accepts drag-and-drop anywhere over it, plus a
+paperclip button that opens the file picker (`components/FileUploadZone.jsx`).
+Images (`ALLOWED_IMAGE_TYPES`) and non-image files (`ALLOWED_FILE_TYPES`) are
+handled by the same zone:
+
+* Client-side pre-checks (type, size, per-message image count) reject with a
+  specific message per rejection reason before any bytes are sent.
+* Each pending file shows a thumbnail (images) or a type icon, name and size
+  (files), with an individual remove button and upload progress.
+* Upload goes to `POST /api/v1/files/upload` via `hooks/useFileUpload.js`; the
+  returned `file_id` is what the message references thereafter, so the base64
+  payload is sent once rather than on every turn.
+* Images are validated server-side at upload time against the engine's real
+  pixel budget and dimension multiple, so a bad image is rejected where the user
+  can see which file caused it.
+
+**Message attachments.** Rendered inside both user and assistant bubbles by
+`components/MessageAttachments.jsx`: images as a thumbnail grid (click for a
+full-size overlay), other files as a chip with icon, name, size and a download
+button. Assistant-generated files carry a sparkle badge. Attachment metadata is
+persisted with the transcript, so thumbnails survive a page reload; the bytes
+come from `/api/v1/files/{id}/preview`.
+
+**Workspace browser.** A workspace panel (`components/WorkspaceFileTree.jsx`)
+exposes the file tree under `STRIXPER_WORKSPACE` — the same tree the agent reads
+and writes. It browses directories with `GET /api/v1/workspace/list`, previews
+text and images, downloads files, and deletes a file or empty directory from the
+UI (`DELETE /api/v1/workspace?path=`) behind a confirmation dialog. Deletion of
+a non-empty directory is refused by the backend, so the tree must be emptied
+first.
 
 **Client-side streaming.** `streamChat()` in `api.js` uses `fetch` +
 `ReadableStream` (not `EventSource`, which cannot POST) and parses the SSE
@@ -1868,7 +2142,8 @@ backend/
       config_routes.py      GET/POST /config
       stats_routes.py       POST /stats/reset
       tokens.py             POST /count-tokens (Halogen count_tokens proxy)
-      chat.py               POST /chat (streaming chat proxy, 4 API styles)
+      chat.py               POST /chat (streaming chat proxy, 4 API styles, attachments)
+      files.py              file upload/download + workspace browsing
       agent.py               agent chat, tools, skills, protected MCP APIs
       runner.py             LLM-Runner: config CRUD + start/watch/stop + preview
     services/
@@ -1884,6 +2159,8 @@ backend/
       params.py             {name} template validation + command rendering
       agent_tools.py        tool functions exposed to the agent (read-only + gated)
       agent_exec_tools.py   full-access tier: web, shell, python, file I/O
+      file_store.py         index-backed, workspace-confined file storage + TTL sweep
+      vision_helper.py      magic-byte MIME sniffing, image validation, data URLs
       skill_loader.py       safe SKILL.md discovery and bounded resource loading
       mcp_manager.py        persisted MCP config, stdio process/session lifecycle
     data/
@@ -1901,6 +2178,10 @@ frontend/
     theme.js                chart + status color tokens (light/dark)
     format.js               number/percent/time formatters
     params.js               client-side {name} template helpers (placeholders, missing/unused, render, row validation)
+    hooks/
+      useFileUpload.js      upload state machine (queue, progress, errors)
+    utils/
+      fileUtils.js          MIME detection, size limits, attachment mapping
     components/
       TopBar.jsx            connection, refresh, theme, tabs
       StatTile.jsx          KPI card with info button
@@ -2110,6 +2391,60 @@ Recorded so they are not rediscovered as "missing":
 
 ---
 
+### 8.3 Implementation checklist — AI-Chat file & vision enhancement
+
+Implemented and verified live (Halogen engine, browser + curl):
+
+* [x] **Workspace resolution.** Single `STRIXPER_WORKSPACE` root shared by
+      uploads, agent file tools, and the browser tree. `agent_workspace` remains
+      the default so existing deployments are unchanged.
+* [x] **`file_store` service.** Index-backed store with atomic writes,
+      corrupt-index rebuild, `realpath`/`commonpath` confinement, filename
+      sanitisation, TTL sweep, and `adopt_existing` recovery.
+* [x] **`vision_helper` service.** Magic-byte MIME detection, per-format header
+      parsing, constraint validation, and per-API-style content-part builders.
+* [x] **Upload route.** `POST /api/v1/files/upload` with per-type size limits,
+      image validation at upload time, and optional `subdir`.
+* [x] **File routes.** List, download, preview (inline vs forced download),
+      delete by id.
+* [x] **Workspace routes.** List, read, preview, download, delete by path.
+* [x] **Chat attachments.** `attachments` on `POST /chat` and
+      `POST /agent/chat`; per-style content-part assembly; non-image files
+      inlined as text; magic bytes authoritative over declared MIME.
+* [x] **Vision gate.** Engine `vision.enabled` checked before sending images,
+      cached per engine target, with a clear error when the engine has no vision.
+* [x] **Image count cap.** `MAX_IMAGES_PER_MESSAGE` enforced per turn.
+* [x] **Frontend upload zone.** Drag-drop + file picker, per-file progress,
+      thumbnails, individual removal, specific rejection messages.
+* [x] **Attachment rendering.** Image grid with full-size overlay, file chips
+      with download, sparkle badge on agent-generated files, persisted across
+      reload.
+* [x] **Workspace browser panel.** Browse, preview, download, delete with
+      confirmation.
+* [x] **`delete_path` agent tool.** Added to the full-access tier; the
+      confirmation gate applies as it does to `write_file`.
+* [x] **Bug fixed: agent searched the wrong directory.** `agent.py` passed
+      `settings.agent_workspace` to `build_exec_tools()` while uploads use
+      `settings.workspace_root`. Both call sites now use `workspace_root`.
+      Caught by live testing, not by unit tests — the existing tests used the
+      default where the two values coincide.
+* [x] **Tests.** 179 backend tests pass, including new coverage for file store,
+      vision helper, upload routes, workspace routes, and attachment assembly.
+
+**Known limitations (not defects)**
+
+* **Image generation is not supported.** Halogen's `/health` advertises no
+  image-generation capability; the dashboard does not offer it.
+* **TTL sweep runs at startup only.** A long-lived process does not expire files
+  mid-session. Add a periodic task if deployments run for weeks.
+* **No per-file ACL.** Anything with the workspace path can read any file in it.
+  The dashboard has no authentication; see §9.
+* **Non-image attachments are inlined as text.** A PDF or xlsx is not parsed;
+  the model sees the extracted/decoded text only if the file is text-like.
+  Binary formats beyond plain text are of limited use to the current engines.
+
+---
+
 ## 9. Docker Deployment and Lifecycle Contract
 
 ### 9.1 Image build and runtime
@@ -2157,6 +2492,10 @@ The dashboard container relies on host facilities and must be created with:
   group.
 * The named `strixper-agent-ws` volume mounted at `/app/backend/agent_workspace`
   so the full-access tier's downloads and generated scripts survive a recreate.
+  This is also the file-store workspace: uploads, agent outputs and the index live
+  here. If `STRIXPER_WORKSPACE` is set to a different path, that path must be the
+  one mounted — otherwise uploads and agent file access diverge and the browser
+  sees an empty tree.
 * The named `strixper-data` volume mounted at `/app/backend/data` to preserve
   Runner configs, the remembered engine target, and non-secret MCP server
   configuration across container removal.

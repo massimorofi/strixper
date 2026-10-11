@@ -403,3 +403,110 @@ export async function streamAgentChat(
     if (err?.name !== 'AbortError') onError?.(err?.message || 'Stream interrupted')
   }
 }
+
+// ---------------------------------------------------------------------------
+// Files & workspace
+//
+// Uploads go out as multipart/form-data. Everything else is plain JSON.
+// Stored files are addressed by the opaque file_id the backend hands back,
+// never by a path the browser supplies.
+// ---------------------------------------------------------------------------
+
+export async function uploadFile(file, { subdir } = {}) {
+  const form = new FormData()
+  form.append('file', file, file.name || 'upload')
+  if (subdir) form.append('subdir', subdir)
+
+  let res
+  try {
+    res = await fetch(`${BASE}/files/upload`, {
+      method: 'POST',
+      body: form,
+    })
+  } catch (err) {
+    throw new Error(err?.message || 'Upload failed')
+  }
+  if (!res.ok) {
+    throw new Error(await readError(res, `HTTP ${res.status} on POST /files/upload`))
+  }
+  return res.json()
+}
+
+export const listFiles = () => getJSON('/files')
+
+export const listWorkspace = (path = '') =>
+  getJSON(`/workspace/list${path ? `?path=${encodeURIComponent(path)}` : ''}`)
+
+export const readWorkspaceFile = (path) =>
+  getJSON(`/workspace/read?path=${encodeURIComponent(path)}`)
+
+export async function deleteWorkspacePath(path) {
+  const res = await fetch(`${BASE}/workspace?path=${encodeURIComponent(path)}`, {
+    method: 'DELETE',
+  })
+  if (!res.ok) {
+    throw new Error(await readError(res, `HTTP ${res.status} on DELETE /workspace`))
+  }
+  return res.json()
+}
+
+export async function deleteFile(fileId) {
+  const res = await fetch(`${BASE}/files/${encodeURIComponent(fileId)}`, {
+    method: 'DELETE',
+  })
+  if (!res.ok) {
+    throw new Error(await readError(res, `HTTP ${res.status} on DELETE /files`))
+  }
+  return res.json()
+}
+
+// Fetch a stored file and hand it to the browser as a download. Object URLs
+// are revoked by the caller once the anchor has been clicked.
+export async function downloadFile(fileId, filename) {
+  const res = await fetch(`${BASE}/files/${encodeURIComponent(fileId)}`)
+  if (!res.ok) {
+    throw new Error(await readError(res, `HTTP ${res.status} on GET /files`))
+  }
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  try {
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename || 'download'
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  } finally {
+    // Give the browser a moment to start the download before reclaiming.
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+  return true
+}
+
+// Path-addressed workspace download (agent output has no upload record).
+export async function downloadWorkspaceFile(path, filename) {
+  const res = await fetch(
+    `${BASE}/workspace/download?path=${encodeURIComponent(path)}`,
+  )
+  if (!res.ok) {
+    throw new Error(
+      await readError(res, `HTTP ${res.status} on GET /workspace/download`),
+    )
+  }
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  try {
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename || path.split('/').pop() || 'download'
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }
+  return true
+}
+
+export const workspacePreviewUrl = (path) =>
+  `${BASE}/workspace/preview?path=${encodeURIComponent(path)}`

@@ -17,7 +17,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from .config import settings
-from .routers import agent, chat, config_routes, live, runner, stats_routes, tokens, tuning
+from .routers import agent, chat, config_routes, files, live, runner, stats_routes, tokens, tuning
+from .services.file_store import get_store as get_file_store
 from .services.live_service import RuntimeState, managed_poller, set_engine_target
 from .services.mcp_manager import MCPManager
 from .services.run_registry import registry, reconcile_loop
@@ -71,6 +72,17 @@ async def lifespan(app: FastAPI):
         logger.error("MCP configuration could not be loaded; management requires repair.")
     on_adopted = _make_adopted_hook(state)
 
+    # Workspace: create the tree and drop anything past its retention
+    # window. A failure here is not fatal -- chat without attachments and
+    # the rest of the dashboard still work, so log and carry on.
+    try:
+        store = get_file_store()
+        removed = store.sweep()
+        if removed:
+            logger.info("workspace sweep removed %d expired file(s)", removed)
+    except Exception as exc:  # noqa: BLE001 -- never block startup on this
+        logger.warning("workspace initialisation failed: %s", exc)
+
     # A docker container outlives the process that started it, so an engine
     # can be up before this backend is. Adopt it rather than showing an
     # empty console: the run becomes visible, watchable and stoppable, and
@@ -120,6 +132,7 @@ app.include_router(tokens.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/api/v1")
 app.include_router(runner.router, prefix="/api/v1")
 app.include_router(agent.router, prefix="/api/v1")
+app.include_router(files.router, prefix="/api/v1")
 
 
 @app.get("/api/v1/healthz")
