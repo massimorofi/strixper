@@ -22,7 +22,9 @@ events so the UI is identical regardless of the upstream API:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import time
 from typing import Any, AsyncIterator, Literal, Optional
 
@@ -35,6 +37,14 @@ from ..config import settings
 from ..services.halogen_client import HalogenClient
 from ..services.run_registry import registry
 from ..services import vision_helper
+from ..services.chat_retry import (
+    call_with_retry,
+    describe_failure,
+    is_retryable,
+    retry_budget,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["chat"])
 
@@ -586,43 +596,67 @@ async def chat(body: ChatRequest, request: Request) -> Any:
 
     if not body.stream:
         try:
-            result = await client.post_json(_upstream_path(body.api), payload, headers)
-        except httpx.HTTPStatusError as exc:
-            detail = exc.response.text[:500] if exc.response is not None else str(exc)
-            raise HTTPException(
-                status_code=502,
-                detail=f"Engine chat failed ({exc.response.status_code}): {detail}",
-            ) from exc
-        except httpx.HTTPError as exc:
-            raise HTTPException(
-                status_code=502, detail=f"Engine unreachable: {exc}"
-            ) from exc
-        finally:
+            result = await call_with_retry(
+                lambda: client.post_json(_upstream_path(body.api), payload, headers)
+            )
+        except Exception as exc:  # noqa: BLE001 - re-raised as HTTP 502
             if owns_client:
                 await client.close()
+            if isinstance(exc, HTTPException):
+                raise
+            attempts = retry_budget()[0]
+            raise HTTPException(
+                status_code=502, detail=describe_failure(exc, attempts)
+            ) from exc
+        if owns_client:
+            await client.close()
         return _sync_result(body.api, result, model)
 
+    total_attempts, pause = retry_budget()
+
     async def event_stream() -> AsyncIterator[str]:
-        try:
-            async for chunk in client.stream_sse(_upstream_path(body.api), payload, headers):
-                reasoning, content, done = extract(chunk)
-                if reasoning:
-                    yield _sse("reasoning", {"text": reasoning})
-                if content:
-                    yield _sse("delta", {"text": content})
-                if done:
-                    yield _sse("done", done)
-        except httpx.HTTPStatusError as exc:
-            detail = exc.response.text[:500] if exc.response is not None else str(exc)
-            yield _sse(
-                "error",
-                {"message": f"Engine chat failed ({exc.response.status_code}): {detail}"},
-            )
-        except httpx.HTTPError as exc:
-            yield _sse("error", {"message": f"Engine unreachable: {exc}"})
-        finally:
-            if owns_client:
-                await client.close()
+        # A streaming reply cannot be restarted once text has reached the
+        # browser: the retry would duplicate the answer. So the retry loop
+        # only covers failures that happen before the first chunk is shown
+        # (engine down, connection reset, DNS blip), which is where the
+        # "network error" bubble actually comes from. Once text is on
+        # screen, the error is surfaced instead of replayed.
+        emitted = False
+        for attempt in range(1, total_attempts + 1):
+            try:
+                async for chunk in client.stream_sse(
+                    _upstream_path(body.api), payload, headers
+                ):
+                    reasoning, content, done = extract(chunk)
+                    if reasoning:
+                        emitted = True
+                        yield _sse("reasoning", {"text": reasoning})
+                    if content:
+                        emitted = True
+                        yield _sse("delta", {"text": content})
+                    if done:
+                        yield _sse("done", done)
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - classified below
+                last_error = describe_failure(exc, total_attempts)
+                if attempt >= total_attempts or emitted or not is_retryable(exc):
+                    logger.warning(
+                        "Chat stream failed (attempt %d/%d, emitted=%s): %s",
+                        attempt, total_attempts, emitted, exc,
+                    )
+                    yield _sse("error", {"message": last_error})
+                    break
+                logger.warning(
+                    "Chat stream failed on attempt %d/%d (%s); retrying in %.0fs",
+                    attempt, total_attempts, exc, pause,
+                )
+                if pause:
+                    await asyncio.sleep(pause)
+                continue
+        if owns_client:
+            await client.close()
 
     return StreamingResponse(
         event_stream(),

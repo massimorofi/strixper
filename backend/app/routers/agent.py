@@ -417,7 +417,12 @@ def _recovery_config() -> RunConfig:
 # A run that dies partway is usually recoverable: the cause is a bad item in
 # the history, a transient engine error, or a model hiccup. Retrying the
 # same request with a freshly sanitised history gets past all three.
-MAX_RUN_ATTEMPTS = 3
+# The budget is shared with the plain chat path so both survive the same
+# outages (see CHAT_RETRY_ATTEMPTS / CHAT_RETRY_PAUSE_SECONDS).
+MAX_RUN_ATTEMPTS = max(1, int(getattr(settings, "chat_retry_attempts", 6)))
+RUN_RETRY_PAUSE_SECONDS = max(
+    0.0, float(getattr(settings, "chat_retry_pause_seconds", 10.0))
+)
 
 
 def _next_input(result: Any, fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -766,9 +771,10 @@ async def agent_chat(body: AgentChatRequest, request: Request) -> Any:
                         {"text": f"\n\n_(recovered from {type(exc).__name__}, continuing)_\n\n"},
                     )
                     next_input = _next_input(result, original_input)
-                # Brief backoff so a transient engine outage gets a chance
-                # to clear before the next request.
-                await asyncio.sleep(min(2 * attempts, 5))
+                # Backoff so a transient engine outage gets a chance to
+                # clear before the next request.
+                if RUN_RETRY_PAUSE_SECONDS:
+                    await asyncio.sleep(RUN_RETRY_PAUSE_SECONDS)
 
     return StreamingResponse(
         event_stream(),

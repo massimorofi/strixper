@@ -59,6 +59,22 @@ class Settings:
             "DEFAULT_MODEL", "halogen-qwen3.8-flash-next"
         ).strip()
 
+        # ---- Chat retry policy --------------------------------------------
+        # Long AI chats used to die on the first transient network failure
+        # ("network error"). Every chat request -- plain and agentic -- is now
+        # retried before the failure is surfaced to the user.
+        # Attempts counts the initial try plus the retries, so the default of
+        # 6 means "retry at least 5 times".
+        self.chat_retry_attempts: int = _get_int("CHAT_RETRY_ATTEMPTS", 6)
+        # Pause between attempts. The user asked for 10s; it is kept far below
+        # the read timeout so sleeping never counts against a live request.
+        self.chat_retry_pause_seconds: float = _get_float("CHAT_RETRY_PAUSE_SECONDS", 10.0)
+        # Optional upper bound on a single retry attempt. 0 (the default)
+        # leaves the httpx-level timeout in charge; a long reasoning answer
+        # can legitimately stream for minutes, so capping it here would
+        # turn a working request into a retry.
+        self.chat_retry_timeout_seconds: float = _get_float("CHAT_RETRY_TIMEOUT_SECONDS", 0.0)
+
         # ---- Agentic chat -------------------------------------------------
         # The agent talks to the same engine through the OpenAI-compatible
         # API, so it needs no separate endpoint. These settings bound the

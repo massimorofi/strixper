@@ -316,6 +316,12 @@ function Bubble({ msg }) {
                 Thinking…
               </p>
             ) : null}
+            {msg.retry && (
+              <p className="mt-1 flex items-center gap-1.5 text-xs text-[var(--text-muted)]">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                {msg.retry}
+              </p>
+            )}
             {msg.error && (
               <p className="mt-1 text-xs text-[var(--status-critical)]">
                 {msg.error}
@@ -501,9 +507,15 @@ export default function AIChatTab({ active = true }) {
             }
             patch({ steps })
           },
+          onRetry: (attempt, total) => {
+            patch({
+              retry: `Connection lost. Retrying (${attempt}/${total - 1})…`,
+            })
+          },
           onDone: (done) => {
             patch({
               streaming: false,
+              retry: null,
               stats: formatStats(done),
               reasoning: reasoningAcc || undefined,
               content: contentAcc,
@@ -511,7 +523,7 @@ export default function AIChatTab({ active = true }) {
             })
           },
           onError: (message) => {
-            patch({ streaming: false, error: message, steps })
+            patch({ streaming: false, retry: null, error: message, steps })
             setError(message)
           },
         },
@@ -604,16 +616,22 @@ export default function AIChatTab({ active = true }) {
               patch({ content: contentAcc })
             }
           },
+          onRetry: (attempt, total) => {
+            patch({
+              retry: `Connection lost. Retrying (${attempt}/${total - 1})…`,
+            })
+          },
           onDone: (done) => {
             patch({
               streaming: false,
+              retry: null,
               stats: formatStats(done),
               reasoning: done?.reasoning || reasoningAcc || undefined,
               content: done?.content || contentAcc,
             })
           },
           onError: (message) => {
-            patch({ streaming: false, error: message })
+            patch({ streaming: false, retry: null, error: message })
             setError(message)
           },
         },

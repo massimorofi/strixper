@@ -49,6 +49,131 @@ async function getJSON(path) {
   return res.json()
 }
 
+// ---------------------------------------------------------------------------
+// Chat streaming retry policy
+//
+// A long chat used to die on the first dropped connection with a "network
+// error" bubble. The backend retries the upstream engine call, but the
+// browser -> backend hop needs its own retry: that is where a Wi-Fi blip,
+// a backend restart, or a proxy idle timeout shows up.
+//
+// 6 attempts total (the first try plus 5 retries), 10s apart.
+// ---------------------------------------------------------------------------
+const CHAT_RETRY_ATTEMPTS = 6
+const CHAT_RETRY_PAUSE_MS = 10_000
+
+// Statuses that mean "the server hiccuped", not "your request is wrong".
+const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504])
+
+function isAborted(err, signal) {
+  if (signal?.aborted) return true
+  const name = err?.name
+  return name === 'AbortError' || name === 'CanceledError'
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+// Raised internally so a failure inside the SSE handler can break out of the
+// read loop and be classified by the retry loop.
+class ChatStreamError extends Error {
+  constructor(message, retryable) {
+    super(message)
+    this.name = 'ChatStreamError'
+    this.retryable = !!retryable
+  }
+}
+
+/**
+ * POST a chat request and read the SSE response, retrying transient network
+ * failures up to `attempts` times with `pauseMs` between tries.
+ *
+ * Retry rules:
+ *  - A user abort is never retried and never reported as an error.
+ *  - A 4xx response (other than the retryable statuses) is reported at once:
+ *    retrying a validation error just wastes 10s each time.
+ *  - Once any answer text has reached the screen, a failure is reported rather
+ *    than retried, because replaying the request would duplicate the answer.
+ *
+ * `handlers` receives {onReasoning, onDelta, onDone, onError, onRetry}.
+ */
+async function streamChatWithRetry(path, body, handlers = {}, options = {}) {
+  const attempts = options.attempts ?? CHAT_RETRY_ATTEMPTS
+  const pauseMs = options.pauseMs ?? CHAT_RETRY_PAUSE_MS
+  const signal = options.signal
+  const { onReasoning, onDelta, onTool, onDone, onError, onRetry } = handlers
+
+  let lastMessage = 'Network request failed'
+
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    // Anything already shown to the user makes a replay unsafe.
+    let emitted = false
+    try {
+      const res = await fetch(`${BASE}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+        body: JSON.stringify(body),
+        signal,
+      })
+
+      if (!res.ok || !res.body) {
+        const message = await readError(res, `HTTP ${res.status} on POST ${path}`)
+        throw new ChatStreamError(message, RETRYABLE_STATUS.has(res.status))
+      }
+
+      await readSSE(res, (event, data) => {
+        if (event === 'reasoning') {
+          emitted = true
+          onReasoning?.(data.text || '')
+        } else if (event === 'delta') {
+          emitted = true
+          onDelta?.(data.text || '')
+        } else if (event === 'done') {
+          onDone?.(data)
+        } else if (event === 'tool') {
+          onTool?.(data)
+        } else if (event === 'error') {
+          // The backend has already retried this upstream failure out of its
+          // own budget; replaying it here would multiply the waits.
+          throw new ChatStreamError(textOr('Stream error', data?.message), false)
+        }
+      })
+      return
+    } catch (err) {
+      if (isAborted(err, signal)) return
+      lastMessage = err?.message || lastMessage
+      const retryable =
+        err instanceof ChatStreamError ? err.retryable && !emitted : !emitted
+      if (attempt >= attempts || !retryable) {
+        onError?.(lastMessage)
+        return
+      }
+      onRetry?.(attempt, attempts, lastMessage)
+      if (pauseMs) await sleep(pauseMs)
+    }
+  }
+}
+
+// Stream a chat turn from the backend /api/v1/chat proxy.
+// onReasoning(textChunk), onDelta(textChunk), onDone(donePayload), onError(err)
+export async function streamChat(
+  { messages, api = 'chat', maxTokens, temperature, thinking = true, runId },
+  { onReasoning, onDelta, onDone, onError, onRetry, signal } = {},
+) {
+  const body = { messages, api, stream: true, thinking }
+  if (runId) body.run_id = runId
+  if (maxTokens != null) body.max_tokens = maxTokens
+  if (temperature != null) body.temperature = temperature
+
+  await streamChatWithRetry(
+    '/chat',
+    body,
+    { onReasoning, onDelta, onDone, onError, onRetry },
+    { signal },
+  )
+}
+
 export const fetchLiveStatus = () => getJSON('/live-status')
 export const fetchTuningCheck = () => getJSON('/tuning-check')
 export const fetchSystemInfo = () => getJSON('/system-info')
@@ -297,48 +422,6 @@ export function createThinkSplitter() {
   }
 }
 
-// Stream a chat turn from the backend /api/v1/chat proxy.
-// onReasoning(textChunk), onDelta(textChunk), onDone(donePayload), onError(err)
-export async function streamChat(
-  { messages, api = 'chat', maxTokens, temperature, thinking = true, runId },
-  { onReasoning, onDelta, onDone, onError, signal } = {},
-) {
-  const body = { messages, api, stream: true, thinking }
-  if (runId) body.run_id = runId
-  if (maxTokens != null) body.max_tokens = maxTokens
-  if (temperature != null) body.temperature = temperature
-
-  let res
-  try {
-    res = await fetch(`${BASE}/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-      body: JSON.stringify(body),
-      signal,
-    })
-  } catch (err) {
-    onError?.(err?.message || 'Request failed')
-    return
-  }
-
-  if (!res.ok || !res.body) {
-    onError?.(await readError(res, `HTTP ${res.status} on POST /chat`))
-    return
-  }
-
-  try {
-    await readSSE(res, (event, data) => {
-      if (event === 'reasoning') onReasoning?.(data.text || '')
-      else if (event === 'delta') onDelta?.(data.text || '')
-      else if (event === 'done') onDone?.(data)
-      else if (event === 'error')
-        onError?.(textOr('Stream error', data?.message))
-    })
-  } catch (err) {
-    if (err?.name !== 'AbortError') onError?.(err?.message || 'Stream interrupted')
-  }
-}
-
 // Stream an agentic turn from the backend /api/v1/agent/chat endpoint.
 //
 // Same wire vocabulary as streamChat, plus one extra event:
@@ -373,35 +456,12 @@ export async function streamAgentChat(
   if (maxTokens != null) body.max_tokens = maxTokens
   if (temperature != null) body.temperature = temperature
 
-  let res
-  try {
-    res = await fetch(`${BASE}/agent/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
-      body: JSON.stringify(body),
-      signal,
-    })
-  } catch (err) {
-    onError?.(err?.message || 'Request failed')
-    return
-  }
-
-  if (!res.ok || !res.body) {
-    onError?.(await readError(res, `HTTP ${res.status} on POST /agent/chat`))
-    return
-  }
-
-  try {
-    await readSSE(res, (event, data) => {
-      if (event === 'reasoning') onReasoning?.(data.text || '')
-      else if (event === 'delta') onDelta?.(data.text || '')
-      else if (event === 'tool') onTool?.(data)
-      else if (event === 'done') onDone?.(data)
-      else if (event === 'error') onError?.(textOr('Stream error', data?.message))
-    })
-  } catch (err) {
-    if (err?.name !== 'AbortError') onError?.(err?.message || 'Stream interrupted')
-  }
+  await streamChatWithRetry(
+    '/agent/chat',
+    body,
+    { onReasoning, onDelta, onTool, onDone, onError, onRetry },
+    { signal },
+  )
 }
 
 // ---------------------------------------------------------------------------

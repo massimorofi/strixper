@@ -282,6 +282,9 @@ Copy `backend/.env.example` to `backend/.env` and adjust:
 | --- | --- | --- |
 | `HALOGEN_HOST` | `http://127.0.0.1:8731` | Halogen server base address |
 | `POLL_INTERVAL_SECONDS` | `5` | Background poll cadence |
+| `CHAT_RETRY_ATTEMPTS` | `6` | Total chat attempts (first try + 5 retries) before a network failure is reported |
+| `CHAT_RETRY_PAUSE_SECONDS` | `10` | Seconds to wait between chat retry attempts |
+| `CHAT_RETRY_TIMEOUT_SECONDS` | `0` | Optional cap on one chat attempt in seconds (`0` = disabled, HTTP client timeout applies) |
 | `BIND_HOST` | `0.0.0.0` | Backend bind host |
 | `BIND_PORT` | `8000` | Backend bind port |
 | `AGENT_MAX_TURNS` | `150` | Max agent turns before the run is stopped |
