@@ -1,0 +1,467 @@
+[
+  {
+    "id": "10082f82ee6a",
+    "name": "Halogen-Qwen3.8-flash-next",
+    "docker_command": "docker run --rm -it --name ai-toolbox-cockpit-halogen-server-334446c6 \\\n  --pull=always \\\n  --device /dev/kfd \\\n  --device /dev/dri \\\n  --group-add video \\\n  --group-add $(getent group render | cut -d: -f3) \\\n  --security-opt seccomp=unconfined \\\n  --ipc=host \\\n  --ulimit memlock=-1:-1 \\\n  -p {bind}:{port}:{port} \\\n  --security-opt no-new-privileges \\\n  -v {models}/qwen38-flash-next-w4b.hgn:/models/qwen38-flash-next-w4b.hgn:ro \\\n  -v {models}/qwen38-flash-next-w4b.overlay-speed.hgn:/models/qwen38-flash-next-w4b.overlay-speed.hgn:ro \\\n  -v {models}/tokenizer/chat_template.jinja:/models/tokenizer/chat_template.jinja:ro \\\n  -v {models}/tokenizer/generation_config.json:/models/tokenizer/generation_config.json:ro \\\n  -v {models}/tokenizer/merges.txt:/models/tokenizer/merges.txt:ro \\\n  -v {models}/tokenizer/tokenizer.json:/models/tokenizer/tokenizer.json:ro \\\n  -v {models}/tokenizer/tokenizer_config.json:/models/tokenizer/tokenizer_config.json:ro \\\n  -v {models}/tokenizer/vocab.json:/models/tokenizer/vocab.json:ro \\\n  -v {models}/qwen38-flash-next-vision.hgn:/models/qwen38-flash-next-vision.hgn:ro \\\n  -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-w4b.hgn \\\n  -e HALOGEN_CK_OVERLAY=/models/qwen38-flash-next-w4b.overlay-speed.hgn \\\n  -e HALOGEN_TOKENIZER=/models/tokenizer \\\n  -e HALOGEN_API_PORT={port} \\\n  -e HALOGEN_CTX={ctx} \\\n  -e HALOGEN_KV_POOL_POSITIONS={kv_pool_positions} \\\n  -e HALOGEN_KV_SLOTS={kv_slots} \\\n  -e HALOGEN_PROMPT_CACHE={prompt_cache} \\\n  -e HALOGEN_VISION_TOWER=/models/qwen38-flash-next-vision.hgn \\\n  {image}",
+    "description": "Run Strix Halo Halogen LLM Inference engine",
+    "parameters": [
+      {
+        "name": "models",
+        "label": "Models directory",
+        "value": "/run/media/briggen/DEV/.aitoolbox/models"
+      },
+      {
+        "name": "port",
+        "label": "API port",
+        "value": "8731"
+      },
+      {
+        "name": "ctx",
+        "label": "Context length",
+        "value": "262144"
+      },
+      {
+        "name": "kv_pool_positions",
+        "label": "KV pool positions",
+        "value": "524288"
+      },
+      {
+        "name": "kv_slots",
+        "label": "KV slots",
+        "value": "4"
+      },
+      {
+        "name": "prompt_cache",
+        "label": "Prompt cache",
+        "value": "2"
+      },
+      {
+        "name": "image",
+        "label": "Docker image",
+        "value": "ghcr.io/peonist-ai/halogen-flash-server:latest"
+      },
+      {
+        "name": "bind",
+        "label": "Expose on address",
+        "value": "0.0.0.0"
+      }
+    ],
+    "created_at": "2026-10-09T19:11:44Z",
+    "updated_at": "2026-10-09T22:06:27Z"
+  },
+  {
+    "id": "e3be318f0a51",
+    "name": "GUFO-Qwen3.8-27B-UD-Q4_K_XL",
+    "docker_command": "docker run --rm -it --name gufo-cockpit-server-5f134390 \\\n  --device /dev/dri \\\n  --device /dev/kfd \\\n  --group-add video \\\n  --group-add render \\\n  --security-opt seccomp=unconfined \\\n  --ipc=host \\\n  -p {bind}:{port}:{port} \\\n  -v {models}/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf:/models/target/Qwen3.8-27B-UD-Q4_K_XL.gguf:ro \\\n  -v {models}/Qwen3.8-27B-DFlash2-GGUF:/models/speculation:ro \\\n  {image} gufo serve \\\n  --host 0.0.0.0 \\\n  --port {port} \\\n  --sessions {sessions} \\\n  llm \\\n  --model /models/target/Qwen3.8-27B-UD-Q4_K_XL.gguf \\\n  --context {ctx} \\\n  --max-tokens {max_tokens} \\\n  --served-model-name {served_model_name} \\\n  --think {think} \\\n  --reasoning-effort {reasoning_effort} \\\n  --max-pending-per-client {max_pending_per_client} \\\n  --speculative dflash2 \\\n  --dflash-model /models/speculation/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \\\n  --draft-tokens {draft_tokens}",
+    "description": "Run GUFO LLM server (llama.cpp-style GGUF serving) on Strix Halo",
+    "parameters": [
+      {
+        "name": "models",
+        "label": "Models directory",
+        "value": "/home/briggen/Dev/.aitoolbox/models"
+      },
+      {
+        "name": "port",
+        "label": "API port",
+        "value": "18080"
+      },
+      {
+        "name": "ctx",
+        "label": "Context length",
+        "value": "262144"
+      },
+      {
+        "name": "max_tokens",
+        "label": "Max tokens",
+        "value": "32768"
+      },
+      {
+        "name": "served_model_name",
+        "label": "Served model name",
+        "value": "Qwen3.8-27B-UD-Q4_K_XL"
+      },
+      {
+        "name": "sessions",
+        "label": "Sessions",
+        "value": "1"
+      },
+      {
+        "name": "think",
+        "label": "Thinking",
+        "value": "on"
+      },
+      {
+        "name": "reasoning_effort",
+        "label": "Reasoning effort",
+        "value": "high"
+      },
+      {
+        "name": "max_pending_per_client",
+        "label": "Max pending per client",
+        "value": "4"
+      },
+      {
+        "name": "draft_tokens",
+        "label": "Draft tokens",
+        "value": "7"
+      },
+      {
+        "name": "image",
+        "label": "Docker image",
+        "value": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-gufo"
+      },
+      {
+        "name": "bind",
+        "label": "Expose on address",
+        "value": "0.0.0.0"
+      }
+    ],
+    "created_at": "2026-10-09T20:36:18Z",
+    "updated_at": "2026-10-09T22:07:38Z"
+  },
+  {
+    "id": "8592d1934a21",
+    "name": "ROCM10Llama-Gemma426B-A4B",
+    "docker_command": "docker run --rm -it --name {container_name} \\\n  --device /dev/dri \\\n  --device /dev/kfd \\\n  --group-add video \\\n  --group-add render \\\n  --security-opt seccomp=unconfined \\\n  -e XDG_CACHE_HOME=/tmp \\\n  -v {models}:/models:ro \\\n  -p {bind}:{port}:{port} \\\n  {image} llama-server \\\n  -m /models/{model_file} \\\n  -c {ctx} \\\n  -ngl {ngl} \\\n  --host {host} \\\n  --port {port} \\\n  --load-mode {load_mode} \\\n  -fa {fa} \\\n  --cache-type-k {cache_type_k} \\\n  --cache-type-v {cache_type_v} \\\n  {jinja} \\\n  --temp {temp} \\\n  --top-p {top_p} \\\n  --top-k {top_k} \\\n  --metrics",
+    "description": "Run ROCM 10 Llama.cpp server with Gemma 4 26B-A4B on Strix Halo",
+    "parameters": [
+      {
+        "name": "models",
+        "label": "Models directory",
+        "value": "/home/briggen/Dev/.aitoolbox/models"
+      },
+      {
+        "name": "port",
+        "label": "API port",
+        "value": "8080"
+      },
+      {
+        "name": "bind",
+        "label": "Expose on address",
+        "value": "127.0.0.1"
+      },
+      {
+        "name": "model_file",
+        "label": "Model file (relative to models dir)",
+        "value": "gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-UD-Q8_K_XL.gguf"
+      },
+      {
+        "name": "ctx",
+        "label": "Context length",
+        "value": "126976"
+      },
+      {
+        "name": "ngl",
+        "label": "GPU layers to offload",
+        "value": "999"
+      },
+      {
+        "name": "host",
+        "label": "Server host",
+        "value": "0.0.0.0"
+      },
+      {
+        "name": "load_mode",
+        "label": "Load mode",
+        "value": "none"
+      },
+      {
+        "name": "fa",
+        "label": "Flash attention",
+        "value": "1"
+      },
+      {
+        "name": "cache_type_k",
+        "label": "Cache type K",
+        "value": "q8_0"
+      },
+      {
+        "name": "cache_type_v",
+        "label": "Cache type V",
+        "value": "q8_0"
+      },
+      {
+        "name": "jinja",
+        "label": "Use Jinja chat template",
+        "value": "--jinja"
+      },
+      {
+        "name": "temp",
+        "label": "Temperature",
+        "value": "1.0"
+      },
+      {
+        "name": "top_p",
+        "label": "Top-p",
+        "value": "0.95"
+      },
+      {
+        "name": "top_k",
+        "label": "Top-k",
+        "value": "64"
+      },
+      {
+        "name": "image",
+        "label": "Docker image",
+        "value": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0"
+      },
+      {
+        "name": "container_name",
+        "label": "Container name",
+        "value": "llama-cockpit-server-gemma4-26b"
+      }
+    ],
+    "created_at": "2026-10-10T16:50:07Z",
+    "updated_at": "2026-10-10T17:04:50Z"
+  },
+  {
+    "id": "2cb92515e4f6",
+    "name": "ROCM10-Qwen3.6-35B-A3B-Q4KM",
+    "docker_command": "docker run --rm -it --name {container_name} \\\n  --device /dev/dri \\\n  --device /dev/kfd \\\n  --group-add video \\\n  --group-add render \\\n  --security-opt seccomp=unconfined \\\n  -e XDG_CACHE_HOME=/tmp \\\n  -v {models}:/models:ro \\\n  -p {bind}:{port}:{port} \\\n  {image} llama-server \\\n  -m /models/{model_file} \\\n  -c {ctx} \\\n  -ngl {ngl} \\\n  --host {host} \\\n  --port {port} \\\n  --load-mode {load_mode} \\\n  -fa {fa} \\\n  --cache-type-k {cache_type_k} \\\n  --cache-type-v {cache_type_v} \\\n  {jinja} \\\n  --temp {temp} \\\n  --top-p {top_p} \\\n  --top-k {top_k} \\\n  --min-p {min_p} \\\n  --presence-penalty {presence_penalty} \\\n  --repeat-penalty {repeat_penalty} \\\n  --metrics",
+    "description": "Run ROCm 10 Llama.cpp server with Qwen3.6-35B-A3B UD Q4_K_M on Strix Halo",
+    "parameters": [
+      {
+        "name": "models",
+        "label": "Models directory",
+        "value": "/home/briggen/Dev/.aitoolbox/models"
+      },
+      {
+        "name": "port",
+        "label": "API port",
+        "value": "8080"
+      },
+      {
+        "name": "bind",
+        "label": "Expose on address",
+        "value": "127.0.0.1"
+      },
+      {
+        "name": "model_file",
+        "label": "Model file (relative to models dir)",
+        "value": "Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
+      },
+      {
+        "name": "ctx",
+        "label": "Context length",
+        "value": "126976"
+      },
+      {
+        "name": "ngl",
+        "label": "GPU layers to offload",
+        "value": "999"
+      },
+      {
+        "name": "host",
+        "label": "Server host",
+        "value": "0.0.0.0"
+      },
+      {
+        "name": "load_mode",
+        "label": "Load mode",
+        "value": "none"
+      },
+      {
+        "name": "fa",
+        "label": "Flash attention",
+        "value": "1"
+      },
+      {
+        "name": "cache_type_k",
+        "label": "Cache type K",
+        "value": "q8_0"
+      },
+      {
+        "name": "cache_type_v",
+        "label": "Cache type V",
+        "value": "q8_0"
+      },
+      {
+        "name": "jinja",
+        "label": "Use Jinja chat template",
+        "value": "--jinja"
+      },
+      {
+        "name": "temp",
+        "label": "Temperature",
+        "value": "1.0"
+      },
+      {
+        "name": "top_p",
+        "label": "Top-p",
+        "value": "0.95"
+      },
+      {
+        "name": "top_k",
+        "label": "Top-k",
+        "value": "20"
+      },
+      {
+        "name": "min_p",
+        "label": "Min-p",
+        "value": "0.0"
+      },
+      {
+        "name": "presence_penalty",
+        "label": "Presence penalty",
+        "value": "1.5"
+      },
+      {
+        "name": "repeat_penalty",
+        "label": "Repeat penalty",
+        "value": "1.0"
+      },
+      {
+        "name": "image",
+        "label": "Docker image",
+        "value": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0"
+      },
+      {
+        "name": "container_name",
+        "label": "Container name",
+        "value": "llama-cockpit-server-qwen36-35b"
+      }
+    ],
+    "created_at": "2026-10-11T15:17:35Z",
+    "updated_at": "2026-10-11T16:11:20Z"
+  },
+  {
+    "id": "a7f3c91d2e8b",
+    "name": "ROCM10-B-Qwen3-30B-A3B-Instruct-Q4KM",
+    "docker_command": "docker run --rm -it --name {container_name} \\\n  --device /dev/dri \\\n  --device /dev/kfd \\\n  --group-add video \\\n  --group-add render \\\n  --security-opt seccomp=unconfined \\\n  -e XDG_CACHE_HOME=/tmp \\\n  -v {models}:/models:ro \\\n  -p {bind}:{port}:{port} \\\n  {image} llama-server \\\n  -m /models/{model_file} \\\n  -c {ctx} \\\n  -ngl {ngl} \\\n  --host {host} \\\n  --port {port} \\\n  -fa {fa} \\\n  --cache-type-k {cache_type_k} \\\n  --cache-type-v {cache_type_v} \\\n  {jinja} \\\n --metrics",
+    "description": "Run ROCm 10 Llama.cpp server with Qwen3-30B-A3B-Instruct Q4_K_M on Strix Halo",
+    "parameters": [
+      {
+        "name": "models",
+        "label": "Models directory",
+        "value": "/home/briggen/Dev/.aitoolbox/models"
+      },
+      {
+        "name": "port",
+        "label": "API port",
+        "value": "8085"
+      },
+      {
+        "name": "bind",
+        "label": "Expose on address",
+        "value": "127.0.0.1"
+      },
+      {
+        "name": "model_file",
+        "label": "Model file (relative to models dir)",
+        "value": "Qwen3-30B-A3B-Instruct-2507-GGUF/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"
+      },
+      {
+        "name": "ctx",
+        "label": "Context length",
+        "value": "126976"
+      },
+      {
+        "name": "ngl",
+        "label": "GPU layers to offload",
+        "value": "999"
+      },
+      {
+        "name": "host",
+        "label": "Server host",
+        "value": "0.0.0.0"
+      },
+      {
+        "name": "fa",
+        "label": "Flash attention",
+        "value": "1"
+      },
+      {
+        "name": "cache_type_k",
+        "label": "Cache type K",
+        "value": "q8_0"
+      },
+      {
+        "name": "cache_type_v",
+        "label": "Cache type V",
+        "value": "q8_0"
+      },
+      {
+        "name": "jinja",
+        "label": "Use Jinja chat template",
+        "value": "--jinja"
+      },
+      {
+        "name": "image",
+        "label": "Docker image",
+        "value": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-rocmfpx"
+      },
+      {
+        "name": "container_name",
+        "label": "Container name",
+        "value": "ROCM10-qwen3-30b"
+      }
+    ],
+    "created_at": "2026-10-11T20:18:58Z",
+    "updated_at": "2026-10-11T20:18:58Z"
+  },
+  {
+    "id": "0b854a5208ae",
+    "name": "Halogen-Qwen3.8-flash-next-NPU-Prefill",
+    "docker_command": "docker run --rm -it --name {container_name} \\\n  --pull=always \\\n  --device /dev/kfd \\\n  --device /dev/dri \\\n  --device /dev/accel/accel0 \\\n  -v /sys:/host/sys \\\n  --group-add video \\\n  --group-add $(getent group render | cut -d: -f3) \\\n  --security-opt seccomp=unconfined \\\n  --ipc=host \\\n  --ulimit memlock=-1:-1 \\\n  -p {bind}:{port}:{port} \\\n  --security-opt no-new-privileges \\\n  -v {xrt_system_lib_dir}/libxrt_coreutil.so.2:/opt/xilinx/xrt/lib/libxrt_coreutil.so.2:ro \\\n  -v {xrt_system_lib_dir}/libxrt_core.so.2:/opt/xilinx/xrt/lib/libxrt_core.so.2:ro \\\n  -v {xrt_system_lib_dir}/libxrt_driver_xdna.so.2:/opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2:ro \\\n  -v {xrt_system_lib_dir}/libxrt_coreutil.so.2:/opt/xilinx/lib/x86_64-linux-gnu/libxrt_coreutil.so.2:ro \\\n  -v {xrt_system_lib_dir}/libxrt_core.so.2:/opt/xilinx/lib/x86_64-linux-gnu/libxrt_core.so.2:ro \\\n  -v {xrt_system_lib_dir}/libxrt_driver_xdna.so.2:/opt/xilinx/lib/x86_64-linux-gnu/libxrt_driver_xdna.so.2:ro \\\n  -v {xrt_system_lib_dir}/libxrt_coreutil.so.2:/usr/lib/x86_64-linux-gnu/libxrt_coreutil.so.2:ro \\\n  -v {xrt_system_lib_dir}/libxrt_core.so.2:/usr/lib/x86_64-linux-gnu/libxrt_core.so.2:ro \\\n  -v {xrt_system_lib_dir}/libxrt_driver_xdna.so.2:/usr/lib/x86_64-linux-gnu/libxrt_driver_xdna.so.2:ro \\\n  -v {models}/qwen38-flash-next-w4b.hgn:/models/qwen38-flash-next-w4b.hgn:ro \\\n  -v {models}/qwen38-flash-next-w4b.overlay-speed.hgn:/models/qwen38-flash-next-w4b.overlay-speed.hgn:ro \\\n  -v {models}/tokenizer/chat_template.jinja:/models/tokenizer/chat_template.jinja:ro \\\n  -v {models}/tokenizer/generation_config.json:/models/tokenizer/generation_config.json:ro \\\n  -v {models}/tokenizer/merges.txt:/models/tokenizer/merges.txt:ro \\\n  -v {models}/tokenizer/tokenizer.json:/models/tokenizer/tokenizer.json:ro \\\n  -v {models}/tokenizer/tokenizer_config.json:/models/tokenizer/tokenizer_config.json:ro \\\n  -v {models}/tokenizer/vocab.json:/models/tokenizer/vocab.json:ro \\\n  -v {models}/qwen38-flash-next-vision.hgn:/models/qwen38-flash-next-vision.hgn:ro \\\n  -v {models}/npu:/models/npu \\\n  -v {npu_model_dir}:/models/npu/wemm-embedding-4b:ro \\\n  -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-w4b.hgn \\\n  -e HALOGEN_CK_OVERLAY=/models/qwen38-flash-next-w4b.overlay-speed.hgn \\\n  -e HALOGEN_TOKENIZER=/models/tokenizer \\\n  -e HALOGEN_API_PORT={port} \\\n  -e HALOGEN_CTX={ctx} \\\n  -e HALOGEN_KV_POOL_POSITIONS={kv_pool_positions} \\\n  -e HALOGEN_KV_SLOTS={kv_slots} \\\n  -e HALOGEN_PROMPT_CACHE={prompt_cache} \\\n  -e HALOGEN_VISION_TOWER=/models/qwen38-flash-next-vision.hgn \\\n  -e HALOGEN_NPU_MODELS=wemm-embedding-4b \\\n  {image}",
+    "description": "Halogen flash server with the image-pinned WeMM-Embedding-4B model on the XDNA 2 NPU. The model is mounted read-only at /models/npu/wemm-embedding-4b and selected by its registered model ID. Host XRT/XDNA libraries are mounted at the container XRT, Xilinx fallback, and system library paths. Host /sys lets Halogen hold the GPU fabric clock; the writable /models/npu cache contains the pinned decider-4b device files.",
+    "parameters": [
+      {
+        "name": "models",
+        "label": "Models directory",
+        "value": "/run/media/briggen/DEV/.aitoolbox/models"
+      },
+      {
+        "name": "npu_model_dir",
+        "label": "NPU embedding model directory (host)",
+        "value": "/run/media/briggen/DEV/.aitoolbox/models/wemm-embedding-4b"
+      },
+      {
+        "name": "xrt_system_lib_dir",
+        "label": "Host XRT system library directory",
+        "value": "/usr/lib/x86_64-linux-gnu"
+      },
+      {
+        "name": "port",
+        "label": "API port",
+        "value": "8731"
+      },
+      {
+        "name": "ctx",
+        "label": "Context length",
+        "value": "262144"
+      },
+      {
+        "name": "kv_pool_positions",
+        "label": "KV pool positions",
+        "value": "524288"
+      },
+      {
+        "name": "kv_slots",
+        "label": "KV slots",
+        "value": "4"
+      },
+      {
+        "name": "prompt_cache",
+        "label": "Prompt cache",
+        "value": "2"
+      },
+      {
+        "name": "container_name",
+        "label": "Container name",
+        "value": "halogen-npu-prefill-server-9f21c4da"
+      },
+      {
+        "name": "bind",
+        "label": "Expose on address",
+        "value": "0.0.0.0"
+      },
+      {
+        "name": "image",
+        "label": "Docker image",
+        "value": "ghcr.io/peonist-ai/halogen-flash-server:latest"
+      }
+    ],
+    "created_at": "2026-10-22T18:10:54Z",
+    "updated_at": "2026-10-22T19:19:00Z"
+  }
+]

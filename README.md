@@ -6,13 +6,16 @@ host and hardware telemetry on an **AMD Strix Halo** (Ryzen AI Max+ 395 / Radeon
 8060S) machine, with an on-demand fine-tuning compliance audit and a built-in
 streaming **AI chat**.
 
-Built from `strixper_specs.md`, using `Halogen_REST_API.md` for the Halogen
-endpoint contracts and `strix_halo_finetuning.md` for the tuning recommendations.
+Built from [doc/strixper_specs.md](doc/strixper_specs.md), using
+[doc/Halogen_REST_API.md](doc/Halogen_REST_API.md) for the Halogen endpoint
+contracts and [doc/strix_halo_finetuning.md](doc/strix_halo_finetuning.md)
+for the tuning recommendations.
 
 ## Table of Contents
 
 - [Quick Start](#quick-start)
 - [Prerequisites](#prerequisites)
+- [Model downloads](#model-downloads)
 - [What it does](#what-it-does)
 - [Architecture](#architecture)
 - [Local Development and Run Modes](#local-development-and-run-modes)
@@ -112,10 +115,118 @@ but the dashboard reads cached-token counts from `halogen:prompt_tokens_cached_t
 On GUFO that field therefore shows as unavailable even though the number exists.
 
 Configure a runnable engine in the **LLM-Runner** tab. See
-[strixper_prerequisites.md](./strixper_prerequisites.md) for the host, kernel,
+[doc/strixper_prerequisites.md](doc/strixper_prerequisites.md) for the host, kernel,
 firmware, GPU driver, and engine/model setup checklist.
 Runner commands must give each container a unique Docker `--name`; Strixper
 uses that name to adopt, monitor, and reliably stop each engine.
+
+## Model downloads
+
+Model weights ship with neither Strixper nor the engine images. You download
+them once into a host directory and mount that directory read-only into each
+engine container. The examples below use the directory the bundled
+configurations point at:
+
+```
+/run/media/briggen/DEV/.aitoolbox/models/
+```
+
+Any other location works — it is the `models` parameter of each LLM-Runner
+configuration, so change that one value rather than editing the commands.
+
+### One-time: the Hugging Face CLI
+
+Downloads use the `hf` command from `huggingface_hub`:
+
+```bash
+pip install -U huggingface_hub
+hf auth login    # optional; unauthenticated pulls are rate-limited
+```
+
+`export HF_TOKEN=hf_...` works in place of `hf auth login` if you prefer to
+supply the token yourself.
+
+### Main model — Halogen Qwen3.8 Flash Next
+
+The `peonist-ai/halogen-qwen3.8-flash-next` repository holds 307 GB of
+checkpoints, most of which one deployment never touches. Download only the
+files the Halogen configuration actually mounts — 9 files, **127.5 GB**:
+
+```bash
+hf download peonist-ai/halogen-qwen3.8-flash-next \
+  --local-dir /run/media/briggen/DEV/.aitoolbox/models \
+  --include "qwen38-flash-next-w4b.hgn" \
+  --include "qwen38-flash-next-w4b.overlay-speed.hgn" \
+  --include "qwen38-flash-next-vision.hgn" \
+  --include "tokenizer/*"
+```
+
+| File | Purpose |
+|---|---|
+| `qwen38-flash-next-w4b.hgn` | Main checkpoint (`HALOGEN_CHECKPOINT`) |
+| `qwen38-flash-next-w4b.overlay-speed.hgn` | Speed overlay (`HALOGEN_CK_OVERLAY`) |
+| `qwen38-flash-next-vision.hgn` | Vision tower (`HALOGEN_VISION_TOWER`) |
+| `tokenizer/*` | Chat template, vocab, merges, generation config |
+
+Dropping `--include` mirrors the whole repository (17 files, 307 GB), which
+also brings the `ht43`, `v2`, `mtp`, `ngram` and plain `overlay`
+checkpoints that no bundled configuration uses.
+
+### NPU model — WeMM Embedding 4B
+
+The NPU-prefill configuration registers a compiled embedding artifact on
+the XDNA 2 NPU through `HALOGEN_NPU_MODELS`. That artifact lives in its
+own repository, `peonist-ai/halogen-npu-wemm-embedding-4b` (12 files,
+**6.1 GB**), and must go into its own subdirectory:
+
+```bash
+hf download peonist-ai/halogen-npu-wemm-embedding-4b \
+  --local-dir /run/media/briggen/DEV/.aitoolbox/models/wemm-embedding-4b
+```
+
+The runner mounts that directory read-only at
+`/models/npu/wemm-embedding-4b` and selects it using the registered model ID
+`wemm-embedding-4b` in `HALOGEN_NPU_MODELS`.
+
+| File | Purpose |
+|---|---|
+| `wemm-embedding-4b.hnpw` | NPU weight package (5.7 GB) |
+| `vis/weights.hnpw` | Visual weight package (385 MB) |
+| `vis/u0.elf`, `vis/u1.elf` | XDNA firmware images |
+| `vis/devices.hnpm` | Device manifest |
+| `vis/consts.hnpb` | Compiled constants |
+| `vis/NOTICE.md` | Upstream licensing notice |
+
+The embedding model also uses the pinned `decider-4b` device program. Download
+its device files into the NPU cache directory; the runner mounts this directory
+at `/models/npu`:
+
+```bash
+docker run --rm \
+  -v /run/media/briggen/DEV/.aitoolbox/models/npu:/models/npu \
+  --entrypoint hf ghcr.io/peonist-ai/halogen-flash-server:latest \
+  download peonist-ai/halogen-npu-decider-4b \
+  --revision 01f1d8e14b6a565eb485bca102a1a2f6cc8b5381 \
+  --include 'devices/*' \
+  --local-dir /models/npu/decider-4b
+```
+
+The runner also mounts the host XRT/XDNA libraries and `/sys`. Halogen uses
+`/sys` to hold the GPU fabric clock at its top speed while the GPU and NPU
+work together, then returns it to the driver when the container stops. Do not
+set `HALOGEN_NPU_WITH_GPU=1`; that bypasses the safeguard.
+
+### Check it
+
+```bash
+ls -lh /run/media/briggen/DEV/.aitoolbox/models/
+ls -lh /run/media/briggen/DEV/.aitoolbox/models/wemm-embedding-4b/
+ls -lh /run/media/briggen/DEV/.aitoolbox/models/npu/decider-4b/devices/
+```
+
+The plain `Halogen-Qwen3.8-flash-next` configuration runs the main model
+alone. `Halogen-Qwen3.8-flash-next-NPU-Prefill` requires both NPU artifact
+downloads and answers `/v1/embeddings` from the NPU.
 
 ## What it does
 
@@ -156,6 +267,12 @@ uses that name to adopt, monitor, and reliably stop each engine.
   same box into a tool-using assistant: it can inspect live metrics, run the
   tuning audit, and (only if you explicitly allow it) start and stop engines.
   See [Agentic AI Chat](#agentic-ai-chat).
+- **File & Image Attachments** — attach images or documents to any chat
+  message, in both Plain and Agent mode. Uploads are stored server-side in
+  the workspace (type-checked by magic bytes, size- and pixel-limited),
+  images reach the model as native vision content, and other files are
+  inlined into the prompt as text. A workspace file tree lets you browse,
+  preview, download, and bulk-delete everything you or the agent put there.
 - **In-context Help** — every chart and every top KPI card has an **info button**
   (ⓘ, top-right corner) that opens a detailed explanation of the measures shown
   there.
@@ -293,6 +410,28 @@ Copy `backend/.env.example` to `backend/.env` and adjust:
 | `AGENT_INSTRUCTIONS` | built-in | Optional override of the agent system prompt |
 | `AGENT_WORKSPACE` | `backend/agent_workspace` | Where the full-access tier writes files |
 | `AGENT_TLS_VERIFY` | `1` | TLS verification for `fetch_url` / `search_web` |
+| `DEFAULT_MODEL` | `halogen-qwen3.8-flash-next` | Model id assumed before any engine reports one |
+| `STRIXPER_WORKSPACE` | = `AGENT_WORKSPACE` | Root for user uploads and the workspace browser |
+| `STRIXPER_DATA_DIR` | `backend/data` | Where the runtime JSON stores live |
+| `SKILLS_DIR` | `<repo>/skills` | Where drop-in skill folders are discovered |
+| `MCP_ADMIN_TOKEN` | unset | Bearer token required for MCP management (disabled without it) |
+| `MCP_CALL_TIMEOUT_SECONDS` | `30` | Timeout for MCP tool calls |
+| `MCP_SERVERS_DIR` | `<repo>/mcp-servers` | Install root for MCP server packages |
+| `MAX_IMAGE_SIZE_MB` | `10` | Largest accepted image upload |
+| `MAX_FILE_SIZE_MB` | `50` | Largest accepted file upload |
+| `MAX_IMAGES_PER_MESSAGE` | `5` | Images allowed per chat message |
+| `IMAGE_MAX_PIXELS` | `3686400` | Pixel budget enforced at upload time |
+| `IMAGE_SIZE_MULTIPLE` | `32` | Image dimensions must be a multiple of this |
+| `WORKSPACE_TTL_DAYS` | `7` | Uploaded files older than this are removed at startup |
+| `ALLOWED_IMAGE_TYPES` | png, jpeg, webp, gif | Accepted image MIME types |
+| `ALLOWED_FILE_TYPES` | `*` | Accepted file types (`*` = any) |
+| `MAX_WORKSPACE_READ_BYTES` | `1000000` | Largest text returned by `workspace_read` |
+
+The [backend/.env.example](backend/.env.example) also documents the
+`RUNNER_*` engine-lifecycle knobs (`RUNNER_STOP_TIMEOUT`,
+`RUNNER_CONSOLE_BYTES`, `RUNNER_SUBSCRIBER_QUEUE`, `RUNNER_ADOPT_TAIL`,
+`RUNNER_RELEASE_WAIT`, `RUNNER_STOP_SETTLE`, `RUNNER_SSE_HEARTBEAT`,
+`RUNNER_RECONCILE`) and `ENGINE_TARGET_PATH`.
 
 The polling interval can also be changed at runtime from the dashboard's
 auto-refresh selector (synced to the backend via `POST /api/v1/config`).
@@ -355,10 +494,30 @@ ss -tlnp | grep LISTEN          # see what's already taken
 | `/api/v1/stats/reset` | POST | Reset session statistics to zero |
 | `/api/v1/count-tokens` | POST | Count the input tokens of a prompt (proxies Halogen) |
 | `/api/v1/chat` | POST | Streaming chat completion (4 API styles, SSE) |
+| `/api/v1/runner/configs` | GET / POST | List / create LLM-Runner configurations |
+| `/api/v1/runner/configs/{id}` | GET / PUT / DELETE | Read / update / remove one configuration |
+| `/api/v1/runner/preview` | POST | Render the docker command for a config without starting it |
+| `/api/v1/runner/configs/{id}/run` | POST | Start a run from a saved configuration |
+| `/api/v1/runner/active` | GET | The currently active run, if any |
+| `/api/v1/runner/runs` | GET | All tracked runs |
+| `/api/v1/runner/runs/{id}/live-status` | GET | Per-run live status snapshot |
+| `/api/v1/runner/runs/{id}/stream` | GET | Live console output stream (SSE) |
+| `/api/v1/runner/runs/{id}/stop` | POST | Stop one run |
+| `/api/v1/runner/stop-all` | POST | Stop every managed run |
 | `/api/v1/agent/skills` | GET | Rescan and list valid skill folders and manifest errors |
 | `/api/v1/agent/mcp-servers` | GET / POST | Protected MCP configuration/status (requires `X-MCP-Admin-Token`) |
 | `/api/v1/agent/mcp-servers/{id}` | PUT / DELETE | Protected MCP server update/removal |
 | `/api/v1/agent/mcp-servers/test` | POST | Protected temporary stdio connection test |
+| `/api/v1/files/upload` | POST | Multipart upload → stored file record |
+| `/api/v1/files` | GET | List indexed uploads |
+| `/api/v1/files/{id}` | GET / DELETE | Download / delete one stored file |
+| `/api/v1/files/{id}/preview` | GET | Open one stored file inline (images, text) |
+| `/api/v1/workspace/list` | GET | Browse the workspace tree |
+| `/api/v1/workspace/read` | GET | Read a workspace text file |
+| `/api/v1/workspace/preview` | GET | Inline preview of a workspace file |
+| `/api/v1/workspace/download` | GET | Download a workspace file |
+| `/api/v1/workspace` | DELETE | Delete one file or empty directory |
+| `/api/v1/workspace/delete` | POST | Bulk delete (recursive by default) |
 | `/api/v1/healthz` | GET | Backend liveness |
 
 Interactive API docs: `http://localhost:8000/docs`.
@@ -388,6 +547,11 @@ single JSON response instead.
 Assistant replies render as GitHub-flavoured Markdown, including tables and
 fenced code blocks. Use **Source** on a reply to switch between the rendered
 view and its original Markdown text.
+
+You can attach images and files to any message. Images are sent to the
+model as native image content — except in the Text Completions style,
+which has no content-part concept and cannot carry them. Other file types
+are inlined into the prompt as text.
 
 Your conversation is **not** cleared when you switch tabs — the chat stays
 mounted in the background, so you can check the metrics mid-chat and come back
@@ -443,8 +607,9 @@ by which tools are registered.
 
 ### Full access: research and execution
 
-Ticking **Full access** adds seven tools that go outside the machine's own
-telemetry — the agent can browse, search, run code, and write files:
+Ticking **Full access** adds eight tools that go outside the machine's own
+telemetry — the agent can browse, search, run code, write files, and
+delete them:
 
 | Tool | What it does |
 | --- | --- |
@@ -455,6 +620,7 @@ telemetry — the agent can browse, search, run code, and write files:
 | `write_file` | Writes or appends a file in the workspace |
 | `read_file` | Reads a file |
 | `list_directory` | Lists a directory |
+| `delete_path` | Deletes one file or one empty directory inside the workspace |
 
 This is what turns "I cannot browse that URL" into an actual research run: the
 model fetches a page, notices the RSS feed is short, writes a parser, runs it,
@@ -509,7 +675,9 @@ Request body:
 ```
 
 Set `"mode": "plain"` to have the same endpoint fall through to the normal
-one-shot chat handler.
+one-shot chat handler. Messages may carry an `attachments` array — images
+or files uploaded through `POST /api/v1/files/upload`; images reach the
+model as native vision content and other files are inlined as text.
 
 The SSE stream reuses the Plain-mode vocabulary and adds one event:
 
@@ -714,6 +882,7 @@ rebuild from scratch.
 | `-v strixper-data:/app/backend/data` | Persists your LLM-Runner configs and the remembered engine target across recreations |
 | `-v strixper-agent-ws:/app/backend/agent_workspace` | Persists files the agent creates when **Full access** is enabled |
 | `-v <repo>/skills:/app/skills:ro` | Makes drop-in skill folders available without rebuilding the image |
+| `-v <repo>:/workspace/strixper:ro` | Exposes the repo checkout to Tieline (`TIELINE_WORKSPACE`) |
 | `--device=/dev/kfd` and `--device=/dev/dri` | Give ROCm SMI access to the host GPU devices |
 | `--group-add ...` | Allow the container to access GPU devices using the host `video` and `render` group IDs |
 
@@ -835,14 +1004,24 @@ backend/
   app/
     main.py                 FastAPI app + lifespan + static serving
     config.py               env settings
-    routers/                live, tuning, config, tokens, chat, agent, runner
+    routers/                live, tuning, config, stats, tokens, chat, agent,
+                          runner, files
     services/
       halogen_client.py     async Halogen HTTP client + Prometheus parser
       system_monitor.py     sysfs/procfs telemetry
+      rocm_monitor.py       rocm-smi GPU telemetry
       tuning_checker.py     compliance audit + system info
       live_service.py       background poller + shared runtime state
-      agent_tools.py        tool functions exposed to the agent
+      agent_tools.py        read-only tool functions exposed to the agent
       agent_exec_tools.py   full-access tier: web, shell, python, file I/O
+      agent_recovery.py     tool-call repair and failed-run retry logic
+      chat_retry.py         network retry wrapper for chat requests
+      docker_control.py     docker CLI wrapper for engine lifecycle
+      run_registry.py       registry of live engine runs
+      runner_store.py       persisted Runner configurations
+      engine_target.py      remembered engine target
+      file_store.py         upload storage, indexing, path confinement
+      vision_helper.py      image sniffing and size parsing
       skill_loader.py       SKILL.md discovery and bounded resource loading
       mcp_manager.py        MCP config store + stdio process/session lifecycle
     tests/                  backend test suite
@@ -851,9 +1030,21 @@ frontend/
   src/
     App.jsx                 tabs, theme, polling, history buffer
     api.js                  fetch helpers + streamChat / streamAgentChat SSE clients
+    format.js               number/byte/time formatting helpers
+    params.js               client-side mirror of the run-config parameter
+                          renderer (validation + preview)
+    theme.js                chart color tokens (light/dark)
     components/             TopBar, StatTile, Meter, StatusBadge, LiveTab,
-                            TuningTab, AIChatTab, AgentExtensions, RunnerTab
-    charts/                 Throughput, KV pool, Queue, Memory charts
+                          TuningTab, StatsSummary, CacheStatsCard, TokenCounter,
+                          AIChatTab, FileUploadZone, MessageAttachments,
+                          WorkspaceFileTree, AgentExtensions, RunnerTab,
+                          ErrorBoundary
+    charts/                 Throughput, KV pool, Queue, Memory charts +
+                          ChartCard, ChartTooltip, InfoModal
+    hooks/useFileUpload.js  upload state machine
+    utils/                  fileUtils.js (upload rule mirror),
+                          highlight.js (workspace preview syntax highlighting)
+doc/                        specs, API contracts, tuning and prerequisites docs
 mcp-servers/                install root for MCP server packages
 skills/                     drop-in skill folders
 Dockerfile
