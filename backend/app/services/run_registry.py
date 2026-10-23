@@ -196,9 +196,15 @@ class ActiveRun:
     # True when this backend attached to a pre-existing container rather
     # than launching it.
     adopted: bool = False
+    # "docker" for a launched container, "external" for a monitor-only
+    # registration of an already-running server (no process, no pump).
+    kind: str = "docker"
     engine_url: Optional[str] = None
     model_name: Optional[str] = None
     engine_switch_error: str = ""
+    # Set when the reachability probe at start time failed. Advisory:
+    # the run still starts, the Live tab reports connectivity anyway.
+    engine_probe_error: str = ""
     console: ConsoleBuffer = field(default_factory=ConsoleBuffer)
 
     proc: Optional[asyncio.subprocess.Process] = None
@@ -225,7 +231,9 @@ class ActiveRun:
             "status": self.status,
             "exit_code": self.exit_code,
             "adopted": self.adopted,
+            "kind": self.kind,
             "engine_switch_error": self.engine_switch_error or None,
+            "engine_probe_error": self.engine_probe_error or None,
         }
 
     async def stop(self) -> str:
@@ -240,6 +248,15 @@ class ActiveRun:
         async with self.stop_lock:
             if self._halted:
                 return self._halt_method
+
+            # An external run has no process and no pump, so the EOF that
+            # normally ends a docker run will never arrive. Record the end
+            # directly here, or the run would stay "running" forever.
+            if self.kind == "external":
+                self._halted = True
+                self._halt_method = "external"
+                await _mark_exited(self)
+                return "external"
 
             method = "already_exited"
             if self.proc is not None and self.proc.returncode is None:
@@ -435,6 +452,43 @@ class RunRegistry:
             self._arm_pump(run)
             return run
 
+    async def start_external(
+        self,
+        config_id: str,
+        config_name: str,
+        base_url: str,
+    ) -> ActiveRun:
+        """Register an external engine run: no process, no container.
+
+        The engine lives outside this backend -- we only follow its HTTP
+        address. Nothing is launched and nothing is armed: the run stays
+        "running" until stopped explicitly. Idempotent per configuration:
+        following the same address twice is one run, not two.
+        """
+        async with self._lock:
+            existing = next(
+                (
+                    run
+                    for run in self.runs.values()
+                    if run.status == "running" and run.config_id == config_id
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing
+            run = ActiveRun(
+                run_id=uuid.uuid4().hex[:12],
+                config_id=config_id,
+                config_name=config_name,
+                container_name=None,
+                started_at=_utc_now(),
+                command="",
+                kind="external",
+                engine_url=base_url,
+            )
+            self.runs[run.run_id] = run
+            return run
+
     async def adopt(
         self,
         container_name: str,
@@ -552,6 +606,11 @@ class RunRegistry:
 
         adopted: list[ActiveRun] = []
         for cfg in configs or []:
+            # External configs have no container to discover: they are
+            # started explicitly as registrations. Skip them so a stale
+            # docker_command on an external config can never phantom-adopt.
+            if cfg.get("kind") == "external":
+                continue
             name = rendered_container_name(cfg)
             if not name or name not in running:
                 continue

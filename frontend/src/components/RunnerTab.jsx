@@ -40,7 +40,11 @@ const CONSOLE_MAX_CHARS = 500_000
 
 const EMPTY_FORM = {
   name: '',
+  // "docker" launches a container from a command template; "external"
+  // follows an already-running LLM server at base_url and launches nothing.
+  kind: 'docker',
   docker_command: '',
+  base_url: '',
   description: '',
   parameters: [],
 }
@@ -174,12 +178,19 @@ function ConfigForm({ initial, saving, error, onSubmit, onCancel }) {
   useEffect(() => {
     setForm(
       initial
-        ? { ...initial, parameters: normaliseRows(initial.parameters) }
+        ? {
+            ...EMPTY_FORM,
+            ...initial,
+            kind: initial.kind || 'docker',
+            base_url: initial.base_url || '',
+            parameters: normaliseRows(initial.parameters),
+          }
         : EMPTY_FORM,
     )
   }, [initial])
 
   const set = (key) => (e) => setForm((f) => ({ ...f, [key]: e.target.value }))
+  const isExternal = (form.kind || 'docker') === 'external'
 
   // Live feedback on how the command template and the parameter list line
   // up. The backend re-checks both on save; this just avoids the surprise.
@@ -204,7 +215,10 @@ function ConfigForm({ initial, saving, error, onSubmit, onCancel }) {
   }, [form.docker_command, form.parameters])
 
   const canSubmit =
-    form.name.trim() && form.docker_command.trim() && !saving && !rowErrors
+    form.name.trim() &&
+    (isExternal ? (form.base_url || '').trim() : form.docker_command.trim()) &&
+    !saving &&
+    (isExternal || !rowErrors)
 
   return (
     <div className="rounded-xl border border-[var(--border-hairline)] bg-[var(--surface-card)] p-4">
@@ -239,41 +253,90 @@ function ConfigForm({ initial, saving, error, onSubmit, onCancel }) {
           />
         </label>
 
-        <label className="block">
+        <div>
           <span className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--text-muted)]">
-            Docker command
+            Type
           </span>
-          <textarea
-            value={form.docker_command}
-            onChange={set('docker_command')}
-            rows={4}
-            spellCheck={false}
-            placeholder={
-              'docker run --rm -it -v {models}/weights.hgn:/models/w.hgn:ro -p 0.0.0.0:{port}:{port} my-llm-image'
-            }
-            className={`${monoCls} resize-y`}
-          />
-        </label>
-
-        <ParametersEditor
-          params={form.parameters || []}
-          onChange={(parameters) => setForm((f) => ({ ...f, parameters }))}
-        />
-
-        {missing.length > 0 && (
-          <div className="rounded-lg border border-[var(--status-warning)] px-3 py-1.5 text-xs text-[var(--status-warning)]">
-            Command uses {missing.map((n) => `{${n}}`).join(', ')} but no such
-            parameter is defined.
+          <div className="inline-flex rounded-lg border border-[var(--border-hairline)] p-0.5">
+            {[
+              ['docker', 'Docker container'],
+              ['external', 'External server'],
+            ].map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => setForm((f) => ({ ...f, kind: value }))}
+                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                  (form.kind || 'docker') === value
+                    ? 'bg-[var(--series-1)] text-white'
+                    : 'text-[var(--text-secondary)] hover:bg-[var(--surface-page)]'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
           </div>
-        )}
-        {unused.length > 0 && (
-          <div className="rounded-lg border border-[var(--border-hairline)] px-3 py-1.5 text-xs text-[var(--text-muted)]">
-            Not referenced by the command:{' '}
-            {unused.map((n) => `{${n}}`).join(', ')}
-          </div>
-        )}
+        </div>
 
-        <CommandPreview command={preview} />
+        {isExternal ? (
+          <label className="block">
+            <span className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--text-muted)]">
+              Engine URL
+            </span>
+            <input
+              type="text"
+              value={form.base_url || ''}
+              onChange={set('base_url')}
+              maxLength={300}
+              placeholder="http://192.168.1.50:8080"
+              spellCheck={false}
+              className={monoCls}
+            />
+            <p className="mt-1 text-[11px] text-[var(--text-muted)]">
+              Root address of the already-running LLM server, scheme and host
+              only — no <code className="font-mono">/v1</code> path. Nothing is
+              launched: the dashboard monitors this server and the chat uses it.
+            </p>
+          </label>
+        ) : (
+          <>
+            <label className="block">
+              <span className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--text-muted)]">
+                Docker command
+              </span>
+              <textarea
+                value={form.docker_command}
+                onChange={set('docker_command')}
+                rows={4}
+                spellCheck={false}
+                placeholder={
+                  'docker run --rm -it -v {models}/weights.hgn:/models/w.hgn:ro -p 0.0.0.0:{port}:{port} my-llm-image'
+                }
+                className={`${monoCls} resize-y`}
+              />
+            </label>
+
+            <ParametersEditor
+              params={form.parameters || []}
+              onChange={(parameters) => setForm((f) => ({ ...f, parameters }))}
+            />
+
+            {missing.length > 0 && (
+              <div className="rounded-lg border border-[var(--status-warning)] px-3 py-1.5 text-xs text-[var(--status-warning)]">
+                Command uses {missing.map((n) => `{${n}}`).join(', ')} but no
+                such parameter is defined.
+              </div>
+            )}
+            {unused.length > 0 && (
+              <div className="rounded-lg border border-[var(--border-hairline)] px-3 py-1.5 text-xs text-[var(--text-muted)]">
+                Not referenced by the command:{' '}
+                {unused.map((n) => `{${n}}`).join(', ')}
+              </div>
+            )}
+
+            <CommandPreview command={preview} />
+          </>
+        )}
 
         <label className="block">
           <span className="mb-1 block text-xs font-medium uppercase tracking-wide text-[var(--text-muted)]">
@@ -300,12 +363,22 @@ function ConfigForm({ initial, saving, error, onSubmit, onCancel }) {
             type="button"
             disabled={!canSubmit}
             onClick={() =>
-              onSubmit({
-                name: form.name,
-                docker_command: form.docker_command,
-                description: form.description,
-                parameters: form.parameters || [],
-              })
+              onSubmit(
+                isExternal
+                  ? {
+                      name: form.name,
+                      kind: 'external',
+                      base_url: form.base_url,
+                      description: form.description,
+                    }
+                  : {
+                      name: form.name,
+                      kind: 'docker',
+                      docker_command: form.docker_command,
+                      description: form.description,
+                      parameters: form.parameters || [],
+                    },
+              )
             }
             className="inline-flex items-center gap-1.5 rounded-md bg-[var(--series-1)] px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
           >
@@ -348,8 +421,9 @@ function ConfigList({
           No configurations yet.
         </p>
         <p className="max-w-xs text-xs text-[var(--text-muted)]">
-          Create a configuration with the docker command used to launch your LLM
-          inference container.
+          Create a Docker configuration with the command that launches your LLM
+          container, or an External configuration that connects to an
+          already-running LLM server.
         </p>
       </div>
     )
@@ -370,6 +444,11 @@ function ConfigList({
                   <span className="truncate text-sm font-semibold text-[var(--text-primary)]">
                     {c.name}
                   </span>
+                  {c.kind === 'external' && (
+                    <span className="inline-flex items-center rounded-full bg-[var(--surface-page)] px-2 py-0.5 text-[10px] font-medium text-[var(--text-secondary)]">
+                      External
+                    </span>
+                  )}
                   {isRunning && (
                     <span className="inline-flex items-center gap-1 rounded-full bg-[var(--status-good)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--status-good)]">
                       <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--status-good)]" />
@@ -382,12 +461,21 @@ function ConfigList({
                     {c.description}
                   </p>
                 )}
-                <p
-                  className="mt-1 truncate font-mono text-[11px] text-[var(--text-muted)]"
-                  title={c.docker_command}
-                >
-                  {c.docker_command}
-                </p>
+                {c.kind === 'external' ? (
+                  <p
+                    className="mt-1 truncate font-mono text-[11px] text-[var(--text-muted)]"
+                    title={c.base_url}
+                  >
+                    {c.base_url}
+                  </p>
+                ) : (
+                  <p
+                    className="mt-1 truncate font-mono text-[11px] text-[var(--text-muted)]"
+                    title={c.docker_command}
+                  >
+                    {c.docker_command}
+                  </p>
+                )}
                 {params.length > 0 && (
                   <div className="mt-1.5 flex flex-wrap gap-1">
                     {params.map((p) => (
@@ -487,7 +575,6 @@ export default function RunnerTab({ active = true, onEngineChange }) {
 
   const configs = data?.configs || []
   const runningRuns = runs.filter((run) => run.status === 'running')
-  const runningRunIds = runningRuns.map((run) => run.run_id).join(',')
   const selectedRun = runs.find((run) => run.run_id === selectedRunId) || runningRuns[0] || runs[0]
   const output = selectedRun ? outputs[selectedRun.run_id] || '' : ''
   const activeConfigIds = new Set(runningRuns.map((run) => run.config_id))
@@ -504,16 +591,25 @@ export default function RunnerTab({ active = true, onEngineChange }) {
   const handleSubmit = async (form) => {
     setSaving(true)
     setFormError(null)
-    const payload = {
-      name: form.name.trim(),
-      docker_command: form.docker_command.trim(),
-      description: (form.description || '').trim(),
-      parameters: (form.parameters || []).map((p) => ({
-        name: (p.name || '').trim(),
-        label: (p.label || '').trim(),
-        value: p.value ?? '',
-      })),
-    }
+    const isExternal = (form.kind || 'docker') === 'external'
+    const payload = isExternal
+      ? {
+          name: form.name.trim(),
+          kind: 'external',
+          base_url: (form.base_url || '').trim(),
+          description: (form.description || '').trim(),
+        }
+      : {
+          name: form.name.trim(),
+          kind: 'docker',
+          docker_command: form.docker_command.trim(),
+          description: (form.description || '').trim(),
+          parameters: (form.parameters || []).map((p) => ({
+            name: (p.name || '').trim(),
+            label: (p.label || '').trim(),
+            value: p.value ?? '',
+          })),
+        }
     try {
       if (formInitial?.id) {
         await updateRunnerConfig(formInitial.id, payload)
@@ -575,8 +671,12 @@ export default function RunnerTab({ active = true, onEngineChange }) {
   }
 
   // Keep an independent console stream for every running engine.
+  // External runs have no console (nothing is launched here), so they
+  // are left out and no stream is opened for them.
+  const streamRuns = runningRuns.filter((run) => run.kind !== 'external')
+  const streamRunIds = streamRuns.map((run) => run.run_id).join(',')
   useEffect(() => {
-    const controllers = runningRuns.map((run) => {
+    const controllers = streamRuns.map((run) => {
       const controller = new AbortController()
       openRunnerStream(run.run_id, {
         signal: controller.signal,
@@ -593,7 +693,7 @@ export default function RunnerTab({ active = true, onEngineChange }) {
       return controller
     })
     return () => controllers.forEach((controller) => controller.abort())
-  }, [runningRunIds, refreshRunState])
+  }, [streamRunIds, refreshRunState])
 
   // Flush buffered console output on a fixed beat rather than per chunk.
   useEffect(() => {
@@ -712,18 +812,28 @@ export default function RunnerTab({ active = true, onEngineChange }) {
                   }`}
                 >
                   <Loader2 size={12} className="animate-spin" />
-                  {stopping ? 'Stopping container…' : 'Running'}
+                  {stopping
+                    ? selectedRun.kind === 'external'
+                      ? 'Stopping…'
+                      : 'Stopping container…'
+                    : 'Running'}
                 </span>
               ) : selectedRun?.status === 'exited' ? (
-                <span
-                  className={`text-xs font-medium ${
-                    selectedRun.exit_code === 0
-                      ? 'text-[var(--status-good)]'
-                      : 'text-[var(--status-critical)]'
-                  }`}
-                >
-                  Exited ({selectedRun.exit_code})
-                </span>
+                selectedRun.kind === 'external' ? (
+                  <span className="text-xs font-medium text-[var(--text-muted)]">
+                    Stopped
+                  </span>
+                ) : (
+                  <span
+                    className={`text-xs font-medium ${
+                      selectedRun.exit_code === 0
+                        ? 'text-[var(--status-good)]'
+                        : 'text-[var(--status-critical)]'
+                    }`}
+                  >
+                    Exited ({selectedRun.exit_code})
+                  </span>
+                )
               ) : (
                 <span className="text-xs text-[var(--text-muted)]">Idle</span>
               )}
@@ -757,7 +867,17 @@ export default function RunnerTab({ active = true, onEngineChange }) {
                 {runErrors[selectedRun?.run_id] || runErrors.start}
               </div>
             )}
-            {output ? (
+            {selectedRun?.engine_probe_error && (
+              <div className="mb-2 rounded-lg border border-[var(--status-warning)] px-3 py-1.5 text-xs text-[var(--status-warning)]">
+                {selectedRun.engine_probe_error}
+              </div>
+            )}
+            {selectedRun?.kind === 'external' ? (
+              <p className="text-xs text-[var(--text-muted)]">
+                External engine — no console output. Live metrics are in the
+                Live tab, and the AI Chat talks to this server directly.
+              </p>
+            ) : output ? (
               <pre className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-[var(--text-secondary)]">
                 {output}
                 {selectedRun?.status === 'running' && <span className="animate-pulse">▍</span>}

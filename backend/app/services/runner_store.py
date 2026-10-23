@@ -1,14 +1,23 @@
 """Local JSON store for LLM run configurations (LLM-Runner tab).
 
-Each configuration captures the docker command used to launch a containerized
-LLM inference server, together with a human-friendly name and description. The
-command is a *template*: its variable parts are written as ``{parameter_name}``
-and the matching values live in the configuration's ``parameters`` list (see
-services/params.py). The store validates the two against each other on every
-write, so a saved configuration always renders into a complete command.
-Configurations are persisted to a JSON file on disk so they survive backend
-restarts. All mutations go through an asyncio lock and are written atomically
-(temp file + os.replace) so a crash mid-write cannot corrupt the store.
+Configurations come in two kinds:
+
+* ``docker`` (the default) captures the docker command used to launch a
+  containerized LLM inference server. The command is a *template*: its
+  variable parts are written as ``{parameter_name}`` and the matching
+  values live in the configuration's ``parameters`` list (see
+  services/params.py). The store validates the two against each other on
+  every write, so a saved configuration always renders into a complete
+  command.
+* ``external`` launches nothing. It stores the root ``base_url`` of an
+  LLM server that is already running (possibly on another host), so the
+  dashboard can monitor it and the chat can use it. No command, no
+  parameters -- just the address, validated to be a usable http(s) root.
+
+Configurations are persisted to a JSON file on disk so they survive
+backend restarts. All mutations go through an asyncio lock and are written
+atomically (temp file + os.replace) so a crash mid-write cannot corrupt
+the store.
 """
 
 from __future__ import annotations
@@ -21,6 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from .engine_target import EngineTargetError, validate_external_base_url
 from .params import ParamError, normalise_parameters, validate_template
 
 # Default location: backend/data/llm_runner_configs.json (override with
@@ -33,6 +43,9 @@ STORE_PATH = Path(os.getenv("RUNNER_STORE_PATH", str(DEFAULT_STORE_PATH)))
 MAX_NAME_CHARS = 120
 MAX_COMMAND_CHARS = 10_000
 MAX_DESCRIPTION_CHARS = 1_000
+MAX_BASE_URL_CHARS = 300
+
+VALID_KINDS = ("docker", "external")
 
 
 def _utc_now() -> str:
@@ -78,6 +91,13 @@ class RunnerStore:
                 cfg["parameters"] = normalise_parameters(cfg.get("parameters"))
             except ParamError:
                 cfg["parameters"] = []
+            # Configurations written before the kind split have no `kind`,
+            # `base_url`, or (for external) `docker_command` key. Give
+            # every config the same shape so readers never have to guess
+            # which keys exist.
+            cfg.setdefault("kind", "docker")
+            cfg.setdefault("docker_command", "")
+            cfg.setdefault("base_url", None)
         self._configs = configs
 
     def _persist(self) -> None:
@@ -116,28 +136,52 @@ class RunnerStore:
     async def create(
         self,
         name: str,
-        docker_command: str,
+        docker_command: str = "",
         description: str = "",
         parameters: Optional[list[Any]] = None,
+        kind: str = "docker",
+        base_url: Optional[str] = None,
     ) -> dict[str, Any]:
         name = name.strip()
-        docker_command = docker_command.strip()
         if not name:
             raise RunnerStoreError("name must not be blank")
-        if not docker_command:
-            raise RunnerStoreError("docker_command must not be blank")
-        try:
-            params = normalise_parameters(parameters)
-        except ParamError as exc:
-            raise RunnerStoreError(str(exc)) from exc
-        self._check_template(docker_command, params)
+        kind = (kind or "docker").strip().lower()
+        if kind not in VALID_KINDS:
+            raise RunnerStoreError(
+                f"unknown configuration kind {kind!r} "
+                f"(expected one of: {', '.join(VALID_KINDS)})"
+            )
+
+        if kind == "external":
+            base_url = (base_url or "").strip()
+            if not base_url:
+                raise RunnerStoreError(
+                    "base_url must not be blank for an external configuration"
+                )
+            try:
+                base_url = validate_external_base_url(base_url)
+            except EngineTargetError as exc:
+                raise RunnerStoreError(str(exc)) from exc
+            params: list[dict[str, str]] = []
+        else:
+            docker_command = (docker_command or "").strip()
+            if not docker_command:
+                raise RunnerStoreError("docker_command must not be blank")
+            try:
+                params = normalise_parameters(parameters)
+            except ParamError as exc:
+                raise RunnerStoreError(str(exc)) from exc
+            self._check_template(docker_command, params)
+
         async with self._lock:
             self._check_name_unique(name)
             now = _utc_now()
             cfg = {
                 "id": uuid.uuid4().hex[:12],
                 "name": name,
-                "docker_command": docker_command,
+                "kind": kind,
+                "docker_command": docker_command if kind == "docker" else "",
+                "base_url": base_url if kind == "external" else None,
                 "description": description.strip(),
                 "parameters": params,
                 "created_at": now,
@@ -154,6 +198,8 @@ class RunnerStore:
         docker_command: Optional[str] = None,
         description: Optional[str] = None,
         parameters: Optional[list[Any]] = None,
+        kind: Optional[str] = None,
+        base_url: Optional[str] = None,
     ) -> dict[str, Any]:
         # Normalise what was supplied before touching the store, so a bad
         # payload leaves nothing behind.
@@ -163,6 +209,17 @@ class RunnerStore:
                 new_params = normalise_parameters(parameters)
             except ParamError as exc:
                 raise RunnerStoreError(str(exc)) from exc
+
+        incoming_kind = None
+        if kind is not None:
+            incoming_kind = kind.strip().lower()
+            if incoming_kind not in VALID_KINDS:
+                raise RunnerStoreError(
+                    f"unknown configuration kind {kind!r} "
+                    f"(expected one of: {', '.join(VALID_KINDS)})"
+                )
+
+        new_base = base_url.strip() if base_url is not None else None
 
         async with self._lock:
             idx = next(
@@ -186,22 +243,50 @@ class RunnerStore:
                 self._check_name_unique(name, exclude_id=config_id)
                 next_name = name
 
-            next_command = cfg.get("docker_command", "")
-            if docker_command is not None:
-                docker_command = docker_command.strip()
-                if not docker_command:
-                    raise RunnerStoreError("docker_command must not be blank")
-                next_command = docker_command
+            # Validate against the *resulting* kind, not the incoming
+            # fields: a docker->external switch must not demand a docker
+            # template, and an external->docker switch must.
+            next_kind = incoming_kind or cfg.get("kind") or "docker"
 
-            next_params = new_params if new_params is not None else (
-                cfg.get("parameters") or []
-            )
-
-            self._check_template(next_command, next_params)
+            if next_kind == "external":
+                next_base = new_base if new_base is not None else cfg.get("base_url")
+                if not (next_base or "").strip():
+                    raise RunnerStoreError(
+                        "base_url is required for an external configuration"
+                    )
+                try:
+                    next_base = validate_external_base_url(next_base)
+                except EngineTargetError as exc:
+                    raise RunnerStoreError(str(exc)) from exc
+            else:
+                next_command = cfg.get("docker_command", "")
+                if docker_command is not None:
+                    docker_command = docker_command.strip()
+                    if not docker_command:
+                        raise RunnerStoreError("docker_command must not be blank")
+                    next_command = docker_command
+                # An external config's stored command is empty by design,
+                # so switching to docker without supplying one must be
+                # rejected here rather than saving a command-less config.
+                if not (next_command or "").strip():
+                    raise RunnerStoreError(
+                        "docker_command is required for a docker configuration"
+                    )
+                next_params = new_params if new_params is not None else (
+                    cfg.get("parameters") or []
+                )
+                self._check_template(next_command, next_params)
 
             cfg["name"] = next_name
-            cfg["docker_command"] = next_command
-            cfg["parameters"] = next_params
+            cfg["kind"] = next_kind
+            if next_kind == "external":
+                cfg["base_url"] = next_base
+                cfg["docker_command"] = ""
+                cfg["parameters"] = []
+            else:
+                cfg["docker_command"] = next_command
+                cfg["parameters"] = next_params
+                cfg["base_url"] = None
             if description is not None:
                 cfg["description"] = description.strip()
             cfg["updated_at"] = _utc_now()

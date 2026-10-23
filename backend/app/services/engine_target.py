@@ -78,6 +78,24 @@ def normalise_base_url(raw: Any) -> str:
     return url.rstrip("/")
 
 
+def validate_external_base_url(raw: Any) -> str:
+    """Normalise an external engine address and reject a non-root path.
+
+    ``HalogenClient`` appends ``/health``, ``/v1/...`` to the base URL, so
+    a base that already carries a path (``http://host:8080/v1``) would
+    double it up into ``/v1/v1/...``. Only scheme + host[:port] is
+    accepted; a trailing slash is fine (``normalise_base_url`` strips it).
+    """
+    url = normalise_base_url(raw)
+    path = urlparse(url).path
+    if path not in ("", "/"):
+        raise EngineTargetError(
+            f"engine address must not include a path (got {path!r}); "
+            "give the root address, e.g. http://host:port"
+        )
+    return url
+
+
 def engine_url(port: Any) -> str:
     """Build the loopback base URL for an engine published on ``port``."""
     return f"http://{LOCAL_ENGINE_HOST}:{validate_port(port)}"

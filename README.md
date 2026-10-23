@@ -117,8 +117,23 @@ On GUFO that field therefore shows as unavailable even though the number exists.
 Configure a runnable engine in the **LLM-Runner** tab. See
 [doc/strixper_prerequisites.md](doc/strixper_prerequisites.md) for the host, kernel,
 firmware, GPU driver, and engine/model setup checklist.
-Runner commands must give each container a unique Docker `--name`; Strixper
-uses that name to adopt, monitor, and reliably stop each engine.
+
+Runner configurations come in two kinds:
+
+- **Docker container** (the default) — Strixper launches the container
+  from the command you saved. Docker configurations must give each
+  container a unique Docker `--name`; Strixper uses that name to adopt,
+  monitor, and reliably stop each engine.
+- **External server** — for an LLM server that is already running, on
+  this host or another one. You store only its root address, e.g.
+  `http://192.168.1.50:8080` — scheme and host only, no `/v1` path.
+  Pressing Run launches nothing: it points the dashboard and the AI Chat
+  at that server, which then shows up in the Live tab like any other
+  engine. External runs have no console output, and Strixper does not
+  detect the server dying — the Live tab's *connected* flag is the
+  liveness signal. After a Strixper restart the run is not resumed;
+  press Run again (the persisted engine target keeps the Live tab
+  monitoring in the meantime).
 
 ## Model downloads
 
@@ -494,7 +509,7 @@ ss -tlnp | grep LISTEN          # see what's already taken
 | `/api/v1/stats/reset` | POST | Reset session statistics to zero |
 | `/api/v1/count-tokens` | POST | Count the input tokens of a prompt (proxies Halogen) |
 | `/api/v1/chat` | POST | Streaming chat completion (4 API styles, SSE) |
-| `/api/v1/runner/configs` | GET / POST | List / create LLM-Runner configurations |
+| `/api/v1/runner/configs` | GET / POST | List / create LLM-Runner configurations (create body takes `kind`: `docker` with `docker_command`, or `external` with `base_url`) |
 | `/api/v1/runner/configs/{id}` | GET / PUT / DELETE | Read / update / remove one configuration |
 | `/api/v1/runner/preview` | POST | Render the docker command for a config without starting it |
 | `/api/v1/runner/configs/{id}/run` | POST | Start a run from a saved configuration |

@@ -1,9 +1,16 @@
-"""LLM-Runner: create, run and store docker-based inference configurations.
+"""LLM-Runner: create, run and store inference configurations.
 
-A "run configuration" captures the docker command used to launch a
-containerized LLM inference server. Configurations are stored locally as a
-JSON list (see services/runner_store.py) and can be created, edited, deleted
-and selected from the dashboard.
+A "run configuration" comes in two kinds:
+
+* ``docker`` (the default) captures the docker command used to launch a
+  containerized LLM inference server.
+* ``external`` launches nothing -- it stores the root address of an
+  LLM server that is already running (possibly on another host), so the
+  dashboard can monitor it and the chat can use it.
+
+Configurations are stored locally as a JSON list (see
+services/runner_store.py) and can be created, edited, deleted and
+selected from the dashboard.
 
 The stored command is a **template**: wherever a value should be
 variable -- a model directory, a port, a context size -- the configuration
@@ -44,14 +51,16 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ..services.engine_target import (
     EngineTargetError,
     engine_url,
     port_from_params,
+    validate_external_base_url,
 )
 from ..services.docker_control import extract_container_name
+from ..services.halogen_client import HalogenClient
 from ..services.live_service import (
     RuntimeState,
     build_run_snapshot,
@@ -65,9 +74,11 @@ from ..services.params import (
 )
 from ..services.run_registry import registry, stream_console
 from ..services.runner_store import (
+    MAX_BASE_URL_CHARS,
     MAX_COMMAND_CHARS,
     MAX_DESCRIPTION_CHARS,
     MAX_NAME_CHARS,
+    VALID_KINDS,
     RunnerStore,
     RunnerStoreError,
 )
@@ -105,23 +116,47 @@ class RunnerParameter(BaseModel):
 
 class RunnerConfigCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=MAX_NAME_CHARS)
-    docker_command: str = Field(..., min_length=1, max_length=MAX_COMMAND_CHARS)
+    # "docker" (default) launches a container; "external" follows an
+    # already-running server at base_url and launches nothing.
+    kind: str = Field(default="docker")
+    # Required for docker configs; ignored for external ones.
+    docker_command: Optional[str] = Field(
+        default=None, max_length=MAX_COMMAND_CHARS
+    )
+    # Required for external configs: root address, e.g. http://host:port.
+    base_url: Optional[str] = Field(default=None, max_length=MAX_BASE_URL_CHARS)
     description: str = Field(default="", max_length=MAX_DESCRIPTION_CHARS)
     parameters: list[RunnerParameter] = Field(default_factory=list, max_length=MAX_PARAMS)
 
-    @field_validator("name", "docker_command")
+    @field_validator("name")
     @classmethod
     def _not_blank(cls, value: str) -> str:
         if not value.strip():
             raise ValueError("must contain at least one non-whitespace character")
         return value
 
+    @model_validator(mode="after")
+    def _kind_requirements(self) -> "RunnerConfigCreate":
+        kind = (self.kind or "docker").strip().lower()
+        if kind not in VALID_KINDS:
+            raise ValueError(
+                f"unknown configuration kind {self.kind!r} "
+                f"(expected one of: {', '.join(VALID_KINDS)})"
+            )
+        if kind == "docker" and not (self.docker_command or "").strip():
+            raise ValueError("docker_command is required for a docker configuration")
+        if kind == "external" and not (self.base_url or "").strip():
+            raise ValueError("base_url is required for an external configuration")
+        return self
+
 
 class RunnerConfigUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=MAX_NAME_CHARS)
+    kind: Optional[str] = Field(default=None)
     docker_command: Optional[str] = Field(
         default=None, min_length=1, max_length=MAX_COMMAND_CHARS
     )
+    base_url: Optional[str] = Field(default=None, max_length=MAX_BASE_URL_CHARS)
     description: Optional[str] = Field(default=None, max_length=MAX_DESCRIPTION_CHARS)
     # Omitted leaves the parameter list untouched; [] clears it.
     parameters: Optional[list[RunnerParameter]] = Field(
@@ -131,60 +166,6 @@ class RunnerConfigUpdate(BaseModel):
 
 def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-
-async def _terminate(proc: asyncio.subprocess.Process) -> None:
-    """Graceful SIGTERM, then SIGKILL after a short grace period."""
-    if proc.returncode is not None:
-        return
-    try:
-        proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-    except ProcessLookupError:
-        pass
-
-
-async def halt_run(run: ActiveRun) -> str:
-    """Stop a run, taking the container down with it.
-
-    Killing the `docker run` client is not enough -- with `-it` attached to
-    a PTY the container outlives its client -- so the container is stopped
-    through docker first, then the client process is reaped.
-
-    Idempotent: whichever path reaches it first (an explicit stop request,
-    or the stream tearing down after a client disconnect) does the work,
-    and later calls return the same result. Returns the method that did it.
-    """
-    async with run.stop_lock:
-        if run.halted:
-            return run.halt_method
-
-        method = "already_exited"
-        if run.proc.returncode is None:
-            if run.container_name:
-                if await stop_container(
-                    run.container_name, timeout=DEFAULT_STOP_TIMEOUT
-                ):
-                    method = "docker_stop"
-                elif await kill_container(run.container_name):
-                    method = "docker_kill"
-                else:
-                    method = "process"
-            else:
-                method = "process"
-
-            # Whether or not docker cooperated, make sure the local client
-            # is gone too -- a lingering `docker run` would keep the PTY
-            # and its slot in the table alive.
-            await _terminate(run.proc)
-
-        run.halted = True
-        run.halt_method = method
-        return method
 
 
 # -- Configuration CRUD --------------------------------------------------------
@@ -208,9 +189,11 @@ async def create_config(body: RunnerConfigCreate) -> dict[str, Any]:
     try:
         return await get_store().create(
             name=body.name,
-            docker_command=body.docker_command,
+            docker_command=body.docker_command or "",
             description=body.description,
             parameters=[p.model_dump() for p in body.parameters],
+            kind=body.kind,
+            base_url=body.base_url,
         )
     except RunnerStoreError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -229,6 +212,8 @@ async def update_config(config_id: str, body: RunnerConfigUpdate) -> dict[str, A
                 if body.parameters is not None
                 else None
             ),
+            kind=body.kind,
+            base_url=body.base_url,
         )
     except RunnerStoreError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -301,6 +286,70 @@ class ConfigNotFound(Exception):
     """No stored configuration with that id."""
 
 
+async def _probe_engine(
+    base_url: str, timeout: float = 3.0
+) -> tuple[bool, Optional[str], str]:
+    """Quick reachability check for an external engine.
+
+    Advisory only: a failure never blocks the start -- the engine may be
+    mid-boot -- it just surfaces a warning immediately instead of leaving
+    the user staring at a silent dashboard until the first poll lands.
+    Returns ``(reachable, reported_model, error_message)``.
+    """
+    client = HalogenClient(base_url, timeout=timeout)
+    try:
+        health = await client.get_health()
+        model = (health or {}).get("model")
+        return True, model, ""
+    except Exception as exc:  # noqa: BLE001 -- advisory only
+        return False, None, f"engine at {base_url} is not reachable: {exc}"
+    finally:
+        await client.close()
+
+
+async def _launch_external(
+    state: RuntimeState, config_id: str, cfg: dict[str, Any]
+) -> dict[str, Any]:
+    """Start an external (monitor-only) configuration.
+
+    Nothing is launched: the engine already runs outside this backend. We
+    validate its address, register a run that follows it, and repoint the
+    dashboard at it. The run stays running until stopped explicitly --
+    there is no process whose exit we could observe.
+    """
+    base_url = cfg.get("base_url")
+    try:
+        base_url = validate_external_base_url(base_url)
+    except EngineTargetError as exc:
+        raise ValueError(str(exc)) from exc
+
+    ok, model, probe_error = await _probe_engine(base_url)
+
+    run = await registry.start_external(
+        config_id=config_id,
+        config_name=cfg.get("name", ""),
+        base_url=base_url,
+    )
+    if not ok:
+        run.engine_probe_error = probe_error
+
+    try:
+        snapshot = await set_engine_target(
+            state,
+            base_url,
+            config_id,
+            cfg.get("name"),
+            model_name=model,
+        )
+        run.engine_url = snapshot["base_url"]
+        if model:
+            run.model_name = model
+    except EngineTargetError as exc:
+        run.engine_switch_error = str(exc)
+
+    return run.summary()
+
+
 async def launch_config(
     state: RuntimeState,
     config_id: str,
@@ -318,6 +367,12 @@ async def launch_config(
     cfg = get_store().get(config_id)
     if cfg is None:
         raise ConfigNotFound(config_id)
+
+    # External configurations launch nothing: they follow an address.
+    # Branch before the docker path so a config without a rendered command
+    # never reaches the template machinery.
+    if cfg.get("kind", "docker") == "external":
+        return await _launch_external(state, config_id, cfg)
 
     # Reconstruct the concrete command from the stored template and the
     # parameter values (request overrides take precedence over stored).

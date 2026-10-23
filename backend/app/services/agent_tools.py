@@ -177,6 +177,7 @@ def build_tools(
             {
                 "id": cfg.get("id"),
                 "name": cfg.get("name"),
+                "kind": cfg.get("kind", "docker"),
                 "description": (cfg.get("description") or "")[:200],
                 "parameters": [p.get("name") for p in (cfg.get("parameters") or [])],
             }
