@@ -442,7 +442,7 @@ export async function streamAgentChat(
     thinking = true,
     runId,
   },
-  { onReasoning, onDelta, onTool, onDone, onError, signal } = {},
+  { onReasoning, onDelta, onTool, onDone, onError, onRetry, signal } = {},
 ) {
   const body = {
     messages,
