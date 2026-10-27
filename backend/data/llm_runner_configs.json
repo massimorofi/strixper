@@ -463,5 +463,82 @@
     ],
     "created_at": "2026-10-22T18:10:54Z",
     "updated_at": "2026-10-22T19:19:00Z"
+  },
+  {
+    "id": "0524a75c0111",
+    "name": "Gufo-Qwen3.8-flash-next",
+    "kind": "docker",
+    "docker_command": "docker run --rm -it --name {container_name} \\\n  --device /dev/dri \\\n  --device /dev/kfd \\\n  --group-add video \\\n  --group-add render \\\n  --security-opt seccomp=unconfined \\\n  --ipc=host \\\n  -p {bind}:{port}:{port} \\\n  -v {models}/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf:/models/target/Qwen3.8-27B-UD-Q4_K_XL.gguf:ro \\\n  -v {models}/Qwen3.8-27B-DFlash2-GGUF:/models/speculation:ro \\\n  {image} gufo serve \\\n  --host 0.0.0.0 \\\n  --port {port} \\\n  --sessions {sessions} \\\n  llm \\\n  --model /models/target/Qwen3.8-27B-UD-Q4_K_XL.gguf \\\n  --context {ctx} \\\n  --max-tokens {max_tokens} \\\n  --served-model-name {served_model_name} \\\n  --think {think} \\\n  --reasoning-effort {reasoning_effort} \\\n  --max-pending-per-client {max_pending_per_client} \\\n  --speculative dflash2 \\\n  --dflash-model /models/speculation/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \\\n  --draft-tokens {draft_tokens}",
+    "base_url": null,
+    "description": "Run GUFO LLM server with Qwen3.8-27B UD Q4_K_XL and DFlash2 speculative decoding on Strix Halo (models on the DEV volume)",
+    "parameters": [
+      {
+        "name": "models",
+        "label": "Models directory",
+        "value": "/run/media/briggen/DEV/.aitoolbox/models"
+      },
+      {
+        "name": "port",
+        "label": "API port",
+        "value": "18080"
+      },
+      {
+        "name": "bind",
+        "label": "Expose on address",
+        "value": "0.0.0.0"
+      },
+      {
+        "name": "ctx",
+        "label": "Context length",
+        "value": "262144"
+      },
+      {
+        "name": "max_tokens",
+        "label": "Max tokens",
+        "value": "32768"
+      },
+      {
+        "name": "served_model_name",
+        "label": "Served model name",
+        "value": "Qwen3.8-27B-UD-Q4_K_XL"
+      },
+      {
+        "name": "sessions",
+        "label": "Sessions",
+        "value": "1"
+      },
+      {
+        "name": "think",
+        "label": "Thinking",
+        "value": "on"
+      },
+      {
+        "name": "reasoning_effort",
+        "label": "Reasoning effort",
+        "value": "high"
+      },
+      {
+        "name": "max_pending_per_client",
+        "label": "Max pending per client",
+        "value": "4"
+      },
+      {
+        "name": "draft_tokens",
+        "label": "Draft tokens",
+        "value": "7"
+      },
+      {
+        "name": "image",
+        "label": "Docker image",
+        "value": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-gufo"
+      },
+      {
+        "name": "container_name",
+        "label": "Container name",
+        "value": "gufo-cockpit-server"
+      }
+    ],
+    "created_at": "2026-10-27T21:07:52Z",
+    "updated_at": "2026-10-27T21:07:52Z"
   }
 ]
