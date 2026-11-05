@@ -540,5 +540,117 @@
     ],
     "created_at": "2026-10-27T21:07:52Z",
     "updated_at": "2026-10-27T21:07:52Z"
+  },
+  {
+    "id": "1dec75e05ec5",
+    "name": "GUFO-Qwen3.8-Flash-Next-UD-Q4_K_XL-MTP",
+    "kind": "docker",
+    "docker_command": "docker run --rm -it --name {container_name} \\\n  --device /dev/dri \\\n  --device /dev/kfd \\\n  --group-add video \\\n  --group-add render \\\n  --security-opt seccomp=unconfined \\\n  --ipc=host \\\n  -p {bind}:{port}:{port} \\\n  -v {models}/{model_dir}/{model_file_1}:/models/target/{model_file_1}:ro \\\n  -v {models}/{model_dir}/{model_file_2}:/models/target/{model_file_2}:ro \\\n  -v {models}/{model_dir}/{model_file_3}:/models/target/{model_file_3}:ro \\\n  -v {models}/{model_dir}/{model_file_4}:/models/target/{model_file_4}:ro \\\n  -v {models}/{mtp_dir}:/models/speculation:ro \\\n  {image} gufo serve \\\n  --host 0.0.0.0 \\\n  --port {port} \\\n  --sessions {sessions} \\\n  llm \\\n  --model /models/target/{model_file_1} \\\n  --context {ctx} \\\n  --max-tokens {max_tokens} \\\n  --served-model-name {served_model_name} \\\n  --think {think} \\\n  --reasoning-effort {reasoning_effort} \\\n  --max-pending-per-client {max_pending_per_client} \\\n  --speculative mtp \\\n  --mtp-model /models/speculation/{mtp_model_file} \\\n  --draft-tokens {draft_tokens}",
+    "base_url": null,
+    "description": "Run GUFO LLM server with Qwen3.8-Flash-Next UD Q4_K_XL (4-part GGUF) and MTP speculative decoding on Strix Halo",
+    "parameters": [
+      {
+        "name": "models",
+        "label": "Models base directory",
+        "value": "/run/media/briggen/DEV/.aitoolbox/models"
+      },
+      {
+        "name": "model_dir",
+        "label": "Model directory (relative to models)",
+        "value": "Qwen3.8-Flash-Next-GGUF-Gufo/UD-Q4_K_XL"
+      },
+      {
+        "name": "model_file_1",
+        "label": "Model file part 1",
+        "value": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
+      },
+      {
+        "name": "model_file_2",
+        "label": "Model file part 2",
+        "value": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf"
+      },
+      {
+        "name": "model_file_3",
+        "label": "Model file part 3",
+        "value": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf"
+      },
+      {
+        "name": "model_file_4",
+        "label": "Model file part 4",
+        "value": "Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf"
+      },
+      {
+        "name": "mtp_dir",
+        "label": "MTP model directory (relative to models)",
+        "value": "Qwen3.8-Flash-Next-GGUF-Gufo/MTP"
+      },
+      {
+        "name": "mtp_model_file",
+        "label": "MTP model file",
+        "value": "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+      },
+      {
+        "name": "port",
+        "label": "API port",
+        "value": "18080"
+      },
+      {
+        "name": "bind",
+        "label": "Expose on address",
+        "value": "0.0.0.0"
+      },
+      {
+        "name": "ctx",
+        "label": "Context length",
+        "value": "262144"
+      },
+      {
+        "name": "max_tokens",
+        "label": "Max tokens",
+        "value": "32768"
+      },
+      {
+        "name": "served_model_name",
+        "label": "Served model name",
+        "value": "Qwen3.8-Flash-Next-UD-Q4_K_XL"
+      },
+      {
+        "name": "sessions",
+        "label": "Sessions",
+        "value": "1"
+      },
+      {
+        "name": "think",
+        "label": "Thinking",
+        "value": "on"
+      },
+      {
+        "name": "reasoning_effort",
+        "label": "Reasoning effort",
+        "value": "high"
+      },
+      {
+        "name": "max_pending_per_client",
+        "label": "Max pending per client",
+        "value": "4"
+      },
+      {
+        "name": "draft_tokens",
+        "label": "Draft tokens (MTP)",
+        "value": "7"
+      },
+      {
+        "name": "image",
+        "label": "Docker image",
+        "value": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-gufo"
+      },
+      {
+        "name": "container_name",
+        "label": "Container name",
+        "value": "gufo-cockpit-server-flash-next"
+      }
+    ],
+    "created_at": "2026-11-05T19:05:29Z",
+    "updated_at": "2026-11-05T19:05:29Z"
   }
 ]
