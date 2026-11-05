@@ -428,11 +428,12 @@ function ConfigList({
       </div>
     )
   }
+  // Fixed-height scroll box: the page never grows with the number of
+  // configurations, and the scrollbar stays visible via workspace-scroll.
   return (
-    <ul className="space-y-2">
+    <ul className="workspace-scroll max-h-[420px] space-y-2 overflow-y-auto pr-1">
       {configs.map((c) => {
         const isRunning = activeConfigIds.has(c.id)
-        const params = c.parameters || []
         return (
           <li
             key={c.id}
@@ -475,19 +476,6 @@ function ConfigList({
                   >
                     {c.docker_command}
                   </p>
-                )}
-                {params.length > 0 && (
-                  <div className="mt-1.5 flex flex-wrap gap-1">
-                    {params.map((p) => (
-                      <span
-                        key={p.name}
-                        className="rounded bg-[var(--surface-page)] px-1.5 py-0.5 font-mono text-[10px] text-[var(--text-secondary)]"
-                        title={`${p.label || p.name}: ${p.value}`}
-                      >
-                        {p.name}={p.value}
-                      </span>
-                    ))}
-                  </div>
                 )}
               </div>
             </div>
