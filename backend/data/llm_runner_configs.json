@@ -652,5 +652,109 @@
     ],
     "created_at": "2026-11-05T19:05:29Z",
     "updated_at": "2026-11-05T19:05:29Z"
+  },
+  {
+    "id": "ef79472b2065",
+    "name": "ROCm-Qwen3.6-35B-A3B-Q8",
+    "kind": "docker",
+    "docker_command": "docker run --rm -it -d \\\n  --name {container_name} \\\n  --device /dev/kfd \\\n  --device /dev/dri \\\n  --group-add 44 \\\n  --group-add 990 \\\n  --ipc=host \\\n  --ulimit memlock=-1:-1 \\\n  -v {models}:/models:ro \\\n  -p {bind}:{port}:8080 \\\n   {image} llama-server \\\n  -m /models/{model_file} \\\n  -c {ctx} \\\n  -ngl {ngl} \\\n  --host 0.0.0.0 \\\n  --port 8080 \\\n  --jinja \\\n  --metrics",
+    "base_url": null,
+    "description": "Serve Qwen3.6-35B-A3B Q8_0 with ROCm llama.cpp on port 1972. No matching Qwen3.6 MTP sidecar is installed, so speculative decoding is disabled.",
+    "parameters": [
+      {
+        "name": "models",
+        "label": "Qwen model directory",
+        "value": "/home/briggen/Dev/.aitoolbox/models/unsloth/Qwen3.6-35B-A3B-GGUF"
+      },
+      {
+        "name": "model_file",
+        "label": "Model file",
+        "value": "Qwen3.6-35B-A3B-Q8_0.gguf"
+      },
+      {
+        "name": "port",
+        "label": "Host API port",
+        "value": "1972"
+      },
+      {
+        "name": "bind",
+        "label": "Expose on address",
+        "value": "0.0.0.0"
+      },
+      {
+        "name": "ctx",
+        "label": "Context length",
+        "value": "8192"
+      },
+      {
+        "name": "ngl",
+        "label": "GPU layers",
+        "value": "999"
+      },
+      {
+        "name": "container_name",
+        "label": "Container name",
+        "value": "strixper-qwen36-1972"
+      },
+      {
+        "name": "image",
+        "label": "ROCm llama.cpp image",
+        "value": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0"
+      }
+    ],
+    "created_at": "2026-11-07T21:53:25Z",
+    "updated_at": "2026-11-07T22:26:11Z"
+  },
+  {
+    "id": "d218c7512141",
+    "name": "ROCm-Flint-UD-Q4_K_XL",
+    "kind": "docker",
+    "docker_command": "docker run --rm -it -d \\\n  --name {container_name} \\\n  --device /dev/kfd \\\n  --device /dev/dri \\\n  --group-add 44 \\\n  --group-add 990 \\\n  --ipc=host \\\n  --ulimit memlock=-1:-1 \\\n  -v {models}:/models:ro \\\n  -p {bind}:{port}:8080 \\\n  {image} llama-server \\\n  -m /models/{model_file} \\\n  -c {ctx} \\\n  -ngl {ngl} \\\n  --host 0.0.0.0 \\\n  --port 8080 \\\n  --metrics",
+    "base_url": null,
+    "description": "Serve Flint GGUF with ROCm llama.cpp on port 1973. No matching Flint DFlash2 sidecar is installed, so speculative decoding is disabled.",
+    "parameters": [
+      {
+        "name": "models",
+        "label": "Flint model directory",
+        "value": "/home/briggen/Dev/.aitoolbox/models/unsloth/flint-GGUF"
+      },
+      {
+        "name": "model_file",
+        "label": "Model file",
+        "value": "flint-UD-Q4_K_XL.gguf"
+      },
+      {
+        "name": "port",
+        "label": "Host API port",
+        "value": "1973"
+      },
+      {
+        "name": "bind",
+        "label": "Expose on address",
+        "value": "0.0.0.0"
+      },
+      {
+        "name": "ctx",
+        "label": "Context length",
+        "value": "8192"
+      },
+      {
+        "name": "ngl",
+        "label": "GPU layers",
+        "value": "999"
+      },
+      {
+        "name": "container_name",
+        "label": "Container name",
+        "value": "strixper-flint-1973"
+      },
+      {
+        "name": "image",
+        "label": "ROCm llama.cpp image",
+        "value": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0"
+      }
+    ],
+    "created_at": "2026-11-07T21:53:25Z",
+    "updated_at": "2026-11-07T22:26:11Z"
   }
 ]
