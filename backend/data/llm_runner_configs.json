@@ -51,9 +51,9 @@
   },
   {
     "id": "e3be318f0a51",
-    "name": "GUFO-Qwen3.8-27B-UD-Q4_K_XL",
-    "docker_command": "docker run --rm -it --name gufo-cockpit-server-5f134390 \\\n  --device /dev/dri \\\n  --device /dev/kfd \\\n  --group-add video \\\n  --group-add render \\\n  --security-opt seccomp=unconfined \\\n  --ipc=host \\\n  -p {bind}:{port}:{port} \\\n  -v {models}/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf:/models/target/Qwen3.8-27B-UD-Q4_K_XL.gguf:ro \\\n  -v {models}/Qwen3.8-27B-DFlash2-GGUF:/models/speculation:ro \\\n  {image} gufo serve \\\n  --host 0.0.0.0 \\\n  --port {port} \\\n  --sessions {sessions} \\\n  llm \\\n  --model /models/target/Qwen3.8-27B-UD-Q4_K_XL.gguf \\\n  --context {ctx} \\\n  --max-tokens {max_tokens} \\\n  --served-model-name {served_model_name} \\\n  --think {think} \\\n  --reasoning-effort {reasoning_effort} \\\n  --max-pending-per-client {max_pending_per_client} \\\n  --speculative dflash2 \\\n  --dflash-model /models/speculation/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \\\n  --draft-tokens {draft_tokens}",
-    "description": "Run GUFO LLM server (llama.cpp-style GGUF serving) on Strix Halo",
+    "name": "Halogen-Qwen3.8-27B",
+    "docker_command": "docker run --rm -it --name {container_name} \\\n  --pull=always \\\n  --device /dev/dri \\\n  --device /dev/kfd \\\n  --group-add video \\\n  --group-add $(getent group render | cut -d: -f3) \\\n  --security-opt seccomp=unconfined \\\n  --ipc=host \\\n  --ulimit memlock=-1:-1 \\\n  -p {bind}:{port}:{port} \\\n  --security-opt no-new-privileges \\\n  -v {models}:/models \\\n  -e HALOGEN_DOWNLOAD=peonist-ai/halogen-qwen3.8-27b \\\n  -e HALOGEN_TOKENIZER=/models/tokenizer \\\n  -e HALOGEN_API_PORT={port} \\\n  -e HALOGEN_SLOT_CTX={ctx} \\\n  -e HALOGEN_MAX_TOKENS_CAP={max_tokens} \\\n  -e HALOGEN_KV_SLOTS={sessions} \\\n  -e HALOGEN_MODEL_ID={served_model_name} \\\n  -e HALOGEN_DRAFTER=2 \\\n  {image}",
+    "description": "Run Halogen's Qwen3.8-27B HGN checkpoint with its bundled DFlash2 drafter on Strix Halo. Halogen cannot load the GUFO GGUF files; the first start downloads its compatible checkpoint and tokenizer into the configured models directory.",
     "parameters": [
       {
         "name": "models",
@@ -61,9 +61,14 @@
         "value": "/home/briggen/Dev/.aitoolbox/models"
       },
       {
+        "name": "container_name",
+        "label": "Container name",
+        "value": "halogen-qwen38-27b"
+      },
+      {
         "name": "port",
         "label": "API port",
-        "value": "18080"
+        "value": "8731"
       },
       {
         "name": "ctx",
@@ -72,13 +77,13 @@
       },
       {
         "name": "max_tokens",
-        "label": "Max tokens",
+        "label": "Maximum request token cap",
         "value": "32768"
       },
       {
         "name": "served_model_name",
         "label": "Served model name",
-        "value": "Qwen3.8-27B-UD-Q4_K_XL"
+        "value": "halogen-qwen3.8-27b"
       },
       {
         "name": "sessions",
@@ -86,29 +91,9 @@
         "value": "1"
       },
       {
-        "name": "think",
-        "label": "Thinking",
-        "value": "on"
-      },
-      {
-        "name": "reasoning_effort",
-        "label": "Reasoning effort",
-        "value": "high"
-      },
-      {
-        "name": "max_pending_per_client",
-        "label": "Max pending per client",
-        "value": "4"
-      },
-      {
-        "name": "draft_tokens",
-        "label": "Draft tokens",
-        "value": "7"
-      },
-      {
         "name": "image",
         "label": "Docker image",
-        "value": "docker.io/kyuz0/amd-strix-halo-toolboxes:rocm-10.0-gufo"
+        "value": "ghcr.io/peonist-ai/halogen:latest"
       },
       {
         "name": "bind",
@@ -655,21 +640,21 @@
   },
   {
     "id": "ef79472b2065",
-    "name": "ROCm-Qwen3.6-35B-A3B-Q8",
+    "name": "ROCm-Qwen3.6-35B-A3B-Q4_K_M",
     "kind": "docker",
     "docker_command": "docker run --rm -it -d \\\n  --name {container_name} \\\n  --device /dev/kfd \\\n  --device /dev/dri \\\n  --group-add 44 \\\n  --group-add 990 \\\n  --ipc=host \\\n  --ulimit memlock=-1:-1 \\\n  -v {models}:/models:ro \\\n  -p {bind}:{port}:8080 \\\n   {image} llama-server \\\n  -m /models/{model_file} \\\n  -c {ctx} \\\n  -ngl {ngl} \\\n  --host 0.0.0.0 \\\n  --port 8080 \\\n  --jinja \\\n  --metrics",
     "base_url": null,
-    "description": "Serve Qwen3.6-35B-A3B Q8_0 with ROCm llama.cpp on port 1972. No matching Qwen3.6 MTP sidecar is installed, so speculative decoding is disabled.",
+    "description": "Serve Qwen3.6-35B-A3B Q4_K_M with ROCm llama.cpp on port 1972. No matching Qwen3.6 MTP sidecar is installed, so speculative decoding is disabled.",
     "parameters": [
       {
         "name": "models",
         "label": "Qwen model directory",
-        "value": "/home/briggen/Dev/.aitoolbox/models/unsloth/Qwen3.6-35B-A3B-GGUF"
+        "value": "/home/briggen/Dev/.aitoolbox/models/Qwen3.6-35B-A3B-GGUF"
       },
       {
         "name": "model_file",
         "label": "Model file",
-        "value": "Qwen3.6-35B-A3B-Q8_0.gguf"
+        "value": "Qwen3.6-35B-A3B-UD-Q4_K_M.gguf"
       },
       {
         "name": "port",
@@ -684,7 +669,7 @@
       {
         "name": "ctx",
         "label": "Context length",
-        "value": "8192"
+        "value": "262144"
       },
       {
         "name": "ngl",
@@ -707,21 +692,21 @@
   },
   {
     "id": "d218c7512141",
-    "name": "ROCm-Flint-UD-Q4_K_XL",
+    "name": "ROCm-Ornith-1.5-35B-A3B-Q3_K_M",
     "kind": "docker",
     "docker_command": "docker run --rm -it -d \\\n  --name {container_name} \\\n  --device /dev/kfd \\\n  --device /dev/dri \\\n  --group-add 44 \\\n  --group-add 990 \\\n  --ipc=host \\\n  --ulimit memlock=-1:-1 \\\n  -v {models}:/models:ro \\\n  -p {bind}:{port}:8080 \\\n  {image} llama-server \\\n  -m /models/{model_file} \\\n  -c {ctx} \\\n  -ngl {ngl} \\\n  --host 0.0.0.0 \\\n  --port 8080 \\\n  --metrics",
     "base_url": null,
-    "description": "Serve Flint GGUF with ROCm llama.cpp on port 1973. No matching Flint DFlash2 sidecar is installed, so speculative decoding is disabled.",
+    "description": "Serve Ornith 1.5 35B-A3B Q3_K_M GGUF with ROCm llama.cpp on port 1973.",
     "parameters": [
       {
         "name": "models",
-        "label": "Flint model directory",
-        "value": "/home/briggen/Dev/.aitoolbox/models/unsloth/flint-GGUF"
+        "label": "Ornith model directory",
+        "value": "/home/briggen/Dev/.aitoolbox/models/ornith"
       },
       {
         "name": "model_file",
         "label": "Model file",
-        "value": "flint-UD-Q4_K_XL.gguf"
+        "value": "Ornith-1.5-35B-A3B-Q3_K_M.gguf"
       },
       {
         "name": "port",
@@ -736,7 +721,7 @@
       {
         "name": "ctx",
         "label": "Context length",
-        "value": "8192"
+        "value": "262144"
       },
       {
         "name": "ngl",
