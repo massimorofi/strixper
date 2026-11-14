@@ -202,10 +202,22 @@ def request(path, payload=None):
 configs = request("/runner/configs").get("configs", [])
 names = set()
 for config in configs:
-    preview = request("/runner/preview", {
-        "docker_command": config.get("docker_command", ""),
-        "parameters": config.get("parameters") or [],
-    })
+    label = config.get("name") or config.get("id") or "?"
+    command = (config.get("docker_command") or "").strip()
+    # An external configuration follows a server that already runs outside
+    # this backend and launches no container, so it has no command to
+    # render and no container name to resolve.
+    kind = (config.get("kind") or "docker").strip().lower()
+    if kind != "docker" or not command:
+        continue
+    try:
+        preview = request("/runner/preview", {
+            "docker_command": command,
+            "parameters": config.get("parameters") or [],
+        })
+    except Exception as exc:  # noqa: BLE001 -- one bad config must not block shutdown
+        print(f"[strixper] WARNING: could not render {label}: {exc}", file=sys.stderr)
+        continue
     match = re.search(r"--name(?:\s+|=)(\S+)", preview.get("command", ""))
     if match and not match.group(1).startswith("{"):
         names.add(match.group(1))

@@ -21,8 +21,8 @@
     {
       "id": "10082f82ee6a",
       "name": "Halogen-Qwen3.8-flash-next",
-      "docker_command": "docker run --rm -it --name ai-toolbox-cockpit-halogen-server-334446c6 \\\n  --pull=always \\\n  --device /dev/kfd \\\n  --device /dev/dri \\\n  --group-add video \\\n  --group-add $(getent group render | cut -d: -f3) \\\n  --security-opt seccomp=unconfined \\\n  --ipc=host \\\n  --ulimit memlock=-1:-1 \\\n  -p {bind}:{port}:{port} \\\n  --security-opt no-new-privileges \\\n  -v {models}/qwen38-flash-next-w4b.hgn:/models/qwen38-flash-next-w4b.hgn:ro \\\n  -v {models}/qwen38-flash-next-w4b.overlay-speed.hgn:/models/qwen38-flash-next-w4b.overlay-speed.hgn:ro \\\n  -v {models}/tokenizer/chat_template.jinja:/models/tokenizer/chat_template.jinja:ro \\\n  -v {models}/tokenizer/generation_config.json:/models/tokenizer/generation_config.json:ro \\\n  -v {models}/tokenizer/merges.txt:/models/tokenizer/merges.txt:ro \\\n  -v {models}/tokenizer/tokenizer.json:/models/tokenizer/tokenizer.json:ro \\\n  -v {models}/tokenizer/tokenizer_config.json:/models/tokenizer/tokenizer_config.json:ro \\\n  -v {models}/tokenizer/vocab.json:/models/tokenizer/vocab.json:ro \\\n  -v {models}/qwen38-flash-next-vision.hgn:/models/qwen38-flash-next-vision.hgn:ro \\\n  -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-w4b.hgn \\\n  -e HALOGEN_CK_OVERLAY=/models/qwen38-flash-next-w4b.overlay-speed.hgn \\\n  -e HALOGEN_TOKENIZER=/models/tokenizer \\\n  -e HALOGEN_API_PORT={port} \\\n  -e HALOGEN_CTX={ctx} \\\n  -e HALOGEN_KV_POOL_POSITIONS={kv_pool_positions} \\\n  -e HALOGEN_KV_SLOTS={kv_slots} \\\n  -e HALOGEN_PROMPT_CACHE={prompt_cache} \\\n  -e HALOGEN_VISION_TOWER=/models/qwen38-flash-next-vision.hgn \\\n  {image}",
-      "description": "Run Strix Halo Halogen LLM Inference engine",
+      "docker_command": "docker run --rm -it --name halogen-server-V1 \\\n  --pull=always \\\n  --device /dev/kfd \\\n  --device /dev/dri \\\n  --group-add video \\\n  --group-add $(getent group render | cut -d: -f3) \\\n  --security-opt seccomp=unconfined \\\n  --ipc=host \\\n  --ulimit memlock=-1:-1 \\\n  -p {bind}:{port}:{port} \\\n  --security-opt no-new-privileges \\\n  -v {models}/qwen38-flash-next-w4b.hgn:/models/qwen38-flash-next-w4b.hgn:ro \\\n  -v {models}/qwen38-flash-next-w4b.overlay-speed.hgn:/models/qwen38-flash-next-w4b.overlay-speed.hgn:ro \\\n  -v {models}/tokenizer/chat_template.jinja:/models/tokenizer/chat_template.jinja:ro \\\n  -v {models}/tokenizer/generation_config.json:/models/tokenizer/generation_config.json:ro \\\n  -v {models}/tokenizer/merges.txt:/models/tokenizer/merges.txt:ro \\\n  -v {models}/tokenizer/tokenizer.json:/models/tokenizer/tokenizer.json:ro \\\n  -v {models}/tokenizer/tokenizer_config.json:/models/tokenizer/tokenizer_config.json:ro \\\n  -v {models}/tokenizer/vocab.json:/models/tokenizer/vocab.json:ro \\\n  -v {models}/qwen38-flash-next-vision.hgn:/models/qwen38-flash-next-vision.hgn:ro \\\n  -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-w4b.hgn \\\n  -e HALOGEN_CK_OVERLAY=/models/qwen38-flash-next-w4b.overlay-speed.hgn \\\n  -e HALOGEN_TOKENIZER=/models/tokenizer \\\n  -e HALOGEN_API_PORT={port} \\\n  -e HALOGEN_ROPE_YARN=2 \\\n  -e HALOGEN_CTX={ctx} \\\n  -e HALOGEN_KV_POOL_POSITIONS={kv_pool_positions} \\\n  -e HALOGEN_KV8=1 \\\n  -e HALOGEN_MAX_TOKENS_CAP={max_tokens_cap} \\\n  -e HALOGEN_KV_SLOTS={kv_slots} \\\n  -e HALOGEN_PROMPT_CACHE={prompt_cache} \\\n  -e HALOGEN_VISION_TOWER=/models/qwen38-flash-next-vision.hgn \\\n  {image}",
+      "description": "Run Halogen with a 512K YaRN context, KV8, and a 16K max-token cap",
       "parameters": [
         {
           "name": "models",
@@ -37,17 +37,22 @@
         {
           "name": "ctx",
           "label": "Context length",
-          "value": "262144"
+          "value": "524288"
         },
         {
           "name": "kv_pool_positions",
           "label": "KV pool positions",
-          "value": "393216"
+          "value": "1048576"
+        },
+        {
+          "name": "max_tokens_cap",
+          "label": "Maximum request token cap",
+          "value": "16384"
         },
         {
           "name": "kv_slots",
           "label": "KV slots",
-          "value": "2"
+          "value": "4"
         },
         {
           "name": "prompt_cache",
@@ -66,7 +71,74 @@
         }
       ],
       "created_at": "2026-10-09T19:11:44Z",
-      "updated_at": "2026-11-08T15:12:30Z",
+      "updated_at": "2026-11-14T16:41:39Z",
+      "kind": "docker",
+      "base_url": null
+    },
+    {
+      "id": "c40a82eeb17f",
+      "name": "Halogen-V2-Qwen3.8-flash-next",
+      "docker_command": "docker run --rm -it --name {container_name} \\\n  --pull=always \\\n  --device /dev/kfd \\\n  --device /dev/dri \\\n  --group-add video \\\n  --group-add $(getent group render | cut -d: -f3) \\\n  --security-opt seccomp=unconfined \\\n  --ipc=host \\\n  --ulimit memlock=-1:-1 \\\n  -p {bind}:{port}:{port} \\\n  --security-opt no-new-privileges \\\n  -v {models}:/models:ro \\\n  -e HALOGEN_CHECKPOINT=/models/qwen38-flash-next-v2.hgn \\\n  -e HALOGEN_TOKENIZER=/models/tokenizer \\\n  -e HALOGEN_API_PORT={port} \\\n  -e HALOGEN_ROPE_YARN=2 \\\n  -e HALOGEN_CTX={ctx} \\\n  -e HALOGEN_KV_POOL_POSITIONS={kv_pool_positions} \\\n  -e HALOGEN_KV8=1 \\\n  -e HALOGEN_MAX_TOKENS_CAP={max_tokens_cap} \\\n  -e HALOGEN_KV_SLOTS={kv_slots} \\\n  -e HALOGEN_PROMPT_CACHE={prompt_cache} \\\n  -e HALOGEN_VISION_TOWER=1 \\\n  -e HALOGEN_MODEL_ID={model_id} \\\n  {image}",
+      "description": "Serve the Halogen v2 Qwen3.8-Flash-Next checkpoint with its adjacent n-gram lookup table and vision tower, using a 512K YaRN context, KV8, and a 16K max-token cap.",
+      "parameters": [
+        {
+          "name": "container_name",
+          "label": "Container name",
+          "value": "halogen-server-v2"
+        },
+        {
+          "name": "models",
+          "label": "Model directory",
+          "value": "/home/briggen/Dev/.aitoolbox/models/halogen/qwen38-flash-next-v2"
+        },
+        {
+          "name": "port",
+          "label": "API port",
+          "value": "8731"
+        },
+        {
+          "name": "ctx",
+          "label": "Context length",
+          "value": "524288"
+        },
+        {
+          "name": "kv_pool_positions",
+          "label": "KV pool positions",
+          "value": "1048576"
+        },
+        {
+          "name": "max_tokens_cap",
+          "label": "Maximum request token cap",
+          "value": "16384"
+        },
+        {
+          "name": "kv_slots",
+          "label": "KV slots",
+          "value": "4"
+        },
+        {
+          "name": "prompt_cache",
+          "label": "Prompt cache",
+          "value": "2"
+        },
+        {
+          "name": "model_id",
+          "label": "Served model ID",
+          "value": "halogen-qwen3.8-flash-next-v2"
+        },
+        {
+          "name": "image",
+          "label": "Docker image",
+          "value": "ghcr.io/peonist-ai/halogen-flash-server:0.20.4"
+        },
+        {
+          "name": "bind",
+          "label": "Expose on address",
+          "value": "0.0.0.0"
+        }
+      ],
+      "created_at": "2026-11-14T16:10:58Z",
+      "updated_at": "2026-11-14T16:41:39Z",
       "kind": "docker",
       "base_url": null
     },
